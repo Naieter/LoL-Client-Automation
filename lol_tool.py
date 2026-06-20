@@ -170,6 +170,12 @@ class LCU:
     def patch(self, ep: str, body=None):
         return self._sess.patch(f"{self._base}{ep}", json=body, timeout=5)
 
+    def complete_action(self, action_id: int):
+        return self._sess.post(
+            f"{self._base}/lol-champ-select/v1/session/actions/{action_id}/complete",
+            json={}, timeout=5
+        )
+
 
 # ── Automation engine ─────────────────────────────────────────────────────────
 class AutoEngine:
@@ -215,6 +221,7 @@ class AutoEngine:
             self._last_phase = phase
             if phase == "ChampSelect":
                 self._done_actions.clear()
+                self._log_champ_select_debug()
             if phase != "EndOfGame":
                 self._replay_sent = False
 
@@ -234,6 +241,31 @@ class AutoEngine:
                 self._log("Auto-replay: requeued for another game.")
                 self._replay_sent = True
 
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+    def _log_champ_select_debug(self):
+        try:
+            r = self._lcu.get("/lol-champ-select/v1/session")
+            if r.status_code != 200:
+                self._log(f"[debug] champ-select session HTTP {r.status_code}")
+                return
+            s = r.json()
+            cell = s.get("localPlayerCellId", "?")
+            team = s.get("myTeam", [])
+            me = next((p for p in team if str(p.get("cellId", "")) == str(cell)), {})
+            role = (me.get("assignedPosition") or "none").lower()
+            actions_flat = [a for g in s.get("actions", []) for a in g
+                            if str(a.get("actorCellId", "")) == str(cell)]
+            action_summary = ", ".join(
+                f"{a.get('type')}(id={a.get('id')} prog={a.get('isInProgress')})"
+                for a in actions_flat
+            ) or "none"
+            self._log(
+                f"[debug] cell={cell} role={role} "
+                f"my_actions=[{action_summary}]"
+            )
+        except Exception as e:
+            self._log(f"[debug] error: {e}")
+
     # ── Champion select ───────────────────────────────────────────────────────
     def _handle_champ_select(self, cfg: dict):
         r = self._lcu.get("/lol-champ-select/v1/session")
@@ -248,9 +280,13 @@ class AutoEngine:
         for bid in session.get("bans", {}).get("theirTeamBans", []):
             bans.add(int(bid))
 
-        # Find my summoner's cell, role, and what allies have picked/intend
-        my_sid         = self._get_summoner_id()
-        my_cell        = None
+        # Use the session's own localPlayerCellId — more reliable than
+        # matching by summoner ID which can be 0 on first poll.
+        local_cell_id = session.get("localPlayerCellId")
+        if local_cell_id is None:
+            return
+        my_cell = str(local_cell_id)
+
         assigned_role  = ""
         my_champ_id    = 0
         ally_picked:   set = set()
@@ -258,11 +294,9 @@ class AutoEngine:
         enemy_picked:  set = set()
 
         for p in session.get("myTeam", []):
-            sid    = str(p.get("summonerId", ""))
             cid    = int(p.get("championId", 0) or 0)
             intent = int(p.get("championPickIntent", 0) or 0)
-            if sid == str(my_sid):
-                my_cell       = str(p.get("cellId", ""))
+            if str(p.get("cellId", "")) == my_cell:
                 assigned_role = (p.get("assignedPosition") or "").lower()
                 my_champ_id   = cid
             else:
@@ -273,21 +307,37 @@ class AutoEngine:
             cid = int(p.get("championId", 0) or 0)
             if cid: enemy_picked.add(cid)
 
-        if my_cell is None:
-            return  # summoner not found in session yet
-
         # Build availability sets
         unavailable_for_pick = bans | ally_picked | enemy_picked
         unavailable_for_ban  = bans | ally_intents    # don't ban what allies want
 
-        # Resolve per-role champion lists
-        role_key = assigned_role if assigned_role in ROLES else "top"
-        role_cfg = cfg.get("roleChampions", {}).get(role_key, {})
-        pick_prio = [int(c) for c in role_cfg.get("picks", [])]
-        ban_prio  = [int(c) for c in role_cfg.get("bans",  [])]
+        # Resolve per-role champion lists.
+        # If no role is assigned (Practice Tool, fill, etc.) merge all roles
+        # in order so any configured champion can be found.
+        role_cfg_map = cfg.get("roleChampions", {})
+        if assigned_role in ROLES:
+            role_key  = assigned_role
+            pick_prio = [int(c) for c in role_cfg_map.get(role_key, {}).get("picks", [])]
+            ban_prio  = [int(c) for c in role_cfg_map.get(role_key, {}).get("bans",  [])]
+        else:
+            role_key  = "fill"
+            seen: set = set()
+            pick_prio = []
+            ban_prio  = []
+            for r in ROLES:
+                for c in role_cfg_map.get(r, {}).get("picks", []):
+                    if int(c) not in seen:
+                        pick_prio.append(int(c))
+                        seen.add(int(c))
+            seen.clear()
+            for r in ROLES:
+                for c in role_cfg_map.get(r, {}).get("bans", []):
+                    if int(c) not in seen:
+                        ban_prio.append(int(c))
+                        seen.add(int(c))
 
-        # Champions we actually own / can play
-        owned = self._get_owned_ids()
+        # Champions actually pickable in this session (accounts for Practice Tool)
+        owned = self._get_pickable_ids()
 
         # Process each action in the action matrix
         for action_group in session.get("actions", []):
@@ -309,14 +359,29 @@ class AutoEngine:
                     champ = self._best(pick_prio, unavailable_for_pick, owned)
                     if champ and champ != my_champ_id:
                         time.sleep(cfg.get("prePickDelay", 500) / 1000)
-                        self._lcu.patch(
+                        r = self._lcu.patch(
                             f"/lol-champ-select/v1/session/actions/{aid}",
-                            {"championId": champ, "completed": False},
+                            {"championId": champ},
                         )
-                        self._log(
-                            f"Pre-pick hover: #{champ}  "
-                            f"[{ROLE_LABEL.get(role_key, role_key)}]"
-                        )
+                        if r.status_code in (200, 204):
+                            self._log(
+                                f"Pre-pick hover: #{champ}  "
+                                f"[{ROLE_LABEL.get(role_key, role_key)}]"
+                            )
+                            # In modes like Practice Tool the action is
+                            # already ready to complete; try immediately.
+                            # In normal draft this fails silently and the
+                            # regular lock-in path fires on the next poll.
+                            if cfg.get("autoPick"):
+                                rc = self._lcu.complete_action(aid)
+                                if rc.status_code in (200, 204):
+                                    self._log(
+                                        f"Locked champion #{champ} as "
+                                        f"{ROLE_LABEL.get(role_key, role_key)}"
+                                    )
+                                    self._done_actions.add(aid)
+                        else:
+                            self._log(f"Pre-pick hover failed: HTTP {r.status_code}")
 
                 # Lock pick
                 if (cfg.get("autoPick")
@@ -327,19 +392,34 @@ class AutoEngine:
                     champ = self._best(pick_prio, unavailable_for_pick, owned)
                     if champ:
                         time.sleep(cfg.get("pickDelay", 1500) / 1000)
-                        self._lcu.patch(
+                        r = self._lcu.patch(
                             f"/lol-champ-select/v1/session/actions/{aid}",
-                            {"championId": champ, "completed": True},
+                            {"championId": champ},
                         )
-                        self._log(
-                            f"Locked champion #{champ} as "
-                            f"{ROLE_LABEL.get(role_key, role_key)}"
-                        )
-                        self._done_actions.add(aid)
+                        if r.status_code in (200, 204):
+                            rc = self._lcu.complete_action(aid)
+                            if rc.status_code in (200, 204):
+                                self._log(
+                                    f"Locked champion #{champ} as "
+                                    f"{ROLE_LABEL.get(role_key, role_key)}"
+                                )
+                                self._done_actions.add(aid)
+                            else:
+                                self._log(f"Pick complete failed: HTTP {rc.status_code}")
+                        else:
+                            self._log(f"Pick hover failed: HTTP {r.status_code}")
                     else:
+                        blocked = [
+                            cid for cid in pick_prio if cid in unavailable_for_pick
+                        ]
+                        not_playable = [
+                            cid for cid in pick_prio
+                            if cid not in unavailable_for_pick and cid not in owned
+                        ]
                         self._log(
                             f"No available pick for {ROLE_LABEL.get(role_key, role_key)}. "
-                            f"Add more champions to that role's list!"
+                            f"pick_prio={pick_prio} blocked={blocked} "
+                            f"not_playable={not_playable} owned_count={len(owned)}"
                         )
 
                 # Ban
@@ -353,12 +433,19 @@ class AutoEngine:
                                        set(range(1_000_000)))
                     if champ:
                         time.sleep(cfg.get("banDelay", 2000) / 1000)
-                        self._lcu.patch(
+                        r = self._lcu.patch(
                             f"/lol-champ-select/v1/session/actions/{aid}",
-                            {"championId": champ, "completed": True},
+                            {"championId": champ},
                         )
-                        self._log(f"Banned champion #{champ}")
-                        self._done_actions.add(aid)
+                        if r.status_code in (200, 204):
+                            rc = self._lcu.complete_action(aid)
+                            if rc.status_code in (200, 204):
+                                self._log(f"Banned champion #{champ}")
+                                self._done_actions.add(aid)
+                            else:
+                                self._log(f"Ban complete failed: HTTP {rc.status_code}")
+                        else:
+                            self._log(f"Ban hover failed: HTTP {r.status_code}")
                     else:
                         self._log(
                             f"No valid ban for {ROLE_LABEL.get(role_key, role_key)}. "
@@ -376,20 +463,19 @@ class AutoEngine:
         except Exception:
             return 0
 
-    def _get_owned_ids(self) -> set:
+    def _get_pickable_ids(self) -> set:
+        # Use the session-scoped endpoint so Practice Tool (all champs available)
+        # and normal games (ownership/free-rotation filtered) both work correctly.
         try:
-            r = self._lcu.get("/lol-champions/v1/owned-champions-minimal")
-            if r.status_code != 200:
-                return set(range(1_000_000))   # fallback: assume all playable
-            owned = set()
-            for c in r.json():
-                if c.get("active") and (
-                    c.get("ownership", {}).get("owned") or c.get("freeToPlay")
-                ):
-                    owned.add(int(c["id"]))
-            return owned
+            r = self._lcu.get("/lol-champ-select/v1/pickable-champion-ids")
+            if r.status_code == 200:
+                data = r.json()
+                if data:
+                    return {int(c) for c in data}
         except Exception:
-            return set(range(1_000_000))
+            pass
+        # Fallback: assume everything is pickable
+        return set(range(1_000_000))
 
     @staticmethod
     def _best(priority: list, unavailable: set, playable: set):
