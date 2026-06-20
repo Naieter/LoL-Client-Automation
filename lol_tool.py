@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -65,11 +65,10 @@ META_BANS = {
 }
 
 DEFAULT_CONFIG = {
-    "autoAccept":   False,
-    "autoPick":     False,
-    "autoPrePick":  False,
-    "autoBan":      False,
-    "autoReplay":   False,
+    "autoAccept":   True,
+    "autoPick":     True,
+    "autoPrePick":  True,
+    "autoBan":      True,
     "pickDelay":    27000,
     "banDelay":     2000,
     "prePickDelay": 500,
@@ -290,8 +289,6 @@ class AutoEngine:
         self._prepicked:     dict = {}   # aid → championId last hovered (avoids spam)
         self._ban_hovered:   dict = {}   # aid → championId hovered for ban (two-phase)
 
-        self._replay_sent  = False        # play-again already requested this game
-
     def start(self):
         self._stop.clear()
         threading.Thread(target=self._loop, daemon=True).start()
@@ -327,8 +324,6 @@ class AutoEngine:
                 self._prepicked.clear()
                 self._ban_hovered.clear()
                 self._log_champ_select_debug()
-            if phase != "EndOfGame":
-                self._replay_sent = False
 
         # Auto accept
         if cfg.get("autoAccept") and phase == "ReadyCheck":
@@ -337,14 +332,6 @@ class AutoEngine:
 
         if phase == "ChampSelect":
             self._handle_champ_select(cfg)
-
-        # Auto replay — click "Play Again" to requeue once the post-game
-        # lobby is up, instead of having to return to the client manually.
-        if cfg.get("autoReplay") and phase == "EndOfGame" and not self._replay_sent:
-            r = self._lcu.post("/lol-lobby/v2/play-again")
-            if r.status_code in (200, 204):
-                self._log("Auto-replay: requeued for another game.")
-                self._replay_sent = True
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
     def _log_champ_select_debug(self):
@@ -508,7 +495,7 @@ class AutoEngine:
                         if self._commit_action(action, champ, complete=False):
                             self._ban_hovered[aid] = champ
                             self._action_start[aid] = time.monotonic()  # start delay after hover
-                            self._log(f"Ban hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
+                            self._log(f"[debug] Ban hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
                     elif (time.monotonic() - self._action_start[aid]) * 1000 >= cfg.get("banDelay", 2000):
                         # Phase 2 — champion is hovered, lock it the SAME way the pick
                         # locks: atomic PATCH completed:true (the pick proves this works
@@ -920,9 +907,8 @@ class App(tk.Tk):
             ("Auto Pre-Pick", "autoPrePick"),
             ("Auto Pick",     "autoPick"),
             ("Auto Ban",      "autoBan"),
-            ("Auto Replay",   "autoReplay"),
         ]:
-            var = tk.BooleanVar(value=bool(self.cfg.get(key, False)))
+            var = tk.BooleanVar(value=bool(self.cfg.get(key, True)))
             self._bool_vars[key] = var
 
             def _on_toggle(k=key, v=var):
@@ -1065,8 +1051,10 @@ class App(tk.Tk):
 
     def _on_connected(self):
         self._lbl_conn.config(text="● Connected", fg=GREEN)
-        self._btn_start.config(state="normal")
         self.log("League client detected — connected automatically.")
+        # Auto-start automation so it's already running by the time champ
+        # select begins — no need to click Start manually.
+        self._start()
 
     def _on_disconnected(self):
         self._lbl_conn.config(text="● Waiting for client…", fg="#888888")
@@ -1346,6 +1334,10 @@ class App(tk.Tk):
         dialog.destroy()
 
     # ── Log ───────────────────────────────────────────────────────────────────
+    # Messages whose prefix marks them as diagnostics are written to the log file
+    # only — they never reach the on-screen log box, keeping the UI clean.
+    _DEBUG_PREFIXES = ("[tick]", "[debug]", "[trace]", "[ban]", "[pick]")
+
     def log(self, msg: str):
         ts = time.strftime("%H:%M:%S")
         line = f"[{ts}]  {msg}\n"
@@ -1354,6 +1346,8 @@ class App(tk.Tk):
                 f.write(line)
         except Exception:
             pass
+        if msg.startswith(self._DEBUG_PREFIXES):
+            return   # diagnostic — file only, not shown to the end user
         def _do():
             self._log_box.config(state="normal")
             self._log_box.insert("end", line)
