@@ -645,21 +645,19 @@ class OpGGDialog(tk.Toplevel):
 
     def __init__(self, app: "App"):
         super().__init__(app)
-        self._app = app
+        self._app      = app
+        self._summoner = None   # (game_name, tag_line, region) once detected
         self.title("op.gg Auto-fill")
         self.configure(bg=DARK)
         self.resizable(False, False)
         self.grab_set()
 
-        tk.Label(self, text="Paste your op.gg profile URL:", bg=DARK, fg=TEXT,
+        tk.Label(self, text="Summoner (from League Client):", bg=DARK, fg=TEXT,
                  font=("Segoe UI", 10)).pack(padx=20, pady=(20, 4), anchor="w")
 
-        self._url_var = tk.StringVar(
-            value="https://op.gg/lol/summoners/na/YourName-TAG"
-        )
-        tk.Entry(self, textvariable=self._url_var, bg=PANEL, fg=WHITE,
-                 insertbackground=WHITE, relief="flat", width=52,
-                 font=("Segoe UI", 9)).pack(padx=20, pady=(0, 10))
+        self._lbl_summoner = tk.Label(self, text="Detecting…", bg=DARK, fg=TEXT,
+                                      font=("Segoe UI", 10, "bold"), wraplength=420)
+        self._lbl_summoner.pack(padx=20, pady=(0, 10), anchor="w")
 
         opts = tk.Frame(self, bg=DARK)
         opts.pack(padx=20, pady=(0, 10), anchor="w")
@@ -675,9 +673,10 @@ class OpGGDialog(tk.Toplevel):
 
         btn_row = tk.Frame(self, bg=DARK)
         btn_row.pack(padx=20, pady=(0, 10))
-        tk.Button(btn_row, text="Fetch & Fill", bg=GOLD, fg="#000",
-                  activebackground=GOLD, command=self._go,
-                  **BTN_STYLE).pack(side="left", padx=(0, 8))
+        self._btn_fetch = tk.Button(btn_row, text="Fetch & Fill", bg=GOLD, fg="#000",
+                                    activebackground=GOLD, command=self._go,
+                                    state="disabled", **BTN_STYLE)
+        self._btn_fetch.pack(side="left", padx=(0, 8))
         tk.Button(btn_row, text="Cancel", bg=PANEL, fg=TEXT,
                   activebackground=PANEL, command=self.destroy,
                   **BTN_STYLE).pack(side="left")
@@ -686,24 +685,57 @@ class OpGGDialog(tk.Toplevel):
                                     font=("Segoe UI", 9), wraplength=420)
         self._lbl_status.pack(padx=20, pady=(0, 16))
 
+        threading.Thread(target=self._detect, daemon=True).start()
+
+    def _detect(self):
+        lcu = self._app._lcu
+        try:
+            if not lcu._sess:
+                raise RuntimeError("League Client not running")
+            r = lcu.get("/lol-summoner/v1/current-summoner")
+            if r.status_code != 200:
+                raise RuntimeError("Could not read summoner from client")
+            d = r.json()
+            game_name = d.get("gameName") or d.get("displayName", "")
+            tag_line  = d.get("tagLine", "")
+            region    = "na"
+            try:
+                rr = lcu.get("/riotclient/region-locale")
+                if rr.status_code == 200:
+                    region = rr.json().get("webRegion", "NA").lower()
+            except Exception:
+                pass
+            self._summoner = (game_name, tag_line, region)
+            label = f"{game_name}#{tag_line}  ({region.upper()})"
+            self.after(0, lambda: (
+                self._lbl_summoner.config(text=label, fg=GOLD),
+                self._btn_fetch.config(state="normal"),
+            ))
+        except Exception as e:
+            msg = str(e)
+            self.after(0, lambda: self._lbl_summoner.config(text=msg, fg=RED))
+
     def _set_status(self, msg: str, color: str = TEXT):
         self.after(0, lambda: self._lbl_status.config(text=msg, fg=color))
 
     def _go(self):
-        url = self._url_var.get().strip()
+        if not self._summoner:
+            return
         self._lbl_status.config(text="Fetching data…", fg=TEXT)
+        self._btn_fetch.config(state="disabled")
         threading.Thread(
             target=self._run,
-            args=(url, self._do_picks.get(), self._do_bans.get()),
+            args=(*self._summoner, self._do_picks.get(), self._do_bans.get()),
             daemon=True,
         ).start()
 
-    def _run(self, url: str, do_picks: bool, do_bans: bool):
-        rows = self._app._opgg_fetch(url, self._set_status)
+    def _run(self, game_name: str, tag_line: str, region: str,
+             do_picks: bool, do_bans: bool):
+        rows = self._app._opgg_fetch(game_name, tag_line, region, self._set_status)
         if rows is not None:
-            self.after(0, lambda: self._app._opgg_apply(
-                rows, do_picks, do_bans, self
-            ))
+            self.after(0, lambda: self._app._opgg_apply(rows, do_picks, do_bans, self))
+        else:
+            self.after(0, lambda: self._btn_fetch.config(state="normal"))
 
 
 class App(tk.Tk):
@@ -1013,21 +1045,9 @@ class App(tk.Tk):
             return
         OpGGDialog(self)
 
-    def _opgg_fetch(self, url: str, status_fn) -> list | None:
+    def _opgg_fetch(self, game_name: str, tag_line: str, region: str,
+                    status_fn) -> list | None:
         """Fetch op.gg season champion stats via MCP API. Returns [(role, name, games, wins), ...]."""
-        m = _re.match(
-            r'https?://(?:www\.)?op\.gg/lol/summoners/(\w+)/([^/?#\s]+)',
-            url, _re.IGNORECASE,
-        )
-        if not m:
-            status_fn("Invalid URL — expected op.gg/lol/summoners/{region}/{name}", RED)
-            return None
-        region, summoner = m.group(1), m.group(2)
-
-        # op.gg slugifies Riot IDs as "GameName-TAGLINE" in the URL
-        parts = summoner.rsplit("-", 1)
-        game_name, tag_line = (parts[0], parts[1]) if len(parts) == 2 else (summoner, region.upper())
-
         status_fn(f"Fetching {game_name}#{tag_line} season stats…")
 
         def _post(body):
