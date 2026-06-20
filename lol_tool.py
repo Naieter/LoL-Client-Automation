@@ -39,6 +39,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
+APP_VERSION = "1.4.0"
+GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DDRAGON_URL = "https://ddragon.leagueoflegends.com"
@@ -67,7 +69,7 @@ DEFAULT_CONFIG = {
     "autoPrePick":  False,
     "autoBan":      False,
     "autoReplay":   False,
-    "pickDelay":    1500,
+    "pickDelay":    27000,
     "banDelay":     2000,
     "prePickDelay": 500,
     "roleChampions": {role: {"picks": [], "bans": []} for role in ROLES},
@@ -98,6 +100,90 @@ def save_config(cfg: dict):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
+
+# ── Auto-update ───────────────────────────────────────────────────────────────
+def _ver(v: str):
+    try:
+        return tuple(int(x) for x in v.strip().lstrip("v").split("."))
+    except Exception:
+        return (0,)
+
+
+def _update_check(root, log_fn):
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            timeout=10, headers={"Accept": "application/vnd.github+json"},
+        )
+        if r.status_code != 200:
+            return
+        data = r.json()
+        tag = data.get("tag_name", "")
+        if _ver(tag) <= _ver(APP_VERSION):
+            return
+        dl_url = next(
+            (a["browser_download_url"] for a in data.get("assets", [])
+             if a["name"].lower().endswith(".exe")),
+            None,
+        )
+        if not dl_url:
+            return
+        root.after(0, lambda: _update_prompt(root, tag, dl_url, log_fn))
+    except Exception:
+        pass
+
+
+def _update_prompt(root, tag: str, dl_url: str, log_fn):
+    import tkinter.messagebox as _mb
+    if _mb.askyesno(
+        "Update Available",
+        f"v{tag.lstrip('v')} is available  (you have v{APP_VERSION}).\n\n"
+        "Download and restart now?",
+        parent=root,
+    ):
+        threading.Thread(target=_do_update, args=(dl_url, log_fn, root),
+                         daemon=True).start()
+
+
+def _do_update(dl_url: str, log_fn, root):
+    if not getattr(sys, "frozen", False):
+        log_fn("[update] Auto-update only works in the packaged exe.")
+        return
+    exe = Path(sys.executable)
+    tmp = exe.with_name("LOL_Client_Tool_update.exe")
+    bat = exe.with_name("lol_update.bat")
+    try:
+        log_fn("[update] Downloading new version…")
+        resp = requests.get(dl_url, stream=True, timeout=120)
+        resp.raise_for_status()
+        total = int(resp.headers.get("content-length", 0))
+        done  = 0
+        with open(tmp, "wb") as f:
+            for chunk in resp.iter_content(65536):
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    log_fn(f"[update] Downloading… {done * 100 // total}%")
+        log_fn("[update] Download complete — restarting…")
+        bat.write_text(
+            "@echo off\n"
+            "timeout /t 3 /nobreak >nul\n"
+            f'move /y "{tmp}" "{exe}"\n'
+            f'start "" "{exe}"\n'
+            'del "%~f0"\n',
+            encoding="utf-8",
+        )
+        import subprocess as _sp
+        _sp.Popen(
+            ["cmd", "/c", str(bat)],
+            creationflags=0x00000008 | 0x08000000,  # DETACHED_PROCESS | CREATE_NO_WINDOW
+        )
+        root.after(500, root.destroy)
+    except Exception as e:
+        log_fn(f"[update] Failed: {e}")
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
 
 
 # ── DDragon champion data ─────────────────────────────────────────────────────
@@ -198,7 +284,8 @@ class AutoEngine:
         self._log          = log_fn    # callable(str)
         self._stop         = threading.Event()
         self._last_phase   = ""
-        self._done_actions: set = set()   # action IDs already processed
+        self._done_actions:   set  = set()  # action IDs already processed
+        self._action_start:  dict = {}    # aid → monotonic time when isInProgress first seen
         self._replay_sent  = False        # play-again already requested this game
 
     def start(self):
@@ -230,6 +317,7 @@ class AutoEngine:
             self._last_phase = phase
             if phase == "ChampSelect":
                 self._done_actions.clear()
+                self._action_start.clear()
                 self._log_champ_select_debug()
             if phase != "EndOfGame":
                 self._replay_sent = False
@@ -398,9 +486,13 @@ class AutoEngine:
                         and in_progress
                         and not completed
                         and aid not in self._done_actions):
+                    if aid not in self._action_start:
+                        self._action_start[aid] = time.monotonic()
+                    elapsed_ms = (time.monotonic() - self._action_start[aid]) * 1000
+                    if elapsed_ms < cfg.get("pickDelay", 27000):
+                        continue
                     champ = self._best(pick_prio, unavailable_for_pick, owned)
                     if champ:
-                        time.sleep(cfg.get("pickDelay", 1500) / 1000)
                         r = self._lcu.patch(
                             f"/lol-champ-select/v1/session/actions/{aid}",
                             {"championId": champ},
@@ -437,11 +529,15 @@ class AutoEngine:
                         and in_progress
                         and not completed
                         and aid not in self._done_actions):
+                    if aid not in self._action_start:
+                        self._action_start[aid] = time.monotonic()
+                    elapsed_ms = (time.monotonic() - self._action_start[aid]) * 1000
+                    if elapsed_ms < cfg.get("banDelay", 2000):
+                        continue
                     # any champion can be banned (no ownership check)
                     champ = self._best(ban_prio, unavailable_for_ban,
                                        set(range(1_000_000)))
                     if champ:
-                        time.sleep(cfg.get("banDelay", 2000) / 1000)
                         r = self._lcu.patch(
                             f"/lol-champ-select/v1/session/actions/{aid}",
                             {"championId": champ},
@@ -762,6 +858,11 @@ class App(tk.Tk):
 
         # Watch for the League client to open (auto-connect on launch)
         threading.Thread(target=self._watch_for_client, daemon=True).start()
+
+        # Check for updates 3 s after startup so the UI is fully loaded first
+        self.after(3000, lambda: threading.Thread(
+            target=_update_check, args=(self, self.log), daemon=True,
+        ).start())
 
     # ── Champion data ─────────────────────────────────────────────────────────
     def _load_champs(self):
