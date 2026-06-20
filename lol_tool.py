@@ -9,8 +9,9 @@ WARNING: Third-party automation tools may violate Riot Games' Terms of Service
 and could result in account penalties. Use at your own risk.
 """
 
-import sys, os, json, threading, time
+import sys, os, json, threading, time, re as _re, math as _math
 from pathlib import Path
+from collections import defaultdict
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext
@@ -50,6 +51,14 @@ ROLE_LABEL = {
     "middle":  "Mid",
     "bottom":  "ADC",
     "utility": "Support",
+}
+
+META_BANS = {
+    "top":     ["Darius", "Camille", "Fiora", "Renekton", "Garen"],
+    "jungle":  ["Lee Sin", "Hecarim", "Nocturne", "Vi", "Briar"],
+    "middle":  ["LeBlanc", "Fizz", "Zed", "Syndra", "Ahri"],
+    "bottom":  ["Caitlyn", "Jinx", "Jhin", "Kai'Sa", "Miss Fortune"],
+    "utility": ["Blitzcrank", "Thresh", "Nautilus", "Pyke", "Leona"],
 }
 
 DEFAULT_CONFIG = {
@@ -631,6 +640,72 @@ class RolePanel:
         return self._widgets[f"{list_key}_lb"]
 
 
+class OpGGDialog(tk.Toplevel):
+    """Dialog that fetches op.gg champion stats and auto-fills pick/ban lists."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app)
+        self._app = app
+        self.title("op.gg Auto-fill")
+        self.configure(bg=DARK)
+        self.resizable(False, False)
+        self.grab_set()
+
+        tk.Label(self, text="Paste your op.gg profile URL:", bg=DARK, fg=TEXT,
+                 font=("Segoe UI", 10)).pack(padx=20, pady=(20, 4), anchor="w")
+
+        self._url_var = tk.StringVar(
+            value="https://op.gg/lol/summoners/na/YourName-TAG"
+        )
+        tk.Entry(self, textvariable=self._url_var, bg=PANEL, fg=WHITE,
+                 insertbackground=WHITE, relief="flat", width=52,
+                 font=("Segoe UI", 9)).pack(padx=20, pady=(0, 10))
+
+        opts = tk.Frame(self, bg=DARK)
+        opts.pack(padx=20, pady=(0, 10), anchor="w")
+        self._do_picks = tk.BooleanVar(value=True)
+        self._do_bans  = tk.BooleanVar(value=True)
+        tk.Checkbutton(opts, text="Fill picks  (from your stats)",
+                       variable=self._do_picks, bg=DARK, fg=TEXT,
+                       activebackground=DARK, selectcolor=PANEL).pack(
+            side="left", padx=(0, 12))
+        tk.Checkbutton(opts, text="Fill bans  (meta suggestions)",
+                       variable=self._do_bans, bg=DARK, fg=TEXT,
+                       activebackground=DARK, selectcolor=PANEL).pack(side="left")
+
+        btn_row = tk.Frame(self, bg=DARK)
+        btn_row.pack(padx=20, pady=(0, 10))
+        tk.Button(btn_row, text="Fetch & Fill", bg=GOLD, fg="#000",
+                  activebackground=GOLD, command=self._go,
+                  **BTN_STYLE).pack(side="left", padx=(0, 8))
+        tk.Button(btn_row, text="Cancel", bg=PANEL, fg=TEXT,
+                  activebackground=PANEL, command=self.destroy,
+                  **BTN_STYLE).pack(side="left")
+
+        self._lbl_status = tk.Label(self, text="", bg=DARK, fg=TEXT,
+                                    font=("Segoe UI", 9), wraplength=420)
+        self._lbl_status.pack(padx=20, pady=(0, 16))
+
+    def _set_status(self, msg: str, color: str = TEXT):
+        self.after(0, lambda: self._lbl_status.config(text=msg, fg=color))
+
+    def _go(self):
+        url = self._url_var.get().strip()
+        self._lbl_status.config(text="Fetching data…", fg=TEXT)
+        threading.Thread(
+            target=self._run,
+            args=(url, self._do_picks.get(), self._do_bans.get()),
+            daemon=True,
+        ).start()
+
+    def _run(self, url: str, do_picks: bool, do_bans: bool):
+        rows = self._app._opgg_fetch(url, self._set_status)
+        if rows is not None:
+            self.after(0, lambda: self._app._opgg_apply(
+                rows, do_picks, do_bans, self
+            ))
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -752,6 +827,11 @@ class App(tk.Tk):
                   bg=PANEL, fg=TEXT, activebackground=PANEL,
                   padx=10, command=self._save,
                   **BTN_STYLE).pack(side="right")
+
+        tk.Button(btns, text="op.gg Auto-fill",
+                  bg=PANEL, fg=GOLD, activebackground=PANEL,
+                  padx=10, command=self._open_opgg_dialog,
+                  **BTN_STYLE).pack(side="right", padx=(0, 6))
 
         # Assigned role indicator (updated while automation runs)
         self._lbl_role = tk.Label(parent, text="Assigned role: —",
@@ -925,6 +1005,226 @@ class App(tk.Tk):
             return
         self.cfg["roleChampions"][role][key].pop(sel[0])
         self.refresh_list(role, key)
+
+    # ── op.gg Auto-fill ───────────────────────────────────────────────────────
+    def _open_opgg_dialog(self):
+        if not self.ddragon.all_display_names():
+            self.log("Champion data not loaded yet — please wait a moment.")
+            return
+        OpGGDialog(self)
+
+    def _opgg_fetch(self, url: str, status_fn) -> list | None:
+        """Fetch op.gg season champion stats via MCP API. Returns [(role, name, games, wins), ...]."""
+        m = _re.match(
+            r'https?://(?:www\.)?op\.gg/lol/summoners/(\w+)/([^/?#\s]+)',
+            url, _re.IGNORECASE,
+        )
+        if not m:
+            status_fn("Invalid URL — expected op.gg/lol/summoners/{region}/{name}", RED)
+            return None
+        region, summoner = m.group(1), m.group(2)
+
+        # op.gg slugifies Riot IDs as "GameName-TAGLINE" in the URL
+        parts = summoner.rsplit("-", 1)
+        game_name, tag_line = (parts[0], parts[1]) if len(parts) == 2 else (summoner, region.upper())
+
+        status_fn(f"Fetching {game_name}#{tag_line} season stats…")
+
+        def _post(body):
+            return requests.post(
+                "https://mcp-api.op.gg/mcp", json=body, timeout=15,
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+
+        # ── Request 1: season champion stats ─────────────────────────────────
+        profile_body = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "lol_get_summoner_profile",
+                "arguments": {
+                    "game_name": game_name, "tag_line": tag_line,
+                    "region": region.upper(),
+                    "desired_output_fields": ["data.summoner.most_champions"],
+                },
+            },
+        }
+        # ── Request 2: meta champion→primary-role map ─────────────────────────
+        meta_body = {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "lol_list_lane_meta_champions",
+                "arguments": {
+                    "region": region.upper(),
+                    "desired_output_fields": [
+                        "data.positions.top[].champion",    "data.positions.top[].role_rate",
+                        "data.positions.mid[].champion",    "data.positions.mid[].role_rate",
+                        "data.positions.jungle[].champion", "data.positions.jungle[].role_rate",
+                        "data.positions.adc[].champion",    "data.positions.adc[].role_rate",
+                        "data.positions.support[].champion","data.positions.support[].role_rate",
+                    ],
+                },
+            },
+        }
+        try:
+            r1 = _post(profile_body)
+            r2 = _post(meta_body)
+            r1.raise_for_status(); r2.raise_for_status()
+        except Exception as e:
+            status_fn(f"Network error: {e}", RED)
+            return None
+
+        def _text(resp):
+            try:
+                return resp.json()["result"]["content"][0]["text"]
+            except Exception:
+                return ""
+
+        profile_text = _text(r1)
+        meta_text    = _text(r2)
+        if not profile_text or not meta_text:
+            status_fn("No data returned from op.gg.", RED)
+            return None
+
+        status_fn("Parsing season stats…")
+
+        # ── Parse season champion stats ───────────────────────────────────────
+        # Format: ChampionStat(id, play, win, lose, ...numbers/nulls..., "champion_name")
+        champ_stats: dict = {}
+        for mo in _re.finditer(
+            r'ChampionStat\(\d+,(\d+),(\d+),[^"]*"([^"]+)"\)', profile_text
+        ):
+            games, wins, name = int(mo.group(1)), int(mo.group(2)), mo.group(3)
+            if games > 0:
+                champ_stats[name] = (games, wins)
+
+        if not champ_stats:
+            status_fn("No season champion stats found — play more ranked games.", RED)
+            return None
+
+        # ── Parse meta champion→role map (role_rate = fraction of games in that lane) ──
+        # Response: Positions([...top...],[...mid...],[...jungle...],[...adc...],[...support...]))
+        pos_m = _re.search(r'Positions\(\[(.*)\]\)\)', meta_text, _re.DOTALL)
+        if not pos_m:
+            status_fn("Could not parse meta champion roles.", RED)
+            return None
+
+        role_order = ["top", "middle", "jungle", "bottom", "utility"]
+        champ_role: dict = {}  # name -> (role, rate)
+        for role, segment in zip(role_order, pos_m.group(1).split("],[")):
+            for mo in _re.finditer(r'Top\("([^"]+)",([\d.]+)\)', segment):
+                name, rate = mo.group(1), float(mo.group(2))
+                if name not in champ_role or rate > champ_role[name][1]:
+                    champ_role[name] = (role, rate)
+
+        # ── Fetch recent match history for exact role overrides ───────────────
+        status_fn("Cross-referencing recent games for role accuracy…")
+        hist_body = {
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "lol_list_summoner_matches",
+                "arguments": {
+                    "game_name": game_name, "tag_line": tag_line,
+                    "region": region.upper(), "limit": 20,
+                    "desired_output_fields": [
+                        "data.game_history[].participants[].champion_name",
+                        "data.game_history[].participants[].position",
+                        "data.game_history[].participants[].stats.result",
+                    ],
+                },
+            },
+        }
+        try:
+            r3 = _post(hist_body)
+            hist_text = _text(r3)
+        except Exception:
+            hist_text = ""
+
+        # Build champion→role and recent win/loss from match history
+        # Recent games are double-counted in the final stats so recently-active
+        # champions score higher through the sqrt(games) term in Bayesian scoring.
+        hist_role:  dict = {}  # champ -> role (exact, overrides meta)
+        hist_extra: dict = defaultdict(lambda: [0, 0])  # champ -> [extra_games, extra_wins]
+        if hist_text:
+            hist_pat = _re.compile(
+                r'Participant\("([^"]+)",(null|"([^"]+)"),Stats\("([^"]+)"\)\)'
+            )
+            for mo in hist_pat.finditer(hist_text):
+                champ  = mo.group(1)
+                pos    = mo.group(3)
+                result = mo.group(4)
+                if pos:
+                    hist_role.setdefault(champ, self._opgg_role(pos))
+                    hist_extra[champ][0] += 1
+                    if result == "WIN":
+                        hist_extra[champ][1] += 1
+
+        # ── Combine ───────────────────────────────────────────────────────────
+        rows = []
+        for name, (season_g, season_w) in champ_stats.items():
+            role = hist_role.get(name) or (champ_role.get(name, (None,))[0])
+            if not role:
+                continue
+            extra_g, extra_w = hist_extra.get(name, [0, 0])
+            rows.append((role, name, season_g + extra_g, season_w + extra_w))
+
+        if not rows:
+            status_fn("No champion-role matches found.", RED)
+            return None
+
+        total = sum(g for _, _, g, _ in rows)
+        status_fn(f"Found {len(rows)} champions from {total} season games (recent games weighted 2×).")
+        return rows
+
+    @staticmethod
+    def _opgg_role(pos: str) -> str:
+        p = pos.lower().strip()
+        if p in ("top", "toplane"):                            return "top"
+        if p in ("jungle", "jng", "jung", "jungler"):         return "jungle"
+        if p in ("mid", "middle", "midlane"):                  return "middle"
+        if p in ("bot", "bottom", "adc", "carry", "botlane"): return "bottom"
+        if p in ("sup", "supp", "support", "utility"):        return "utility"
+        return ""
+
+    def _opgg_apply(self, rows: list, do_picks: bool, do_bans: bool,
+                    dialog: "OpGGDialog"):
+        by_role: dict = defaultdict(list)
+        for role, name, games, wins in rows:
+            bwr   = (wins + 1) / (games + 2)
+            score = bwr * _math.sqrt(games)
+            by_role[role].append((score, name))
+        for role in by_role:
+            by_role[role].sort(reverse=True)
+
+        changed: list = []
+        for role in ROLES:
+            rc = self.cfg["roleChampions"].setdefault(
+                role, {"picks": [], "bans": []}
+            )
+            if do_picks and role in by_role:
+                ids = []
+                for _, name in by_role[role][:5]:
+                    cid = self.ddragon.find_id(name)
+                    if cid is not None:
+                        ids.append(cid)
+                if ids:
+                    rc["picks"] = ids
+                    changed.append(role)
+            if do_bans:
+                ban_ids = []
+                for name in META_BANS.get(role, []):
+                    cid = self.ddragon.find_id(name)
+                    if cid is not None:
+                        ban_ids.append(cid)
+                if ban_ids:
+                    rc["bans"] = ban_ids
+
+        self._refresh_all()
+        save_config(self.cfg)
+        roles_str = ", ".join(ROLE_LABEL[r] for r in changed) or "none"
+        self.log(f"op.gg auto-fill complete. Picks updated: {roles_str}.")
+        if do_bans:
+            self.log("Ban lists filled with meta suggestions.")
+        dialog.destroy()
 
     # ── Log ───────────────────────────────────────────────────────────────────
     def log(self, msg: str):
