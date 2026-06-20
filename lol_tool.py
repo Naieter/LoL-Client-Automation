@@ -39,10 +39,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.1"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+LOG_FILE    = CONFIG_DIR / "lol_tool.log"
 DDRAGON_URL = "https://ddragon.leagueoflegends.com"
 
 # LCU assignedPosition values
@@ -276,7 +277,7 @@ class LCU:
 class AutoEngine:
     """Polls the LCU every 2 s and acts based on game flow phase."""
 
-    POLL = 2  # seconds
+    POLL = 0.5  # seconds
 
     def __init__(self, lcu: LCU, cfg_fn, log_fn):
         self._lcu          = lcu
@@ -284,8 +285,11 @@ class AutoEngine:
         self._log          = log_fn    # callable(str)
         self._stop         = threading.Event()
         self._last_phase   = ""
-        self._done_actions:   set  = set()  # action IDs already processed
-        self._action_start:  dict = {}    # aid → monotonic time when isInProgress first seen
+        self._done_actions:  set  = set()
+        self._action_start:  dict = {}   # aid → monotonic time when isInProgress first seen
+        self._prepicked:     dict = {}   # aid → championId last hovered (avoids spam)
+        self._ban_hovered:   dict = {}   # aid → championId hovered for ban (two-phase)
+
         self._replay_sent  = False        # play-again already requested this game
 
     def start(self):
@@ -300,6 +304,8 @@ class AutoEngine:
         while not self._stop.is_set():
             try:
                 self._tick()
+            except requests.exceptions.ConnectionError:
+                pass   # League client not running — expected, no need to log
             except Exception as exc:
                 self._log(f"[error] {exc}")
             time.sleep(self.POLL)
@@ -318,6 +324,8 @@ class AutoEngine:
             if phase == "ChampSelect":
                 self._done_actions.clear()
                 self._action_start.clear()
+                self._prepicked.clear()
+                self._ban_hovered.clear()
                 self._log_champ_select_debug()
             if phase != "EndOfGame":
                 self._replay_sent = False
@@ -364,53 +372,57 @@ class AutoEngine:
             self._log(f"[debug] error: {e}")
 
     # ── Champion select ───────────────────────────────────────────────────────
+    # Faithful port of Terevenen2/LOL-CLient-TOOL MainWindow.axaml.cs auto pick/ban.
+    # Key mechanics taken from the reference:
+    #   • A single PATCH carries the FULL action body and "completed": true/false —
+    #     true commits a pick/ban, false just hovers (pre-pick). No /complete call.
+    #   • Bans avoid champions already banned or in an ally's championPickIntent.
+    #   • Picks remove champions already taken by allies/enemies from the playable
+    #     pool before choosing.
+    # Adapted for Python: the reference's blocking `await Task.Delay` is replaced by
+    # non-blocking elapsed-time tracking so the poll thread is never stalled.
     def _handle_champ_select(self, cfg: dict):
         r = self._lcu.get("/lol-champ-select/v1/session")
         if r.status_code != 200:
             return
         session = r.json()
 
-        # Collect banned champion IDs
+        # ── bans + ally pick intents (reference: bans list + championPickIntent) ──
         bans: set = set()
         for bid in session.get("bans", {}).get("myTeamBans", []):
-            bans.add(int(bid))
+            if int(bid): bans.add(int(bid))
         for bid in session.get("bans", {}).get("theirTeamBans", []):
-            bans.add(int(bid))
+            if int(bid): bans.add(int(bid))
 
-        # Use the session's own localPlayerCellId — more reliable than
-        # matching by summoner ID which can be 0 on first poll.
+        pick_intents: set = set()
+        for p in session.get("myTeam", []):
+            intent = int(p.get("championPickIntent", 0) or 0)
+            if intent:
+                pick_intents.add(intent)
+
+        # ── locate our own cell ──
         local_cell_id = session.get("localPlayerCellId")
         if local_cell_id is None:
             return
         my_cell = str(local_cell_id)
 
-        assigned_role  = ""
-        my_champ_id    = 0
-        ally_picked:   set = set()
-        ally_intents:  set = set()
-        enemy_picked:  set = set()
-
+        assigned_role = ""
         for p in session.get("myTeam", []):
-            cid    = int(p.get("championId", 0) or 0)
-            intent = int(p.get("championPickIntent", 0) or 0)
             if str(p.get("cellId", "")) == my_cell:
                 assigned_role = (p.get("assignedPosition") or "").lower()
-                my_champ_id   = cid
-            else:
-                if cid:    ally_picked.add(cid)
-                if intent: ally_intents.add(intent)
+                break
 
+        # ── champions already taken (removed from the playable pool, like the ref) ──
+        taken: set = set()
+        for p in session.get("myTeam", []):
+            if str(p.get("cellId", "")) != my_cell:
+                cid = int(p.get("championId", 0) or 0)
+                if cid: taken.add(cid)
         for p in session.get("theirTeam", []):
             cid = int(p.get("championId", 0) or 0)
-            if cid: enemy_picked.add(cid)
+            if cid: taken.add(cid)
 
-        # Build availability sets
-        unavailable_for_pick = bans | ally_picked | enemy_picked
-        unavailable_for_ban  = bans | ally_intents    # don't ban what allies want
-
-        # Resolve per-role champion lists.
-        # If no role is assigned (Practice Tool, fill, etc.) merge all roles
-        # in order so any configured champion can be found.
+        # ── resolve role-based priority lists (this tool's own feature) ──
         role_cfg_map = cfg.get("roleChampions", {})
         if assigned_role in ROLES:
             role_key  = assigned_role
@@ -419,24 +431,35 @@ class AutoEngine:
         else:
             role_key  = "fill"
             seen: set = set()
-            pick_prio = []
-            ban_prio  = []
-            for r in ROLES:
-                for c in role_cfg_map.get(r, {}).get("picks", []):
+            pick_prio, ban_prio = [], []
+            for rk in ROLES:
+                for c in role_cfg_map.get(rk, {}).get("picks", []):
                     if int(c) not in seen:
-                        pick_prio.append(int(c))
-                        seen.add(int(c))
+                        pick_prio.append(int(c)); seen.add(int(c))
             seen.clear()
-            for r in ROLES:
-                for c in role_cfg_map.get(r, {}).get("bans", []):
+            for rk in ROLES:
+                for c in role_cfg_map.get(rk, {}).get("bans", []):
                     if int(c) not in seen:
-                        ban_prio.append(int(c))
-                        seen.add(int(c))
+                        ban_prio.append(int(c)); seen.add(int(c))
 
-        # Champions actually pickable in this session (accounts for Practice Tool)
-        owned = self._get_pickable_ids()
+        # Champions actually selectable this session (Practice Tool → all)
+        playable = self._get_pickable_ids()
+        # Reference removes already-taken champions from the playable pool
+        playable_now = playable - taken - bans
 
-        # Process each action in the action matrix
+        # ── diagnostic: log only on state change ──
+        _states = [
+            f"{a.get('type')}(id={a.get('id')} champ={a.get('championId')} prog={a.get('isInProgress')} done={a.get('completed')})"
+            for grp in session.get("actions", [])
+            for a in grp
+            if str(a.get("actorCellId", "")) == my_cell
+        ]
+        _key = f"{_states}|bans={sorted(bans)}|intent={sorted(pick_intents)}"
+        if _key != getattr(self, "_last_state_key", None):
+            self._log(f"[tick] {_states}  bans={sorted(bans)}")
+            self._last_state_key = _key
+
+        # ── action loop (mirrors reference foreach actions → foreach team) ──
         for action_group in session.get("actions", []):
             for action in action_group:
                 if str(action.get("actorCellId", "")) != my_cell:
@@ -447,40 +470,7 @@ class AutoEngine:
                 in_progress = bool(action.get("isInProgress", False))
                 completed   = bool(action.get("completed", False))
 
-                # Pre-pick (hover intent before your turn)
-                if (cfg.get("autoPrePick")
-                        and atype == "pick"
-                        and not in_progress
-                        and not completed
-                        and aid not in self._done_actions):
-                    champ = self._best(pick_prio, unavailable_for_pick, owned)
-                    if champ and champ != my_champ_id:
-                        time.sleep(cfg.get("prePickDelay", 500) / 1000)
-                        r = self._lcu.patch(
-                            f"/lol-champ-select/v1/session/actions/{aid}",
-                            {"championId": champ},
-                        )
-                        if r.status_code in (200, 204):
-                            self._log(
-                                f"Pre-pick hover: #{champ}  "
-                                f"[{ROLE_LABEL.get(role_key, role_key)}]"
-                            )
-                            # In modes like Practice Tool the action is
-                            # already ready to complete; try immediately.
-                            # In normal draft this fails silently and the
-                            # regular lock-in path fires on the next poll.
-                            if cfg.get("autoPick"):
-                                rc = self._lcu.complete_action(aid)
-                                if rc.status_code in (200, 204):
-                                    self._log(
-                                        f"Locked champion #{champ} as "
-                                        f"{ROLE_LABEL.get(role_key, role_key)}"
-                                    )
-                                    self._done_actions.add(aid)
-                        else:
-                            self._log(f"Pre-pick hover failed: HTTP {r.status_code}")
-
-                # Lock pick
+                # ── PICK ── reference: isInProgress && type==pick && autoPick
                 if (cfg.get("autoPick")
                         and atype == "pick"
                         and in_progress
@@ -488,74 +478,79 @@ class AutoEngine:
                         and aid not in self._done_actions):
                     if aid not in self._action_start:
                         self._action_start[aid] = time.monotonic()
-                    elapsed_ms = (time.monotonic() - self._action_start[aid]) * 1000
-                    if elapsed_ms < cfg.get("pickDelay", 27000):
+                    if (time.monotonic() - self._action_start[aid]) * 1000 < cfg.get("pickDelay", 27000):
                         continue
-                    champ = self._best(pick_prio, unavailable_for_pick, owned)
+                    champ = self._best(pick_prio, set(), playable_now)
                     if champ:
-                        r = self._lcu.patch(
-                            f"/lol-champ-select/v1/session/actions/{aid}",
-                            {"championId": champ},
-                        )
-                        if r.status_code in (200, 204):
-                            rc = self._lcu.complete_action(aid)
-                            if rc.status_code in (200, 204):
-                                self._log(
-                                    f"Locked champion #{champ} as "
-                                    f"{ROLE_LABEL.get(role_key, role_key)}"
-                                )
-                                self._done_actions.add(aid)
-                            else:
-                                self._log(f"Pick complete failed: HTTP {rc.status_code}")
-                        else:
-                            self._log(f"Pick hover failed: HTTP {r.status_code}")
+                        ok = self._commit_action(action, champ, complete=True)
+                        if ok:
+                            self._log(f"Locked champion #{champ} as {ROLE_LABEL.get(role_key, role_key)}")
+                            self._done_actions.add(aid)
                     else:
-                        blocked = [
-                            cid for cid in pick_prio if cid in unavailable_for_pick
-                        ]
-                        not_playable = [
-                            cid for cid in pick_prio
-                            if cid not in unavailable_for_pick and cid not in owned
-                        ]
-                        self._log(
-                            f"No available pick for {ROLE_LABEL.get(role_key, role_key)}. "
-                            f"pick_prio={pick_prio} blocked={blocked} "
-                            f"not_playable={not_playable} owned_count={len(owned)}"
-                        )
+                        self._log(f"No available pick for {ROLE_LABEL.get(role_key, role_key)}. pick_prio={pick_prio}")
 
-                # Ban
-                if (cfg.get("autoBan")
+                # ── BAN ── two-phase: hover the champion first so the LCU registers
+                # it, THEN complete on a later poll. A single championId+completed
+                # PATCH is silently ignored for bans (champion was never hovered);
+                # this mirrors why picks work — they're pre-hovered before locking.
+                elif (cfg.get("autoBan")
                         and atype == "ban"
                         and in_progress
                         and not completed
                         and aid not in self._done_actions):
                     if aid not in self._action_start:
                         self._action_start[aid] = time.monotonic()
-                    elapsed_ms = (time.monotonic() - self._action_start[aid]) * 1000
-                    if elapsed_ms < cfg.get("banDelay", 2000):
-                        continue
-                    # any champion can be banned (no ownership check)
-                    champ = self._best(ban_prio, unavailable_for_ban,
-                                       set(range(1_000_000)))
-                    if champ:
-                        r = self._lcu.patch(
-                            f"/lol-champ-select/v1/session/actions/{aid}",
-                            {"championId": champ},
-                        )
-                        if r.status_code in (200, 204):
-                            rc = self._lcu.complete_action(aid)
-                            if rc.status_code in (200, 204):
-                                self._log(f"Banned champion #{champ}")
-                                self._done_actions.add(aid)
-                            else:
-                                self._log(f"Ban complete failed: HTTP {rc.status_code}")
-                        else:
-                            self._log(f"Ban hover failed: HTTP {r.status_code}")
-                    else:
-                        self._log(
-                            f"No valid ban for {ROLE_LABEL.get(role_key, role_key)}. "
-                            f"Add champions to that role's ban list!"
-                        )
+                    champ = self._best(ban_prio, bans | pick_intents, set(range(1_000_000)))
+                    if not champ:
+                        self._log(f"No valid ban for {ROLE_LABEL.get(role_key, role_key)}. Add champions to the ban list!")
+                    elif self._ban_hovered.get(aid) != champ:
+                        # Phase 1 — hover the ban target (no completion yet)
+                        if self._commit_action(action, champ, complete=False):
+                            self._ban_hovered[aid] = champ
+                            self._action_start[aid] = time.monotonic()  # start delay after hover
+                            self._log(f"Ban hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
+                    elif (time.monotonic() - self._action_start[aid]) * 1000 >= cfg.get("banDelay", 2000):
+                        # Phase 2 — champion is hovered, lock it the SAME way the pick
+                        # locks: atomic PATCH completed:true (the pick proves this works
+                        # once the champion is already hovered).
+                        cur = int(action.get("championId", 0) or 0)
+                        if cur != champ:
+                            # hover didn't stick yet — re-hover and wait another cycle
+                            self._ban_hovered[aid] = None
+                            continue
+                        if self._commit_action(action, champ, complete=True):
+                            self._log(f"Banned champion #{champ}")
+                            self._done_actions.add(aid)
+
+                # ── PRE-PICK ── reference: autoPrePick hovers the pick before our turn
+                elif (cfg.get("autoPrePick")
+                        and atype == "pick"
+                        and not in_progress
+                        and not completed
+                        and aid not in self._done_actions):
+                    champ = self._best(pick_prio, set(), playable_now)
+                    if champ and self._prepicked.get(aid) != champ:
+                        if self._commit_action(action, champ, complete=False):
+                            self._prepicked[aid] = champ
+                            self._log(f"Pre-pick hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
+
+    def _commit_action(self, action: dict, champ: int, complete: bool) -> bool:
+        """PATCH an action with the full reference body. complete=True locks the
+        pick/ban; complete=False only hovers (pre-pick intent)."""
+        aid = int(action.get("id", -1))
+        body = {
+            "actorCellId":  action.get("actorCellId"),
+            "championId":   champ,
+            "completed":    complete,
+            "id":           aid,
+            "isAllyAction": True,
+            "type":         action.get("type", "string"),
+        }
+        r = self._lcu.patch(f"/lol-champ-select/v1/session/actions/{aid}", body)
+        if r.status_code not in (200, 204):
+            self._log(f"[{action.get('type')}] PATCH HTTP {r.status_code} body={r.text[:150]}")
+            return False
+        return True
 
     # ── LCU helpers ───────────────────────────────────────────────────────────
     def _get_summoner_id(self) -> int:
@@ -840,6 +835,9 @@ class App(tk.Tk):
         self.title(APP_NAME)
         self.configure(bg=DARK)
         self.resizable(False, False)
+
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        LOG_FILE.write_text("", encoding="utf-8")  # clear on startup
 
         self.cfg     = load_config()
         self.ddragon = DDragon()
@@ -1349,10 +1347,16 @@ class App(tk.Tk):
 
     # ── Log ───────────────────────────────────────────────────────────────────
     def log(self, msg: str):
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}]  {msg}\n"
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
         def _do():
-            ts = time.strftime("%H:%M:%S")
             self._log_box.config(state="normal")
-            self._log_box.insert("end", f"[{ts}]  {msg}\n")
+            self._log_box.insert("end", line)
             self._log_box.see("end")
             if int(self._log_box.index("end-1c").split(".")[0]) > 500:
                 self._log_box.delete("1.0", "2.0")
