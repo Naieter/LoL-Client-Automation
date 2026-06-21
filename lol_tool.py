@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -56,6 +56,22 @@ ROLE_LABEL = {
     "utility": "Support",
 }
 
+# Summoner-spell IDs:  Flash=4 Teleport=12 Smite=11 Ignite=14 Heal=7 Exhaust=3
+# Fallback spell pairs used only when no meta data is available for the champ.
+ROLE_SPELLS = {
+    "top":     (4, 12),   # Flash + Teleport
+    "jungle":  (4, 11),   # Flash + Smite
+    "middle":  (4, 14),   # Flash + Ignite
+    "bottom":  (4, 7),    # Flash + Heal
+    "utility": (4, 14),   # Flash + Ignite
+}
+
+# LCU assignedPosition → op.gg position enum
+OPGG_POSITION = {
+    "top": "top", "jungle": "jungle", "middle": "mid",
+    "bottom": "adc", "utility": "support",
+}
+
 META_BANS = {
     "top":     ["Darius", "Camille", "Fiora", "Renekton", "Garen"],
     "jungle":  ["Lee Sin", "Hecarim", "Nocturne", "Vi", "Briar"],
@@ -69,6 +85,7 @@ DEFAULT_CONFIG = {
     "autoPick":     True,
     "autoPrePick":  True,
     "autoBan":      True,
+    "autoRunes":    True,
     "pickDelay":    27000,
     "banDelay":     2000,
     "prePickDelay": 500,
@@ -191,6 +208,7 @@ class DDragon:
     def __init__(self):
         self._id_to_name: dict = {}
         self._name_to_id: dict = {}   # lowercase name → int id
+        self._id_to_key:  dict = {}   # int id → internal key (e.g. "MissFortune")
 
     def load(self):
         try:
@@ -203,11 +221,19 @@ class DDragon:
                 name = champ["name"]
                 self._id_to_name[cid] = name
                 self._name_to_id[name.lower()] = cid
+                self._id_to_key[cid] = champ["id"]   # e.g. "MissFortune", "DrMundo"
         except Exception as e:
             print(f"[DDragon] {e}")
 
     def name(self, champ_id: int) -> str:
         return self._id_to_name.get(int(champ_id), str(champ_id))
+
+    def opgg_name(self, champ_id: int):
+        """Champion name in op.gg's UPPER_SNAKE_CASE (e.g. MISS_FORTUNE)."""
+        key = self._id_to_key.get(int(champ_id))
+        if not key:
+            return None
+        return _re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).upper()
 
     def find_id(self, name: str):
         return self._name_to_id.get(name.strip().lower())
@@ -265,6 +291,12 @@ class LCU:
     def patch(self, ep: str, body=None):
         return self._sess.patch(f"{self._base}{ep}", json=body, timeout=5)
 
+    def put(self, ep: str, body=None):
+        return self._sess.put(f"{self._base}{ep}", json=body, timeout=5)
+
+    def delete(self, ep: str):
+        return self._sess.delete(f"{self._base}{ep}", timeout=5)
+
     def complete_action(self, action_id: int):
         return self._sess.post(
             f"{self._base}/lol-champ-select/v1/session/actions/{action_id}/complete",
@@ -278,16 +310,18 @@ class AutoEngine:
 
     POLL = 0.5  # seconds
 
-    def __init__(self, lcu: LCU, cfg_fn, log_fn):
+    def __init__(self, lcu: LCU, cfg_fn, log_fn, ddragon=None):
         self._lcu          = lcu
         self._cfg          = cfg_fn    # callable → dict
         self._log          = log_fn    # callable(str)
+        self._dd           = ddragon   # DDragon, for champ-id → op.gg name
         self._stop         = threading.Event()
         self._last_phase   = ""
         self._done_actions:  set  = set()
         self._action_start:  dict = {}   # aid → monotonic time when isInProgress first seen
         self._prepicked:     dict = {}   # aid → championId last hovered (avoids spam)
         self._ban_hovered:   dict = {}   # aid → championId hovered for ban (two-phase)
+        self._runes_done   = False       # meta runes/spells already imported this game
 
     def start(self):
         self._stop.clear()
@@ -323,6 +357,7 @@ class AutoEngine:
                 self._action_start.clear()
                 self._prepicked.clear()
                 self._ban_hovered.clear()
+                self._runes_done = False
                 self._log_champ_select_debug()
 
         # Auto accept
@@ -520,6 +555,173 @@ class AutoEngine:
                         if self._commit_action(action, champ, complete=False):
                             self._prepicked[aid] = champ
                             self._log(f"Pre-pick hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
+
+        # ── Auto runes + summoner spells — once our champion is locked in ──
+        if cfg.get("autoRunes") and not self._runes_done:
+            locked = 0
+            for grp in session.get("actions", []):
+                for a in grp:
+                    if (str(a.get("actorCellId", "")) == my_cell
+                            and a.get("type") == "pick"
+                            and a.get("completed")):
+                        locked = int(a.get("championId", 0) or 0)
+            if locked:
+                self._runes_done = True
+                threading.Thread(
+                    target=self._import_runes_spells,
+                    args=(locked, assigned_role),
+                    daemon=True,
+                ).start()
+
+    def _import_runes_spells(self, champ_id: int, position: str):
+        """Import the meta rune page + summoner spells for the locked-in champion.
+        Primary source: op.gg Diamond+ stats for this exact champion and role
+        (the most-played page across recent diamond+ games). Falls back to the
+        League client's own recommendation if op.gg is unavailable. Worker thread."""
+        try:
+            champ_name = self._dd.opgg_name(champ_id) if self._dd else None
+            opgg_pos   = OPGG_POSITION.get((position or "").lower())
+            label      = self._dd.name(champ_id) if self._dd else f"#{champ_id}"
+
+            prim = sub = None
+            perks: list = []
+            spells: list = []
+
+            # ── Primary: op.gg Diamond+ for this champion + role ──
+            if champ_name and opgg_pos:
+                data = self._opgg_runes(champ_name, opgg_pos)
+                if data:
+                    prim, perks, sub, spells = data
+                    self._log(f"Runes: using Diamond+ meta for {label} ({opgg_pos}).")
+
+            # ── Fallback: League client's own recommended page ──
+            if not (prim and sub and perks):
+                page = None
+                for _ in range(5):
+                    r = self._lcu.get("/lol-perks/v1/recommended-pages")
+                    if r.status_code == 200:
+                        cand = [p for p in r.json()
+                                if int(p.get("championId", 0) or 0) == champ_id]
+                        if cand:
+                            pos = (position or "").upper()
+                            page = next(
+                                (p for p in cand
+                                 if (p.get("position", "") or "").upper() == pos),
+                                cand[0],
+                            )
+                            break
+                    time.sleep(1)
+                if page:
+                    perks  = page.get("perks") or []
+                    prim   = page.get("primaryPerkStyleId")
+                    sub    = page.get("secondaryPerkStyleId")
+                    if not spells:
+                        spells = page.get("summonerSpellIds") or []
+
+            # ── Apply runes ──
+            if prim and sub and len(perks) >= 6:
+                self._make_rune_room()
+                rp = self._lcu.post("/lol-perks/v1/pages", {
+                    "name":            f"Auto: {label}",
+                    "primaryStyleId":  int(prim),
+                    "subStyleId":      int(sub),
+                    "selectedPerkIds": [int(x) for x in perks],
+                    "current":         True,
+                })
+                if rp.status_code in (200, 201):
+                    self._log(f"Imported meta runes for {label}.")
+                else:
+                    self._log(f"[runes] page create HTTP {rp.status_code} {rp.text[:120]}")
+            else:
+                self._log(f"Runes: no meta data available for {label}.")
+
+            # ── Apply summoner spells (meta if found, else role default) ──
+            if len(spells) < 2:
+                spells = list(ROLE_SPELLS.get((position or "").lower(), (4, 14)))
+            rs = self._lcu.patch(
+                "/lol-champ-select/v1/session/my-selection",
+                {"spell1Id": int(spells[0]), "spell2Id": int(spells[1])},
+            )
+            if rs.status_code in (200, 204):
+                self._log("Imported meta summoner spells.")
+            else:
+                self._log(f"[runes] spells HTTP {rs.status_code} {rs.text[:120]}")
+        except Exception as e:
+            self._log(f"[runes] error: {e}")
+
+    def _opgg_runes(self, champ_name: str, opgg_pos: str):
+        """Query op.gg for the most-played Diamond+ rune page + spells for this
+        champion and role. Returns (primary_style, perk_ids, sub_style, spell_ids)
+        or None. perk_ids = keystone+primary minors + secondary minors + shards."""
+        try:
+            body = {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "lol_get_champion_analysis",
+                    "arguments": {
+                        "champion":  champ_name,
+                        "position":  opgg_pos,
+                        "tier":      "diamond_plus",
+                        "game_mode": "ranked",
+                        "desired_output_fields": [
+                            "data.runes.primary_page_id",
+                            "data.runes.primary_rune_ids",
+                            "data.runes.secondary_page_id",
+                            "data.runes.secondary_rune_ids",
+                            "data.runes.stat_mod_ids",
+                            "data.summoner_spells.ids",
+                        ],
+                    },
+                },
+            }
+            r = requests.post(
+                "https://mcp-api.op.gg/mcp", json=body, timeout=15,
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+            r.raise_for_status()
+            text = r.json()["result"]["content"][0]["text"]
+
+            m = _re.search(
+                r"Runes\((\d+),\[([\d,]+)\],(\d+),\[([\d,]+)\],\[([\d,]+)\]",
+                text,
+            )
+            if not m:
+                return None
+            prim   = int(m.group(1))
+            sub    = int(m.group(3))
+            primary_runes   = [int(x) for x in m.group(2).split(",") if x]
+            secondary_runes = [int(x) for x in m.group(4).split(",") if x]
+            shards          = [int(x) for x in m.group(5).split(",") if x]
+            perks  = primary_runes + secondary_runes + shards
+
+            spells: list = []
+            sm = _re.search(r"SummonerSpells\(\[([\d,]+)\]", text)
+            if sm:
+                spells = [int(x) for x in sm.group(1).split(",") if x][:2]
+
+            if prim and sub and len(perks) >= 6:
+                return prim, perks, sub, spells
+            return None
+        except Exception as e:
+            self._log(f"[runes] op.gg fetch failed: {e}")
+            return None
+
+    def _make_rune_room(self):
+        """Delete an editable rune page if we're at the page limit, so a new
+        one can be created. Prefers deleting a previous 'Auto:' page."""
+        try:
+            inv   = self._lcu.get("/lol-perks/v1/inventory").json()
+            limit = int(inv.get("ownedPageCount", 2) or 2)
+            pages = self._lcu.get("/lol-perks/v1/pages").json()
+            editable = [p for p in pages if p.get("isEditable") or p.get("isDeletable")]
+            if len(pages) >= limit and editable:
+                target = next(
+                    (p for p in editable if str(p.get("name", "")).startswith("Auto:")),
+                    editable[0],
+                )
+                self._lcu.delete(f"/lol-perks/v1/pages/{target.get('id')}")
+        except Exception:
+            pass
 
     def _commit_action(self, action: dict, champ: int, complete: bool) -> bool:
         """PATCH an action with the full reference body. complete=True locks the
@@ -829,7 +1031,7 @@ class App(tk.Tk):
         self.cfg     = load_config()
         self.ddragon = DDragon()
         self._lcu    = LCU()
-        self._engine = AutoEngine(self._lcu, lambda: self.cfg, self.log)
+        self._engine = AutoEngine(self._lcu, lambda: self.cfg, self.log, self.ddragon)
 
         self._role_panels: dict = {}   # role → RolePanel
         self._delay_vars:  dict = {}
@@ -903,10 +1105,11 @@ class App(tk.Tk):
         tgl.pack(fill="x", padx=12, pady=(8, 4))
 
         for label, key in [
-            ("Auto Accept",   "autoAccept"),
-            ("Auto Pre-Pick", "autoPrePick"),
-            ("Auto Pick",     "autoPick"),
-            ("Auto Ban",      "autoBan"),
+            ("Auto Accept",       "autoAccept"),
+            ("Auto Pre-Pick",     "autoPrePick"),
+            ("Auto Pick",         "autoPick"),
+            ("Auto Ban",          "autoBan"),
+            ("Auto Runes/Spells", "autoRunes"),
         ]:
             var = tk.BooleanVar(value=bool(self.cfg.get(key, True)))
             self._bool_vars[key] = var
