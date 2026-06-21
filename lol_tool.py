@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.5.5"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -320,7 +320,9 @@ class AutoEngine:
         self._done_actions:  set  = set()
         self._action_start:  dict = {}   # aid → monotonic time when isInProgress first seen
         self._prepicked:     dict = {}   # aid → championId the TOOL last hovered
+        self._tool_hovers:   dict = {}   # aid → set of every champ the TOOL has hovered
         self._user_pick:     dict = {}   # aid → championId the USER manually hovered
+        self._pick_rejected: dict = {}   # aid → champs that became banned/taken
         self._ban_hovered:   dict = {}   # aid → championId hovered for ban (two-phase)
         self._runes_key      = None      # (champ_id, role) of last runes import
         self._last_role      = None      # assignedPosition seen last poll (detect swaps)
@@ -358,7 +360,9 @@ class AutoEngine:
                 self._done_actions.clear()
                 self._action_start.clear()
                 self._prepicked.clear()
+                self._tool_hovers.clear()
                 self._user_pick.clear()
+                self._pick_rejected.clear()
                 self._ban_hovered.clear()
                 self._runes_key = None
                 self._last_role = None
@@ -510,16 +514,29 @@ class AutoEngine:
                 completed   = bool(action.get("completed", False))
 
                 # ── Detect a manual hover by the user on a pick action ──
-                # If the pick's championId differs from what the TOOL last hovered,
-                # the user chose it themselves — that champion takes priority and is
-                # what we lock in (works before and during the pick phase).
+                # A championId the TOOL never hovered (and that we haven't already
+                # rejected as unavailable) means the user chose it themselves — that
+                # champion takes priority and is what we lock in (works before and
+                # during the pick phase).
                 if atype == "pick" and aid not in self._done_actions:
-                    cur = int(action.get("championId", 0) or 0)
-                    if cur and cur != (self._prepicked.get(aid) or 0):
+                    cur      = int(action.get("championId", 0) or 0)
+                    rejected = self._pick_rejected.get(aid, set())
+                    if (cur
+                            and cur not in self._tool_hovers.get(aid, set())
+                            and cur not in rejected):
                         if self._user_pick.get(aid) != cur:
                             self._user_pick[aid] = cur
                             name = self._dd.name(cur) if self._dd else f"#{cur}"
                             self._log(f"You hovered {name} — that's what will be locked.")
+
+                    # If the user's hovered champion got banned or picked by someone
+                    # else, drop it so picks fall back to the priority list.
+                    ov = self._user_pick.get(aid)
+                    if ov and ov not in playable_now:
+                        self._pick_rejected.setdefault(aid, set()).add(ov)
+                        self._user_pick.pop(aid, None)
+                        name = self._dd.name(ov) if self._dd else f"#{ov}"
+                        self._log(f"{name} was banned or taken — moving to the next option.")
 
                 # ── PICK ── reference: isInProgress && type==pick && autoPick
                 if (cfg.get("autoPick")
@@ -527,6 +544,7 @@ class AutoEngine:
                         and in_progress
                         and not completed
                         and aid not in self._done_actions):
+                    # The user's hovered champion wins (validity already checked above).
                     override = self._user_pick.get(aid)
                     if aid not in self._action_start:
                         self._action_start[aid] = time.monotonic()
@@ -539,8 +557,10 @@ class AutoEngine:
                             if champ and self._prepicked.get(aid) != champ:
                                 if self._commit_action(action, champ, complete=False):
                                     self._prepicked[aid] = champ
+                                    self._tool_hovers.setdefault(aid, set()).add(champ)
                         continue
-                    # Lock: the user's hovered champion wins; otherwise auto-pick.
+                    # Lock: the user's hovered champion wins; otherwise the next
+                    # available champion on the priority list.
                     champ = override if override else self._best(pick_prio, set(), playable_now)
                     if champ:
                         ok = self._commit_action(action, champ, complete=True)
@@ -596,6 +616,7 @@ class AutoEngine:
                     if champ and self._prepicked.get(aid) != champ:
                         if self._commit_action(action, champ, complete=False):
                             self._prepicked[aid] = champ
+                            self._tool_hovers.setdefault(aid, set()).add(champ)
                             self._log(f"Pre-pick hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
 
         # ── Auto runes + summoner spells — once our champion is locked in ──
@@ -1067,7 +1088,7 @@ class OpGGDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME)
+        self.title(f"{APP_NAME}   v{APP_VERSION}")
         self.configure(bg=DARK)
         self.resizable(False, False)
 
@@ -1142,6 +1163,8 @@ class App(tk.Tk):
         hdr.pack(fill="x", padx=8, pady=(8, 0))
         tk.Label(hdr, text="⚔  LOL Client Tool", bg=DARKER, fg=GOLD,
                  font=("Segoe UI", 13, "bold")).pack(side="left", padx=10, pady=8)
+        tk.Label(hdr, text=f"v{APP_VERSION}", bg=DARKER, fg="#888888",
+                 font=("Segoe UI", 9)).pack(side="left", pady=8)
         self._lbl_conn = tk.Label(hdr, text="● Waiting for client…",
                                   bg=DARKER, fg="#888888", font=("Segoe UI", 9))
         self._lbl_conn.pack(side="right", padx=12)
