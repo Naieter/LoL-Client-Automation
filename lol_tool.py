@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -319,9 +319,11 @@ class AutoEngine:
         self._last_phase   = ""
         self._done_actions:  set  = set()
         self._action_start:  dict = {}   # aid → monotonic time when isInProgress first seen
-        self._prepicked:     dict = {}   # aid → championId last hovered (avoids spam)
+        self._prepicked:     dict = {}   # aid → championId the TOOL last hovered
+        self._user_pick:     dict = {}   # aid → championId the USER manually hovered
         self._ban_hovered:   dict = {}   # aid → championId hovered for ban (two-phase)
-        self._runes_done   = False       # meta runes/spells already imported this game
+        self._runes_key      = None      # (champ_id, role) of last runes import
+        self._last_role      = None      # assignedPosition seen last poll (detect swaps)
 
     def start(self):
         self._stop.clear()
@@ -356,8 +358,10 @@ class AutoEngine:
                 self._done_actions.clear()
                 self._action_start.clear()
                 self._prepicked.clear()
+                self._user_pick.clear()
                 self._ban_hovered.clear()
-                self._runes_done = False
+                self._runes_key = None
+                self._last_role = None
                 self._log_champ_select_debug()
 
         # Auto accept
@@ -434,6 +438,19 @@ class AutoEngine:
                 assigned_role = (p.get("assignedPosition") or "").lower()
                 break
 
+        # ── detect a role swap (position trade with a teammate) ──
+        # The pre-pick / hover logic re-evaluates automatically when the new role's
+        # best champion differs from what's hovered, and runes re-import is handled
+        # by the (champ, role) key below — so we only log the change here. (We must
+        # NOT clear _prepicked, or the existing hover would look like a user pick.)
+        if assigned_role != self._last_role:
+            if self._last_role is not None and assigned_role:
+                self._log(
+                    f"Role changed: {ROLE_LABEL.get(self._last_role, self._last_role)} → "
+                    f"{ROLE_LABEL.get(assigned_role, assigned_role)} — re-evaluating."
+                )
+            self._last_role = assigned_role
+
         # ── champions already taken (removed from the playable pool, like the ref) ──
         taken: set = set()
         for p in session.get("myTeam", []):
@@ -492,21 +509,44 @@ class AutoEngine:
                 in_progress = bool(action.get("isInProgress", False))
                 completed   = bool(action.get("completed", False))
 
+                # ── Detect a manual hover by the user on a pick action ──
+                # If the pick's championId differs from what the TOOL last hovered,
+                # the user chose it themselves — that champion takes priority and is
+                # what we lock in (works before and during the pick phase).
+                if atype == "pick" and aid not in self._done_actions:
+                    cur = int(action.get("championId", 0) or 0)
+                    if cur and cur != (self._prepicked.get(aid) or 0):
+                        if self._user_pick.get(aid) != cur:
+                            self._user_pick[aid] = cur
+                            name = self._dd.name(cur) if self._dd else f"#{cur}"
+                            self._log(f"You hovered {name} — that's what will be locked.")
+
                 # ── PICK ── reference: isInProgress && type==pick && autoPick
                 if (cfg.get("autoPick")
                         and atype == "pick"
                         and in_progress
                         and not completed
                         and aid not in self._done_actions):
+                    override = self._user_pick.get(aid)
                     if aid not in self._action_start:
                         self._action_start[aid] = time.monotonic()
                     if (time.monotonic() - self._action_start[aid]) * 1000 < cfg.get("pickDelay", 27000):
+                        # Still waiting to lock. Keep the intended champion hovered so a
+                        # role swap mid-turn is reflected — but never override a champion
+                        # the user hovered themselves.
+                        if override is None:
+                            champ = self._best(pick_prio, set(), playable_now)
+                            if champ and self._prepicked.get(aid) != champ:
+                                if self._commit_action(action, champ, complete=False):
+                                    self._prepicked[aid] = champ
                         continue
-                    champ = self._best(pick_prio, set(), playable_now)
+                    # Lock: the user's hovered champion wins; otherwise auto-pick.
+                    champ = override if override else self._best(pick_prio, set(), playable_now)
                     if champ:
                         ok = self._commit_action(action, champ, complete=True)
                         if ok:
-                            self._log(f"Locked champion #{champ} as {ROLE_LABEL.get(role_key, role_key)}")
+                            src = "your pick" if override else f"{ROLE_LABEL.get(role_key, role_key)}"
+                            self._log(f"Locked champion #{champ} ({src})")
                             self._done_actions.add(aid)
                     else:
                         self._log(f"No available pick for {ROLE_LABEL.get(role_key, role_key)}. pick_prio={pick_prio}")
@@ -544,12 +584,14 @@ class AutoEngine:
                             self._log(f"Banned champion #{champ}")
                             self._done_actions.add(aid)
 
-                # ── PRE-PICK ── reference: autoPrePick hovers the pick before our turn
+                # ── PRE-PICK ── hover our intended champion before our turn, unless
+                # the user has already hovered one themselves (then leave it alone).
                 elif (cfg.get("autoPrePick")
                         and atype == "pick"
                         and not in_progress
                         and not completed
-                        and aid not in self._done_actions):
+                        and aid not in self._done_actions
+                        and aid not in self._user_pick):
                     champ = self._best(pick_prio, set(), playable_now)
                     if champ and self._prepicked.get(aid) != champ:
                         if self._commit_action(action, champ, complete=False):
@@ -557,7 +599,9 @@ class AutoEngine:
                             self._log(f"Pre-pick hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
 
         # ── Auto runes + summoner spells — once our champion is locked in ──
-        if cfg.get("autoRunes") and not self._runes_done:
+        # Keyed on (champion, role) so a position swap after locking re-imports
+        # the correct meta page for the new role.
+        if cfg.get("autoRunes"):
             locked = 0
             for grp in session.get("actions", []):
                 for a in grp:
@@ -566,12 +610,14 @@ class AutoEngine:
                             and a.get("completed")):
                         locked = int(a.get("championId", 0) or 0)
             if locked:
-                self._runes_done = True
-                threading.Thread(
-                    target=self._import_runes_spells,
-                    args=(locked, assigned_role),
-                    daemon=True,
-                ).start()
+                key = (locked, assigned_role)
+                if key != self._runes_key:
+                    self._runes_key = key
+                    threading.Thread(
+                        target=self._import_runes_spells,
+                        args=(locked, assigned_role),
+                        daemon=True,
+                    ).start()
 
     def _import_runes_spells(self, champ_id: int, position: str):
         """Import the meta rune page + summoner spells for the locked-in champion.
