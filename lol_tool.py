@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.5.8"
+APP_VERSION = "1.5.9"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -184,41 +184,54 @@ def _do_update(dl_url: str, log_fn, root):
                     log_fn(f"[update] Downloading… {done * 100 // total}%")
         log_fn("[update] Download complete — restarting…")
         pid = os.getpid()
+        log = exe.with_name("lol_update_log.txt")
         # The batch waits for THIS process to fully exit (so the exe lock is
         # released), then swaps the file with retries and relaunches.
+        # NOTE: use `ping` for delays, not `timeout` — `timeout` needs a console
+        # and fails silently in a windowless/detached process, which previously
+        # broke the swap. enabledelayedexpansion makes the retry counter work.
         bat.write_text(
             "@echo off\r\n"
-            "setlocal enableextensions\r\n"
+            "setlocal enableextensions enabledelayedexpansion\r\n"
             f'set "EXE={exe}"\r\n'
             f'set "NEW={tmp}"\r\n'
+            f'set "LOG={log}"\r\n'
+            'echo === update started === > "%LOG%"\r\n'
             ":waitexit\r\n"
             f'tasklist /fi "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
             "if not errorlevel 1 (\r\n"
-            "  timeout /t 1 /nobreak >nul\r\n"
+            "  ping -n 2 127.0.0.1 >nul\r\n"
             "  goto waitexit\r\n"
             ")\r\n"
+            'echo process exited; waiting for lock release >> "%LOG%"\r\n'
+            "ping -n 3 127.0.0.1 >nul\r\n"
             "set /a tries=0\r\n"
             ":swap\r\n"
-            'move /y "%NEW%" "%EXE%" >nul 2>&1\r\n'
+            'move /y "%NEW%" "%EXE%" >>"%LOG%" 2>&1\r\n'
             'if exist "%NEW%" (\r\n'
             "  set /a tries+=1\r\n"
-            "  if %tries% lss 10 (\r\n"
-            "    timeout /t 1 /nobreak >nul\r\n"
+            '  echo move retry !tries! >> "%LOG%"\r\n'
+            "  if !tries! lss 20 (\r\n"
+            "    ping -n 2 127.0.0.1 >nul\r\n"
             "    goto swap\r\n"
             "  )\r\n"
             ")\r\n"
+            'echo launching new version >> "%LOG%"\r\n'
             'start "" "%EXE%"\r\n'
+            'echo done >> "%LOG%"\r\n'
             'del "%~f0"\r\n',
             encoding="ascii",
         )
         import subprocess as _sp
+        # CREATE_NO_WINDOW keeps a (hidden) console so console tools behave, with
+        # no visible window. Not DETACHED_PROCESS (that removes the console).
         _sp.Popen(
             ["cmd", "/c", str(bat)],
-            creationflags=0x00000008 | 0x08000000,  # DETACHED_PROCESS | CREATE_NO_WINDOW
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
         )
-        # Give the detached batch a moment to start, then hard-exit so the
-        # running exe is unlocked (root.destroy alone can leave the frozen
-        # process alive, which blocks the file swap).
+        # Give the batch a moment to start, then hard-exit so the running exe is
+        # unlocked (root.destroy alone can leave the frozen process alive, which
+        # blocks the file swap).
         time.sleep(0.7)
         os._exit(0)
     except Exception as e:
