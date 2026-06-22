@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.5.13"
+APP_VERSION = "1.5.15"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -221,11 +221,13 @@ def _do_update(dl_url: str, log_fn, root):
             "    goto swap\r\n"
             "  )\r\n"
             ")\r\n"
-            # Let antivirus finish scanning the freshly-swapped exe before the
-            # first launch, so its onefile extraction (python3xx.dll) isn't raced.
-            "ping -n 4 127.0.0.1 >nul\r\n"
+            "ping -n 2 127.0.0.1 >nul\r\n"
             'echo launching new version >> "%LOG%"\r\n'
-            'start "" "%EXE%"\r\n'
+            # Relaunch via explorer so the new GUI process gets a clean interactive
+            # context (exactly like a double-click). Launching with `start` from a
+            # windowless cmd gave the onefile a broken context and failed to load
+            # its bundled python DLL.
+            'explorer.exe "%EXE%"\r\n'
             'echo done >> "%LOG%"\r\n'
             'del "%~f0"\r\n',
             encoding="ascii",
