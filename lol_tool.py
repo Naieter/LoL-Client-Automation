@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.5.10"
+APP_VERSION = "1.5.13"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -182,6 +182,11 @@ def _do_update(dl_url: str, log_fn, root):
                 done += len(chunk)
                 if total:
                     log_fn(f"[update] Downloading… {done * 100 // total}%")
+        # Guard against a truncated download swapping in a corrupt exe.
+        if total and done != total:
+            log_fn(f"[update] Download incomplete ({done}/{total} bytes) — aborting.")
+            tmp.unlink(missing_ok=True)
+            return
         log_fn("[update] Download complete — restarting…")
         pid = os.getpid()
         log = exe.with_name("lol_update_log.txt")
@@ -216,6 +221,9 @@ def _do_update(dl_url: str, log_fn, root):
             "    goto swap\r\n"
             "  )\r\n"
             ")\r\n"
+            # Let antivirus finish scanning the freshly-swapped exe before the
+            # first launch, so its onefile extraction (python3xx.dll) isn't raced.
+            "ping -n 4 127.0.0.1 >nul\r\n"
             'echo launching new version >> "%LOG%"\r\n'
             'start "" "%EXE%"\r\n'
             'echo done >> "%LOG%"\r\n'
