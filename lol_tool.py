@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.5.6"
+APP_VERSION = "1.5.7"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -183,20 +183,44 @@ def _do_update(dl_url: str, log_fn, root):
                 if total:
                     log_fn(f"[update] Downloading… {done * 100 // total}%")
         log_fn("[update] Download complete — restarting…")
+        pid = os.getpid()
+        # The batch waits for THIS process to fully exit (so the exe lock is
+        # released), then swaps the file with retries and relaunches.
         bat.write_text(
-            "@echo off\n"
-            "timeout /t 3 /nobreak >nul\n"
-            f'move /y "{tmp}" "{exe}"\n'
-            f'start "" "{exe}"\n'
-            'del "%~f0"\n',
-            encoding="utf-8",
+            "@echo off\r\n"
+            "setlocal enableextensions\r\n"
+            f'set "EXE={exe}"\r\n'
+            f'set "NEW={tmp}"\r\n'
+            ":waitexit\r\n"
+            f'tasklist /fi "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
+            "if not errorlevel 1 (\r\n"
+            "  timeout /t 1 /nobreak >nul\r\n"
+            "  goto waitexit\r\n"
+            ")\r\n"
+            "set /a tries=0\r\n"
+            ":swap\r\n"
+            'move /y "%NEW%" "%EXE%" >nul 2>&1\r\n'
+            'if exist "%NEW%" (\r\n'
+            "  set /a tries+=1\r\n"
+            "  if %tries% lss 10 (\r\n"
+            "    timeout /t 1 /nobreak >nul\r\n"
+            "    goto swap\r\n"
+            "  )\r\n"
+            ")\r\n"
+            'start "" "%EXE%"\r\n'
+            'del "%~f0"\r\n',
+            encoding="ascii",
         )
         import subprocess as _sp
         _sp.Popen(
             ["cmd", "/c", str(bat)],
             creationflags=0x00000008 | 0x08000000,  # DETACHED_PROCESS | CREATE_NO_WINDOW
         )
-        root.after(500, root.destroy)
+        # Give the detached batch a moment to start, then hard-exit so the
+        # running exe is unlocked (root.destroy alone can leave the frozen
+        # process alive, which blocks the file swap).
+        time.sleep(0.7)
+        os._exit(0)
     except Exception as e:
         log_fn(f"[update] Failed: {e}")
         if tmp.exists():
