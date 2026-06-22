@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.5.6"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1240,7 +1240,7 @@ class App(tk.Tk):
         f = tk.Frame(parent, bg=DARK)
         f.pack(padx=20, pady=20, anchor="nw")
 
-        tk.Label(f, text="Timing  (milliseconds)", bg=DARK, fg=GOLD,
+        tk.Label(f, text="Timing  (seconds)", bg=DARK, fg=GOLD,
                  font=("Segoe UI", 11, "bold")).grid(
             row=0, column=0, columnspan=3, pady=(0, 10), sticky="w")
 
@@ -1256,18 +1256,31 @@ class App(tk.Tk):
                      font=("Segoe UI", 9)).grid(
                 row=i+1, column=0, sticky="w", pady=4)
 
-            var = tk.IntVar(value=int(self.cfg.get(key, 1000)))
+            # Config is stored in milliseconds; the UI works in seconds.
+            var = tk.DoubleVar(value=round(int(self.cfg.get(key, 1000)) / 1000, 1))
             self._delay_vars[key] = var
 
             def _on_change(k=key, v=var):
-                self.cfg[k] = v.get()
+                self.cfg[k] = int(round(v.get() * 1000))
 
-            tk.Spinbox(f, from_=0, to=10000, increment=250, textvariable=var,
-                       width=8, bg=PANEL, fg=WHITE, relief="flat",
+            tk.Spinbox(f, from_=0, to=60, increment=0.5, textvariable=var,
+                       width=8, bg=PANEL, fg=WHITE, relief="flat", format="%.1f",
                        command=_on_change).grid(row=i+1, column=1, padx=10, sticky="w")
 
             tk.Label(f, text=note, bg=DARK, fg="#555",
                      font=("Segoe UI", 8)).grid(row=i+1, column=2, sticky="w")
+
+        # Updates
+        tk.Label(f, text="Updates", bg=DARK, fg=GOLD,
+                 font=("Segoe UI", 11, "bold")).grid(
+            row=5, column=0, columnspan=3, pady=(24, 6), sticky="w")
+        tk.Button(f, text="Check for Updates", bg=PANEL, fg=WHITE, relief="flat",
+                  font=("Segoe UI", 9), padx=12, pady=4,
+                  command=self._manual_update_check).grid(
+            row=6, column=0, sticky="w", pady=2)
+        tk.Label(f, text=f"Current version: v{APP_VERSION}", bg=DARK, fg="#555",
+                 font=("Segoe UI", 8)).grid(row=6, column=1, columnspan=2,
+                                            padx=10, sticky="w")
 
         # Warning box
         warn = tk.Frame(f, bg="#2a1a1a", padx=12, pady=10)
@@ -1349,11 +1362,55 @@ class App(tk.Tk):
 
     def _save(self):
         for k, v in self._delay_vars.items():
-            self.cfg[k] = v.get()
+            self.cfg[k] = int(round(v.get() * 1000))   # seconds (UI) → ms (config)
         for k, v in self._bool_vars.items():
             self.cfg[k] = v.get()
         save_config(self.cfg)
         self.log("Config saved.")
+
+    def _manual_update_check(self):
+        """Settings button: check GitHub for a newer release and, if found,
+        offer to download + install it. Reports the result either way."""
+        import tkinter.messagebox as _mb
+        self.log("Checking for updates…")
+
+        def _do():
+            try:
+                r = requests.get(
+                    f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                    timeout=10, headers={"Accept": "application/vnd.github+json"},
+                )
+                if r.status_code != 200:
+                    self.log(f"Update check failed: HTTP {r.status_code}")
+                    self.after(0, lambda: _mb.showwarning(
+                        "Update check failed",
+                        f"Could not reach GitHub (HTTP {r.status_code}).",
+                        parent=self))
+                    return
+                data = r.json()
+                tag  = data.get("tag_name", "")
+                if _ver(tag) <= _ver(APP_VERSION):
+                    self.log(f"You're on the latest version (v{APP_VERSION}).")
+                    self.after(0, lambda: _mb.showinfo(
+                        "Up to date",
+                        f"You're running the latest version (v{APP_VERSION}).",
+                        parent=self))
+                    return
+                dl_url = next(
+                    (a["browser_download_url"] for a in data.get("assets", [])
+                     if a["name"].lower().endswith(".exe")),
+                    None,
+                )
+                if not dl_url:
+                    self.log("A newer release exists but has no .exe asset.")
+                    return
+                self.after(0, lambda: _update_prompt(self, tag, dl_url, self.log))
+            except Exception as e:
+                self.log(f"Update check error: {e}")
+                self.after(0, lambda: _mb.showwarning(
+                    "Update check failed", str(e), parent=self))
+
+        threading.Thread(target=_do, daemon=True).start()
 
     # ── List management (called by RolePanel) ─────────────────────────────────
     def refresh_list(self, role: str, key: str):
