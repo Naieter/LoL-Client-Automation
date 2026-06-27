@@ -9,7 +9,7 @@ WARNING: Third-party automation tools may violate Riot Games' Terms of Service
 and could result in account penalties. Use at your own risk.
 """
 
-import sys, os, json, threading, time, re as _re, math as _math
+import sys, os, json, threading, time, random, hashlib, re as _re, math as _math
 from pathlib import Path
 from collections import defaultdict
 
@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.5.15"
+APP_VERSION = "1.6.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -89,6 +89,8 @@ DEFAULT_CONFIG = {
     "pickDelay":    27000,
     "banDelay":     2000,
     "prePickDelay": 500,
+    "acceptDelay":  0,       # wait before auto-accepting a found match (ms)
+    "relayUrl":     "",      # ready-up relay server, e.g. http://192.168.1.50:8777
     "roleChampions": {role: {"picks": [], "bans": []} for role in ROLES},
 }
 
@@ -127,6 +129,19 @@ def _ver(v: str):
         return (0,)
 
 
+def _client_asset_url(assets: list):
+    """Pick the client exe from a release's assets — never the relay exe, even
+    though both are .exe (otherwise the client could update itself to the relay)."""
+    for a in assets:
+        if a.get("name", "").lower() == "lol_client_tool.exe":
+            return a["browser_download_url"]
+    for a in assets:
+        n = a.get("name", "").lower()
+        if n.endswith(".exe") and "relay" not in n:
+            return a["browser_download_url"]
+    return None
+
+
 def _update_check(root, log_fn):
     try:
         r = requests.get(
@@ -139,11 +154,7 @@ def _update_check(root, log_fn):
         tag = data.get("tag_name", "")
         if _ver(tag) <= _ver(APP_VERSION):
             return
-        dl_url = next(
-            (a["browser_download_url"] for a in data.get("assets", [])
-             if a["name"].lower().endswith(".exe")),
-            None,
-        )
+        dl_url = _client_asset_url(data.get("assets", []))
         if not dl_url:
             return
         root.after(0, lambda: _update_prompt(root, tag, dl_url, log_fn))
@@ -288,6 +299,9 @@ class DDragon:
     def all_display_names(self) -> list:
         return sorted(self._id_to_name.values())
 
+    def all_ids(self) -> set:
+        return set(self._id_to_name.keys())
+
 
 # ── LCU API wrapper ───────────────────────────────────────────────────────────
 class LCU:
@@ -373,6 +387,11 @@ class AutoEngine:
         self._ban_hovered:   dict = {}   # aid → championId hovered for ban (two-phase)
         self._runes_key      = None      # (champ_id, role) of last runes import
         self._last_role      = None      # assignedPosition seen last poll (detect swaps)
+        self._queue_started     = False  # leader already started queue this lobby
+        self._last_ready_status = None   # last "X/Y ready" string logged
+        self._last_relay_poll   = 0.0    # throttle relay polling
+        self._accept_time       = None   # monotonic when ReadyCheck began
+        self._accepted          = False  # already accepted this ready check
 
     def start(self):
         self._stop.clear()
@@ -403,6 +422,9 @@ class AutoEngine:
         if phase != self._last_phase:
             self._log(f"Phase → {phase}")
             self._last_phase = phase
+            # Reset the per-ready-check accept timer on any phase change.
+            self._accept_time = None
+            self._accepted = False
             if phase == "ChampSelect":
                 self._done_actions.clear()
                 self._action_start.clear()
@@ -414,14 +436,26 @@ class AutoEngine:
                 self._runes_key = None
                 self._last_role = None
                 self._log_champ_select_debug()
+            if phase == "Lobby":
+                # New lobby — allow a fresh queue start and ready tally.
+                self._queue_started   = False
+                self._last_ready_status = None
 
-        # Auto accept
-        if cfg.get("autoAccept") and phase == "ReadyCheck":
-            self._lcu.post("/lol-matchmaking/v1/ready-check/accept")
-            self._log("Auto-accepted match.")
+        # Auto accept — after the configured delay (default 0 = immediate)
+        if cfg.get("autoAccept") and phase == "ReadyCheck" and not self._accepted:
+            if self._accept_time is None:
+                self._accept_time = time.monotonic()
+            if (time.monotonic() - self._accept_time) * 1000 >= cfg.get("acceptDelay", 0):
+                self._lcu.post("/lol-matchmaking/v1/ready-check/accept")
+                self._accepted = True
+                self._log("Auto-accepted match.")
 
         if phase == "ChampSelect":
             self._handle_champ_select(cfg)
+
+        # Party ready check — tally ready markers and (if leader) start queue.
+        if phase == "Lobby":
+            self._handle_party_ready()
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
     def _log_champ_select_debug(self):
@@ -837,6 +871,106 @@ class AutoEngine:
         except Exception:
             pass
 
+    # ── Party ready check ─────────────────────────────────────────────────────
+    # Separate copies of the tool coordinate through a relay server the user runs
+    # (config "relayUrl"). Each member POSTs its own (hashed) ready state; every
+    # tool reads the party's ready set and the leader's tool starts the queue when
+    # everyone is ready. The relay only ever sees opaque hashes — no names or IDs.
+    @staticmethod
+    def _h(prefix: str, *parts) -> str:
+        raw = prefix + ":" + ":".join(str(p) for p in parts)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def _lobby_identity(self):
+        """Return (party_group_hash, my_member_hash, members, is_leader) for the
+        current lobby, or None if not in a lobby."""
+        lob_r = self._lcu.get("/lol-lobby/v2/lobby")
+        if lob_r.status_code != 200:
+            return None
+        lob = lob_r.json()
+        members = lob.get("members", [])
+        if not members:
+            return None
+        local = lob.get("localMember", {})
+        my_sid = local.get("summonerId") or self._get_summoner_id()
+        # Group key: prefer partyId; fall back to the sorted roster (same for all
+        # members) so the relay groups the party consistently.
+        party = lob.get("partyId") or "+".join(
+            sorted(str(m.get("summonerId")) for m in members))
+        group  = self._h("g", party)
+        my_key = self._h("m", party, my_sid)
+        is_leader = bool(local.get("isLeader"))
+        return group, my_key, members, is_leader, party
+
+    def broadcast_party_ready(self, ready: bool, log_all: bool = False) -> bool:
+        """POST our ready/unready state to the relay. Called by the UI."""
+        url = (self._cfg().get("relayUrl") or "").strip().rstrip("/")
+        if not url:
+            self._log("Ready: no relay URL set — add it in Settings.")
+            return False
+        ident = self._lobby_identity()
+        if not ident:
+            return False
+        group, my_key, _members, _leader, _party = ident
+        try:
+            r = requests.post(
+                f"{url}/ready",
+                json={"party": group, "member": my_key, "ready": bool(ready)},
+                timeout=6,
+            )
+            return r.status_code == 200
+        except Exception as e:
+            self._log(f"Ready: can't reach relay at {url} ({e})")
+            return False
+
+    def _relay_ready_set(self, url: str, group: str) -> set:
+        try:
+            r = requests.get(f"{url}/party", params={"id": group}, timeout=6)
+            if r.status_code == 200:
+                return set(r.json().get("ready", []))
+        except Exception:
+            pass
+        return set()
+
+    def _handle_party_ready(self):
+        try:
+            cfg = self._cfg()
+            url = (cfg.get("relayUrl") or "").strip().rstrip("/")
+            if not url:
+                return
+            # Throttle relay polling to ~every 2s (the main loop runs at 0.5s).
+            now = time.monotonic()
+            if now - getattr(self, "_last_relay_poll", 0) < 2.0:
+                return
+            self._last_relay_poll = now
+
+            ident = self._lobby_identity()
+            if not ident:
+                return
+            group, _my_key, members, is_leader, _party = ident
+
+            ready_keys = self._relay_ready_set(url, group)
+            member_keys = {self._h("m", _party, m.get("summonerId")) for m in members}
+            ready_count = len(ready_keys & member_keys)
+            total = len(members)
+
+            status = f"{ready_count}/{total}"
+            if status != self._last_ready_status:
+                self._log(f"Party ready: {ready_count}/{total} ready.")
+                self._last_ready_status = status
+
+            if (is_leader and total >= 1 and ready_count == total
+                    and not self._queue_started
+                    and self._lcu.get("/lol-lobby/v2/lobby").json().get("canStartActivity", True)):
+                r = self._lcu.post("/lol-lobby/v2/lobby/matchmaking/search")
+                if r.status_code in (200, 204):
+                    self._queue_started = True
+                    self._log("Everyone is ready — starting queue!")
+                else:
+                    self._log(f"[party] start queue HTTP {r.status_code} {r.text[:120]}")
+        except Exception as exc:
+            self._log(f"[party] error: {exc}")
+
     def _commit_action(self, action: dict, champ: int, complete: bool) -> bool:
         """PATCH an action with the full reference body. complete=True locks the
         pick/ban; complete=False only hovers (pre-pick intent)."""
@@ -1137,7 +1271,9 @@ class App(tk.Tk):
         super().__init__()
         self.title(f"{APP_NAME}   v{APP_VERSION}")
         self.configure(bg=DARK)
-        self.resizable(False, False)
+        self.geometry("560x520")
+        self.minsize(520, 460)
+        self.resizable(True, True)
 
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         LOG_FILE.write_text("", encoding="utf-8")  # clear on startup
@@ -1159,6 +1295,9 @@ class App(tk.Tk):
 
         # Watch for the League client to open (auto-connect on launch)
         threading.Thread(target=self._watch_for_client, daemon=True).start()
+
+        # Watch the ready-up relay's reachability for the header status bubble
+        threading.Thread(target=self._watch_relay, daemon=True).start()
 
         # Check for updates 3 s after startup so the UI is fully loaded first
         self.after(3000, lambda: threading.Thread(
@@ -1192,17 +1331,57 @@ class App(tk.Tk):
         nb.add(main_frame, text="  Main  ")
         self._build_main(main_frame)
 
-        # Per-role tabs
-        for role in ROLES:
-            frame = ttk.Frame(nb)
-            nb.add(frame, text=f"  {ROLE_LABEL[role]}  ")
-            panel = RolePanel(frame, role, self)
-            self._role_panels[role] = panel
+        # Champions tab — all roles in one, switched by a selector bar
+        champ_frame = ttk.Frame(nb)
+        nb.add(champ_frame, text="  Champions  ")
+        self._build_champions(champ_frame)
 
         # Settings tab
         sett_frame = ttk.Frame(nb)
         nb.add(sett_frame, text="  Settings  ")
         self._build_settings(sett_frame)
+
+    def _build_champions(self, parent):
+        # Role selector bar — the highlighted button marks the active role.
+        sel = tk.Frame(parent, bg=DARKER)
+        sel.pack(fill="x", padx=8, pady=(8, 0))
+        tk.Label(sel, text="Role:", bg=DARKER, fg=GOLD,
+                 font=("Segoe UI", 10, "bold")).pack(side="left", padx=(10, 8), pady=8)
+
+        # op.gg auto-fill — upper-right of the pick/ban tab
+        tk.Button(sel, text="op.gg Auto-fill", bg=PANEL, fg=GOLD,
+                  activebackground=PANEL, relief="flat", cursor="hand2",
+                  padx=12, pady=4, font=("Segoe UI", 9),
+                  command=self._open_opgg_dialog).pack(side="right", padx=(0, 10), pady=6)
+
+        holder = tk.Frame(parent, bg=DARK)
+        holder.pack(fill="both", expand=True)
+
+        self._role_frames: dict = {}
+        self._role_btns:   dict = {}
+        for role in ROLES:
+            rf = tk.Frame(holder, bg=DARK)
+            self._role_frames[role] = rf
+            self._role_panels[role] = RolePanel(rf, role, self)
+
+        def show_role(role):
+            for rf in self._role_frames.values():
+                rf.pack_forget()
+            self._role_frames[role].pack(fill="both", expand=True)
+            for r, b in self._role_btns.items():
+                active = (r == role)
+                b.config(bg=(GOLD if active else PANEL),
+                         fg=("#000" if active else TEXT))
+
+        for role in ROLES:
+            b = tk.Button(sel, text=ROLE_LABEL[role], bg=PANEL, fg=TEXT,
+                          activebackground=GOLD, relief="flat", cursor="hand2",
+                          padx=14, pady=4, font=("Segoe UI", 10, "bold"),
+                          command=lambda r=role: show_role(r))
+            b.pack(side="left", padx=3, pady=6)
+            self._role_btns[role] = b
+
+        show_role(ROLES[0])   # default to Top
 
     def _build_main(self, parent):
         # Header
@@ -1215,10 +1394,87 @@ class App(tk.Tk):
         self._lbl_conn = tk.Label(hdr, text="● Waiting for client…",
                                   bg=DARKER, fg="#888888", font=("Segoe UI", 9))
         self._lbl_conn.pack(side="right", padx=12)
+        self._lbl_relay = tk.Label(hdr, text="● Relay: not set",
+                                   bg=DARKER, fg="#888888", font=("Segoe UI", 9))
+        self._lbl_relay.pack(side="right", padx=(12, 0))
 
-        # Toggles
-        tgl = tk.Frame(parent, bg=DARK)
-        tgl.pack(fill="x", padx=12, pady=(8, 4))
+        # Action buttons
+        btns = tk.Frame(parent, bg=DARK)
+        btns.pack(fill="x", padx=12, pady=(10, 4))
+
+        self._btn_start = tk.Button(btns, text="▶  Start",
+                                    bg=GREEN, fg=WHITE, activebackground=GREEN,
+                                    padx=10, state="disabled",
+                                    command=self._start, **BTN_STYLE)
+        self._btn_start.pack(side="left", padx=(0, 6))
+
+        self._btn_stop = tk.Button(btns, text="■  Stop",
+                                   bg=RED, fg=WHITE, activebackground=RED,
+                                   padx=10, state="disabled",
+                                   command=self._stop, **BTN_STYLE)
+        self._btn_stop.pack(side="left", padx=(0, 6))
+
+        tk.Button(btns, text="🎲  ULTIMATE BRAVERY",
+                  bg="#7b2fbf", fg=WHITE, activebackground="#7b2fbf",
+                  padx=10, command=self._ultimate_bravery,
+                  **BTN_STYLE).pack(side="left", padx=(0, 6))
+
+        # Prominent party ready-up button
+        self._party_ready = False
+        self._btn_ready = tk.Button(
+            parent, text="✓   READY UP",
+            bg=GREEN, fg=WHITE, activebackground="#1f8f4e",
+            activeforeground=WHITE, relief="flat", cursor="hand2",
+            font=("Segoe UI", 15, "bold"), command=self._toggle_party_ready)
+        self._btn_ready.pack(fill="x", padx=12, pady=(10, 4), ipady=12)
+
+        # Assigned role indicator (updated while automation runs)
+        self._lbl_role = tk.Label(parent, text="Assigned role: —",
+                                  bg=DARK, fg=GOLD,
+                                  font=("Segoe UI", 10, "bold"))
+        self._lbl_role.pack(anchor="w", padx=14, pady=(4, 0))
+
+        # Log
+        self._log_box = scrolledtext.ScrolledText(
+            parent, height=10, width=72,
+            bg=DARKER, fg="#aaaaaa",
+            font=("Consolas", 9), relief="flat",
+            state="disabled", wrap="word")
+        self._log_box.pack(fill="both", expand=True, padx=8, pady=8)
+
+    def _build_settings(self, parent):
+        # Save button, anchored to the lower-right of the tab.
+        savebar = tk.Frame(parent, bg=DARK)
+        savebar.pack(side="bottom", fill="x", padx=16, pady=(0, 12))
+        tk.Button(savebar, text="💾  Save Config",
+                  bg=GOLD, fg="#000", activebackground="#caa53e",
+                  relief="flat", cursor="hand2", padx=14, pady=4,
+                  font=("Segoe UI", 10, "bold"),
+                  command=self._save).pack(side="right")
+
+        # Scrollable body so settings stay reachable in a small window.
+        canvas = tk.Canvas(parent, bg=DARK, highlightthickness=0)
+        vsb = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(canvas, bg=DARK)
+        win = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(win, width=e.width))
+        # Mouse-wheel scrolling while the cursor is over the settings tab.
+        def _wheel(e):
+            canvas.yview_scroll(int(-e.delta / 120), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        # Automation toggles (moved here from the Main tab)
+        auto = tk.Frame(body, bg=DARK)
+        auto.pack(padx=20, pady=(20, 0), anchor="nw", fill="x")
+        tk.Label(auto, text="Automation", bg=DARK, fg=GOLD,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
 
         for label, key in [
             ("Auto Accept",       "autoAccept"),
@@ -1233,58 +1489,13 @@ class App(tk.Tk):
             def _on_toggle(k=key, v=var):
                 self.cfg[k] = v.get()
 
-            tk.Checkbutton(tgl, text=label, variable=var,
-                           bg=DARK, fg=TEXT,
+            tk.Checkbutton(auto, text=label, variable=var,
+                           bg=DARK, fg=TEXT, anchor="w",
                            activebackground=DARK, selectcolor=PANEL,
-                           command=_on_toggle).pack(side="left", padx=8)
+                           font=("Segoe UI", 10),
+                           command=_on_toggle).pack(anchor="w", padx=4, pady=1)
 
-        # Action buttons
-        btns = tk.Frame(parent, bg=DARK)
-        btns.pack(fill="x", padx=12, pady=4)
-
-        tk.Button(btns, text="Connect to Client",
-                  bg=GOLD, fg="#000", activebackground=GOLD,
-                  padx=10, command=self._connect,
-                  **BTN_STYLE).pack(side="left", padx=(0, 6))
-
-        self._btn_start = tk.Button(btns, text="▶  Start",
-                                    bg=GREEN, fg=WHITE, activebackground=GREEN,
-                                    padx=10, state="disabled",
-                                    command=self._start, **BTN_STYLE)
-        self._btn_start.pack(side="left", padx=(0, 6))
-
-        self._btn_stop = tk.Button(btns, text="■  Stop",
-                                   bg=RED, fg=WHITE, activebackground=RED,
-                                   padx=10, state="disabled",
-                                   command=self._stop, **BTN_STYLE)
-        self._btn_stop.pack(side="left", padx=(0, 6))
-
-        tk.Button(btns, text="Save Config",
-                  bg=PANEL, fg=TEXT, activebackground=PANEL,
-                  padx=10, command=self._save,
-                  **BTN_STYLE).pack(side="right")
-
-        tk.Button(btns, text="op.gg Auto-fill",
-                  bg=PANEL, fg=GOLD, activebackground=PANEL,
-                  padx=10, command=self._open_opgg_dialog,
-                  **BTN_STYLE).pack(side="right", padx=(0, 6))
-
-        # Assigned role indicator (updated while automation runs)
-        self._lbl_role = tk.Label(parent, text="Assigned role: —",
-                                  bg=DARK, fg=GOLD,
-                                  font=("Segoe UI", 10, "bold"))
-        self._lbl_role.pack(anchor="w", padx=14, pady=(4, 0))
-
-        # Log
-        self._log_box = scrolledtext.ScrolledText(
-            parent, height=18, width=78,
-            bg=DARKER, fg="#aaaaaa",
-            font=("Consolas", 9), relief="flat",
-            state="disabled", wrap="word")
-        self._log_box.pack(padx=8, pady=8)
-
-    def _build_settings(self, parent):
-        f = tk.Frame(parent, bg=DARK)
+        f = tk.Frame(body, bg=DARK)
         f.pack(padx=20, pady=20, anchor="nw")
 
         tk.Label(f, text="Timing  (seconds)", bg=DARK, fg=GOLD,
@@ -1292,6 +1503,8 @@ class App(tk.Tk):
             row=0, column=0, columnspan=3, pady=(0, 10), sticky="w")
 
         for i, (label, key, note) in enumerate([
+            ("Accept delay:",    "acceptDelay",
+             "Wait before accepting a found match"),
             ("Pre-pick delay:",  "prePickDelay",
              "Hover champion before your turn"),
             ("Pick delay:",      "pickDelay",
@@ -1317,16 +1530,42 @@ class App(tk.Tk):
             tk.Label(f, text=note, bg=DARK, fg="#555",
                      font=("Segoe UI", 8)).grid(row=i+1, column=2, sticky="w")
 
+        # Party Ready-Up relay
+        tk.Label(f, text="Party Ready-Up", bg=DARK, fg=GOLD,
+                 font=("Segoe UI", 11, "bold")).grid(
+            row=5, column=0, columnspan=3, pady=(24, 6), sticky="w")
+        tk.Label(f, text="Relay URL:", bg=DARK, fg=TEXT,
+                 font=("Segoe UI", 9)).grid(row=6, column=0, sticky="w", pady=4)
+        self._relay_var = tk.StringVar(value=str(self.cfg.get("relayUrl", "") or ""))
+        # Apply live as typed so Ready Up works immediately…
+        self._relay_var.trace_add(
+            "write",
+            lambda *a: self.cfg.__setitem__("relayUrl", self._relay_var.get().strip()))
+        relay_entry = tk.Entry(f, textvariable=self._relay_var, width=34, bg=PANEL,
+                               fg=WHITE, relief="flat", insertbackground=WHITE)
+        relay_entry.grid(row=6, column=1, padx=10, sticky="w")
+
+        # …and persist to disk when you finish editing (click away or press Enter).
+        def _persist_relay(*_):
+            self.cfg["relayUrl"] = self._relay_var.get().strip()
+            save_config(self.cfg)
+            self.log("Relay URL saved.")
+        relay_entry.bind("<FocusOut>", _persist_relay)
+        relay_entry.bind("<Return>",  _persist_relay)
+        tk.Label(f, text="e.g. http://your-server-ip:8777  (same for everyone in the party)",
+                 bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
+            row=7, column=1, columnspan=2, padx=10, sticky="w")
+
         # Updates
         tk.Label(f, text="Updates", bg=DARK, fg=GOLD,
                  font=("Segoe UI", 11, "bold")).grid(
-            row=5, column=0, columnspan=3, pady=(24, 6), sticky="w")
+            row=8, column=0, columnspan=3, pady=(24, 6), sticky="w")
         tk.Button(f, text="Check for Updates", bg=PANEL, fg=WHITE, relief="flat",
                   font=("Segoe UI", 9), padx=12, pady=4,
                   command=self._manual_update_check).grid(
-            row=6, column=0, sticky="w", pady=2)
+            row=9, column=0, sticky="w", pady=2)
         tk.Label(f, text=f"Current version: v{APP_VERSION}", bg=DARK, fg="#555",
-                 font=("Segoe UI", 8)).grid(row=6, column=1, columnspan=2,
+                 font=("Segoe UI", 8)).grid(row=9, column=1, columnspan=2,
                                             padx=10, sticky="w")
 
         # Warning box
@@ -1344,6 +1583,28 @@ class App(tk.Tk):
                  font=("Segoe UI", 9), justify="left").pack(anchor="w", pady=(4, 0))
 
     # ── Auto-connect watcher ──────────────────────────────────────────────────
+    def _watch_relay(self):
+        """Background thread: ping the ready-up relay and reflect its status in
+        the header bubble (not set / connected / offline)."""
+        while True:
+            url = (self.cfg.get("relayUrl") or "").strip().rstrip("/")
+            if not url:
+                self.after(0, lambda: self._lbl_relay.config(
+                    text="● Relay: not set", fg="#888888"))
+            else:
+                ok = False
+                try:
+                    ok = requests.get(f"{url}/ping", timeout=4).status_code == 200
+                except Exception:
+                    ok = False
+                if ok:
+                    self.after(0, lambda: self._lbl_relay.config(
+                        text="● Relay connected", fg=GREEN))
+                else:
+                    self.after(0, lambda: self._lbl_relay.config(
+                        text="● Relay offline", fg=RED))
+            time.sleep(5)
+
     def _watch_for_client(self):
         """Background thread: polls every 3 s for LeagueClientUx and
         connects automatically when it appears, then detects when it closes."""
@@ -1367,20 +1628,6 @@ class App(tk.Tk):
             time.sleep(POLL)
 
     # ── Controls ──────────────────────────────────────────────────────────────
-    def _connect(self):
-        """Manual connect button — useful if auto-connect hasn't fired yet."""
-        def _do():
-            self.log("Connecting to League client...")
-            try:
-                if self._lcu.connect() and self._lcu.ping():
-                    self._connected = True
-                    self.after(0, self._on_connected)
-                else:
-                    self.log("Could not connect — is the League client running?")
-            except Exception as e:
-                self.log(f"Connection error: {e}")
-        threading.Thread(target=_do, daemon=True).start()
-
     def _on_connected(self):
         self._lbl_conn.config(text="● Connected", fg=GREEN)
         self.log("League client detected — connected automatically.")
@@ -1407,11 +1654,111 @@ class App(tk.Tk):
         self._btn_start.config(state="normal")
         self.log("Automation stopped.")
 
+    def _toggle_party_ready(self):
+        """Toggle your ready state and broadcast it to the party chat so every
+        party member's tool can tally it. The leader's tool starts queue once
+        everyone is ready."""
+        if not self._connected:
+            self.log("Ready Up: connect to the League client first.")
+            return
+
+        def _do():
+            want = not self._party_ready
+            # Log the available chat conversations on the first ready of a session
+            # so we can confirm the party chat is being found.
+            ok = self._engine.broadcast_party_ready(want, log_all=not self._party_ready)
+            if ok:
+                self._party_ready = want
+                self.after(0, lambda: self._btn_ready.config(
+                    text=("✓   READY!  (click to cancel)" if want else "✓   READY UP"),
+                    bg=(GOLD if want else GREEN),
+                    fg=("#000" if want else WHITE),
+                    activebackground=("#caa53e" if want else "#1f8f4e"),
+                ))
+                self.log(f"You are {'READY' if want else 'not ready'}.")
+            else:
+                self.log("Ready Up: couldn't register — set a Relay URL in Settings "
+                         "and make sure you're in a party lobby.")
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _ultimate_bravery(self):
+        """Roll a random available champion and hover it on our pick action.
+        It's registered as the chosen pick so Auto Pick locks it (and Auto
+        Pre-Pick won't override the roll)."""
+        def _do():
+            try:
+                if not self._connected:
+                    self.log("Ultimate Bravery: connect to the League client first.")
+                    return
+                r = self._lcu.get("/lol-champ-select/v1/session")
+                if r.status_code != 200:
+                    self.log("Ultimate Bravery: only works during champion select.")
+                    return
+                s = r.json()
+                cell = s.get("localPlayerCellId")
+                if cell is None:
+                    return
+                my_cell = str(cell)
+
+                # our current (incomplete) pick action
+                pick_aid = None
+                for grp in s.get("actions", []):
+                    for a in grp:
+                        if (str(a.get("actorCellId", "")) == my_cell
+                                and a.get("type") == "pick"
+                                and not a.get("completed")):
+                            pick_aid = int(a.get("id", -1))
+                if pick_aid is None:
+                    self.log("Ultimate Bravery: no pick available right now.")
+                    return
+
+                # available pool = pickable − bans − already taken, real champs only
+                bans = set()
+                for b in s.get("bans", {}).get("myTeamBans", []):
+                    if int(b): bans.add(int(b))
+                for b in s.get("bans", {}).get("theirTeamBans", []):
+                    if int(b): bans.add(int(b))
+                taken = set()
+                for p in s.get("myTeam", []):
+                    if str(p.get("cellId", "")) != my_cell:
+                        c = int(p.get("championId", 0) or 0)
+                        if c: taken.add(c)
+                for p in s.get("theirTeam", []):
+                    c = int(p.get("championId", 0) or 0)
+                    if c: taken.add(c)
+
+                real = self.ddragon.all_ids()
+                pickable = self._engine._get_pickable_ids()
+                pool = [c for c in pickable
+                        if c in real and c not in bans and c not in taken]
+                if not pool:
+                    self.log("Ultimate Bravery: no available champions to roll.")
+                    return
+
+                champ = random.choice(pool)
+                rr = self._lcu.patch(
+                    f"/lol-champ-select/v1/session/actions/{pick_aid}",
+                    {"championId": champ},
+                )
+                if rr.status_code in (200, 204):
+                    # Treat the roll as the user's pick so the engine respects it.
+                    self._engine._user_pick[pick_aid] = champ
+                    self.log(f"🎲 ULTIMATE BRAVERY rolled: {self.ddragon.name(champ)}!")
+                else:
+                    self.log(f"Ultimate Bravery: hover failed (HTTP {rr.status_code}).")
+            except Exception as e:
+                self.log(f"Ultimate Bravery error: {e}")
+
+        threading.Thread(target=_do, daemon=True).start()
+
     def _save(self):
         for k, v in self._delay_vars.items():
             self.cfg[k] = int(round(v.get() * 1000))   # seconds (UI) → ms (config)
         for k, v in self._bool_vars.items():
             self.cfg[k] = v.get()
+        if hasattr(self, "_relay_var"):
+            self.cfg["relayUrl"] = self._relay_var.get().strip()
         save_config(self.cfg)
         self.log("Config saved.")
 
@@ -1443,11 +1790,7 @@ class App(tk.Tk):
                         f"You're running the latest version (v{APP_VERSION}).",
                         parent=self))
                     return
-                dl_url = next(
-                    (a["browser_download_url"] for a in data.get("assets", [])
-                     if a["name"].lower().endswith(".exe")),
-                    None,
-                )
+                dl_url = _client_asset_url(data.get("assets", []))
                 if not dl_url:
                     self.log("A newer release exists but has no .exe asset.")
                     return
