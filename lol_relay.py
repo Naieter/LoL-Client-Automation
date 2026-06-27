@@ -20,7 +20,9 @@ Endpoints (used by the tool):
 import sys
 import json
 import time
+import socket
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -33,6 +35,28 @@ _data: dict = {}   # party -> { member -> last_seen_timestamp }
 
 def _ts():
     return time.strftime("%H:%M:%S")
+
+
+def _public_ip():
+    """This server's public (internet-facing) IP, or None if it can't be found."""
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as r:
+            ip = r.read().decode().strip()
+            return ip or None
+    except Exception:
+        return None
+
+
+def _lan_ip():
+    """This server's LAN IP (for party members on the same network)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -116,13 +140,23 @@ def main():
             pass
     threading.Thread(target=_prune_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print("=" * 52)
+    print("=" * 56)
     print("  LOL Client Tool — Ready-Up Relay")
     print(f"  Listening on  0.0.0.0:{port}")
-    print("  Point each tool's relay URL at this machine, e.g.")
-    print(f"      http://<this-server-ip>:{port}")
+    print("  Set each tool's Relay URL to:")
+    pub = _public_ip()
+    lan = _lan_ip()
+    if pub:
+        print(f"      remote:        http://{pub}:{port}")
+    if lan:
+        print(f"      same network:  http://{lan}:{port}")
+    if not pub and not lan:
+        print(f"      http://<this-server-ip>:{port}")
+    if pub:
+        print("  (remote members also need TCP "
+              f"{port} forwarded on the router to this server)")
     print("  Keep this window open. Ctrl+C to stop.")
-    print("=" * 52)
+    print("=" * 56)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
