@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -947,14 +947,19 @@ class AutoEngine:
             return True
         return False
 
-    def _relay_ready_set(self, url: str, group: str) -> set:
+    def _relay_party_state(self, url: str, group: str):
+        """Return (present_set, ready_set) from the relay. present_set is None if
+        the relay is an older version that doesn't report presence."""
         try:
             r = requests.get(f"{url}/party", params={"id": group}, timeout=6)
             if r.status_code == 200:
-                return set(r.json().get("ready", []))
+                data = r.json()
+                ready   = set(data.get("ready", []))
+                present = set(data["present"]) if "present" in data else None
+                return present, ready
         except Exception:
             pass
-        return set()
+        return None, set()
 
     def _handle_party_ready(self):
         try:
@@ -972,24 +977,30 @@ class AutoEngine:
                 return
             group, my_key, members, is_leader, party, can_start = ident
 
-            # Heartbeat: keep my ready entry fresh so a long queue doesn't let it
-            # expire (which would otherwise look like an unready and cancel queue).
-            if self._i_am_ready:
-                self._post_ready(url, group, my_key, True)
+            # Heartbeat presence every cycle so the relay knows this member has
+            # the tool running (independent of ready state). Members without the
+            # tool never appear, so they're excluded from the ready check.
+            self._post_ready(url, group, my_key, self._i_am_ready)
 
-            ready_keys  = self._relay_ready_set(url, group)
+            present_set, ready_set = self._relay_party_state(url, group)
             member_keys = {self._h("m", party, m.get("summonerId")) for m in members}
-            ready_count = len(ready_keys & member_keys)
-            total = len(members)
+            if present_set is None:        # old relay — fall back to whole roster
+                present_set = member_keys
+            present_count = len(present_set & member_keys)
+            ready_count   = len(ready_set & member_keys)
 
-            status = f"{ready_count}/{total}"
+            status = f"{ready_count}/{present_count}"
             if status != self._last_ready_status:
-                self._log(f"Party ready: {ready_count}/{total} ready.")
+                extra = ("" if present_count == len(members)
+                         else f"  ({len(members)} in party)")
+                self._log(f"Party ready: {ready_count}/{present_count} tool users ready.{extra}")
                 self._last_ready_status = status
 
             if not is_leader:
                 return
-            all_ready = (total >= 1 and ready_count == total)
+            # Start once everyone who HAS the tool is ready (members without it
+            # are ignored). present_count >= 1 always includes us (the leader).
+            all_ready = (present_count >= 1 and ready_count == present_count)
             if all_ready and not self._queue_started and can_start:
                 r = self._lcu.post("/lol-lobby/v2/lobby/matchmaking/search")
                 if r.status_code in (200, 204):

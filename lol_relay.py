@@ -17,20 +17,28 @@ Endpoints (used by the tool):
     POST /ready  {party, member, ready:bool}
     GET  /party?id=<party>        -> {"ready": [member, ...]}
 """
+import os
 import sys
 import json
 import time
 import socket
 import threading
+import subprocess
 import urllib.request
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+RELAY_VERSION = "1.6.4"
+GITHUB_REPO   = "Naieter/LoL-Client-Automation"
+
 DEFAULT_PORT = 8777
-TTL = 600  # seconds — ready entries older than this are ignored & pruned
+# A member is "present" (has the tool running) if it heartbeated within FRESH
+# seconds; tools heartbeat every ~2s, so this drops members who close the tool.
+FRESH = 20
 
 _lock = threading.Lock()
-_data: dict = {}   # party -> { member -> last_seen_timestamp }
+_data: dict = {}   # party -> { member -> {"r": ready_bool, "t": timestamp} }
 
 
 def _ts():
@@ -80,8 +88,12 @@ class Handler(BaseHTTPRequestHandler):
             now = time.time()
             with _lock:
                 members = _data.get(pid, {})
-                ready = [m for m, t in members.items() if now - t < TTL]
-            self._send(200, {"ready": ready})
+                # "present" = heartbeated recently (tool running); "ready" = those
+                # who are also marked ready.
+                present = [m for m, v in members.items() if now - v["t"] < FRESH]
+                ready   = [m for m, v in members.items()
+                           if now - v["t"] < FRESH and v["r"]]
+            self._send(200, {"present": present, "ready": ready})
             return
         self._send(404, {"error": "not found"})
 
@@ -102,15 +114,15 @@ class Handler(BaseHTTPRequestHandler):
         if not party or not member:
             self._send(400, {"error": "party and member required"})
             return
+        now = time.time()
         with _lock:
             p = _data.setdefault(party, {})
-            if ready:
-                p[member] = time.time()
-            else:
-                p.pop(member, None)
-            count = len(p)
+            # Always record presence (timestamp); the ready flag may be off.
+            p[member] = {"r": ready, "t": now}
+            present = sum(1 for v in p.values() if now - v["t"] < FRESH)
+            rdy     = sum(1 for v in p.values() if now - v["t"] < FRESH and v["r"])
         print(f"[{_ts()}] {'ready' if ready else 'unready'}  party={party[:8]}…  "
-              f"({count} ready in party)")
+              f"({rdy}/{present} ready)")
         self._send(200, {"ok": True})
 
     def log_message(self, *a):
@@ -119,16 +131,112 @@ class Handler(BaseHTTPRequestHandler):
 
 def _prune_loop():
     while True:
-        time.sleep(60)
+        time.sleep(30)
         now = time.time()
         with _lock:
             for party in list(_data.keys()):
                 members = _data[party]
                 for m in list(members.keys()):
-                    if now - members[m] > TTL:
+                    if now - members[m]["t"] > FRESH:
                         del members[m]
                 if not members:
                     del _data[party]
+
+
+# ── Self-update (mirrors the client tool) ──────────────────────────────────────
+def _ver(v):
+    try:
+        return tuple(int(x) for x in v.strip().lstrip("v").split("."))
+    except Exception:
+        return (0,)
+
+
+def _check_and_update(idle_required=False):
+    """Check GitHub for a newer LOL_Relay.exe and, if found, download + swap +
+    relaunch. When idle_required is True, skip if any party is currently active
+    (so periodic checks don't interrupt an in-progress ready-up)."""
+    if not getattr(sys, "frozen", False):
+        return  # only the packaged exe self-updates
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "LOL-Relay"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode())
+        tag = data.get("tag_name", "")
+        if _ver(tag) <= _ver(RELAY_VERSION):
+            return
+        dl = next((a["browser_download_url"] for a in data.get("assets", [])
+                   if a.get("name", "").lower() == "lol_relay.exe"), None)
+        if not dl:
+            return
+        if idle_required:
+            with _lock:
+                if _data:
+                    print(f"[{_ts()}] update v{tag.lstrip('v')} available — "
+                          "waiting until idle to apply.")
+                    return
+        print("=" * 56)
+        print(f"  Update available: v{tag.lstrip('v')} "
+              f"(running v{RELAY_VERSION}). Downloading…")
+        _do_update(dl)
+    except Exception as e:
+        print(f"  Update check failed: {e}")
+
+
+def _do_update(dl_url):
+    exe = Path(sys.executable)
+    tmp = exe.with_name("LOL_Relay_update.exe")
+    bat = exe.with_name("relay_update.bat")
+    log = exe.with_name("relay_update_log.txt")
+    try:
+        req = urllib.request.Request(dl_url, headers={"User-Agent": "LOL-Relay"})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            blob = r.read()
+        with open(tmp, "wb") as f:
+            f.write(blob)
+        pid = os.getpid()
+        # Wait for this process to exit, swap with retries, relaunch. Uses ping
+        # for delays (timeout needs a console) and explorer to relaunch cleanly.
+        bat.write_text(
+            "@echo off\r\n"
+            "setlocal enableextensions enabledelayedexpansion\r\n"
+            f'set "EXE={exe}"\r\n'
+            f'set "NEW={tmp}"\r\n'
+            f'set "LOG={log}"\r\n'
+            'echo === relay update === > "%LOG%"\r\n'
+            ":waitexit\r\n"
+            f'tasklist /fi "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
+            "if not errorlevel 1 ( ping -n 2 127.0.0.1 >nul & goto waitexit )\r\n"
+            "ping -n 3 127.0.0.1 >nul\r\n"
+            "set /a tries=0\r\n"
+            ":swap\r\n"
+            'move /y "%NEW%" "%EXE%" >>"%LOG%" 2>&1\r\n'
+            'if exist "%NEW%" ( set /a tries+=1 & '
+            'if !tries! lss 20 ( ping -n 2 127.0.0.1 >nul & goto swap ) )\r\n'
+            "ping -n 2 127.0.0.1 >nul\r\n"
+            'explorer.exe "%EXE%"\r\n'
+            'del "%~f0"\r\n',
+            encoding="ascii",
+        )
+        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x08000000)
+        print("  Downloaded — restarting to apply update…")
+        time.sleep(0.7)
+        os._exit(0)
+    except Exception as e:
+        print(f"  Update failed: {e}")
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+
+def _update_loop():
+    """Periodically check for updates, applying only while idle."""
+    while True:
+        time.sleep(6 * 3600)   # every 6 hours
+        _check_and_update(idle_required=True)
 
 
 def main():
@@ -138,10 +246,13 @@ def main():
             port = int(sys.argv[1])
         except ValueError:
             pass
+    # Self-update on startup (the relay is idle here), then periodically.
+    _check_and_update()
+    threading.Thread(target=_update_loop, daemon=True).start()
     threading.Thread(target=_prune_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("=" * 56)
-    print("  LOL Client Tool — Ready-Up Relay")
+    print(f"  LOL Client Tool — Ready-Up Relay  v{RELAY_VERSION}")
     print(f"  Listening on  0.0.0.0:{port}")
     print("  Set each tool's Relay URL to:")
     pub = _public_ip()
