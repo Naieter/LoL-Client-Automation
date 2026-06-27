@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -371,11 +371,12 @@ class AutoEngine:
 
     POLL = 0.5  # seconds
 
-    def __init__(self, lcu: LCU, cfg_fn, log_fn, ddragon=None):
+    def __init__(self, lcu: LCU, cfg_fn, log_fn, ddragon=None, on_phase=None):
         self._lcu          = lcu
         self._cfg          = cfg_fn    # callable → dict
         self._log          = log_fn    # callable(str)
         self._dd           = ddragon   # DDragon, for champ-id → op.gg name
+        self._on_phase     = on_phase  # callable(phase) — UI reacts to phase
         self._stop         = threading.Event()
         self._last_phase   = ""
         self._done_actions:  set  = set()
@@ -390,6 +391,7 @@ class AutoEngine:
         self._queue_started     = False  # leader already started queue this lobby
         self._last_ready_status = None   # last "X/Y ready" string logged
         self._last_relay_poll   = 0.0    # throttle relay polling
+        self._i_am_ready        = False  # my own ready state (for relay heartbeat)
         self._accept_time       = None   # monotonic when ReadyCheck began
         self._accepted          = False  # already accepted this ready check
 
@@ -425,6 +427,8 @@ class AutoEngine:
             # Reset the per-ready-check accept timer on any phase change.
             self._accept_time = None
             self._accepted = False
+            if self._on_phase:
+                self._on_phase(phase)   # UI: grey the Ready Up button in champ select
             if phase == "ChampSelect":
                 self._done_actions.clear()
                 self._action_start.clear()
@@ -435,10 +439,11 @@ class AutoEngine:
                 self._ban_hovered.clear()
                 self._runes_key = None
                 self._last_role = None
+                # A game started — the ready cycle is done; clear my ready state.
+                self._i_am_ready = False
                 self._log_champ_select_debug()
             if phase == "Lobby":
-                # New lobby — allow a fresh queue start and ready tally.
-                self._queue_started   = False
+                self._queue_started     = False
                 self._last_ready_status = None
 
         # Auto accept — after the configured delay (default 0 = immediate)
@@ -453,8 +458,9 @@ class AutoEngine:
         if phase == "ChampSelect":
             self._handle_champ_select(cfg)
 
-        # Party ready check — tally ready markers and (if leader) start queue.
-        if phase == "Lobby":
+        # Party ready check — tally ready state and (if leader) start the queue.
+        # Runs during Matchmaking too so the leader can cancel if someone unreadies.
+        if phase in ("Lobby", "Matchmaking"):
             self._handle_party_ready()
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
@@ -882,7 +888,7 @@ class AutoEngine:
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def _lobby_identity(self):
-        """Return (party_group_hash, my_member_hash, members, is_leader) for the
+        """Return (group, my_key, members, is_leader, party, can_start) for the
         current lobby, or None if not in a lobby."""
         lob_r = self._lcu.get("/lol-lobby/v2/lobby")
         if lob_r.status_code != 200:
@@ -897,21 +903,13 @@ class AutoEngine:
         # members) so the relay groups the party consistently.
         party = lob.get("partyId") or "+".join(
             sorted(str(m.get("summonerId")) for m in members))
-        group  = self._h("g", party)
-        my_key = self._h("m", party, my_sid)
+        group     = self._h("g", party)
+        my_key    = self._h("m", party, my_sid)
         is_leader = bool(local.get("isLeader"))
-        return group, my_key, members, is_leader, party
+        can_start = bool(lob.get("canStartActivity", True))
+        return group, my_key, members, is_leader, party, can_start
 
-    def broadcast_party_ready(self, ready: bool, log_all: bool = False) -> bool:
-        """POST our ready/unready state to the relay. Called by the UI."""
-        url = (self._cfg().get("relayUrl") or "").strip().rstrip("/")
-        if not url:
-            self._log("Ready: no relay URL set — add it in Settings.")
-            return False
-        ident = self._lobby_identity()
-        if not ident:
-            return False
-        group, my_key, _members, _leader, _party = ident
+    def _post_ready(self, url: str, group: str, my_key: str, ready: bool) -> bool:
         try:
             r = requests.post(
                 f"{url}/ready",
@@ -922,6 +920,21 @@ class AutoEngine:
         except Exception as e:
             self._log(f"Ready: can't reach relay at {url} ({e})")
             return False
+
+    def broadcast_party_ready(self, ready: bool, log_all: bool = False) -> bool:
+        """POST our ready/unready state to the relay. Called by the UI."""
+        url = (self._cfg().get("relayUrl") or "").strip().rstrip("/")
+        if not url:
+            self._log("Ready: no relay URL set — add it in Settings.")
+            return False
+        ident = self._lobby_identity()
+        if not ident:
+            return False
+        group, my_key = ident[0], ident[1]
+        if self._post_ready(url, group, my_key, ready):
+            self._i_am_ready = bool(ready)   # remembered for the heartbeat
+            return True
+        return False
 
     def _relay_ready_set(self, url: str, group: str) -> set:
         try:
@@ -934,11 +947,10 @@ class AutoEngine:
 
     def _handle_party_ready(self):
         try:
-            cfg = self._cfg()
-            url = (cfg.get("relayUrl") or "").strip().rstrip("/")
+            url = (self._cfg().get("relayUrl") or "").strip().rstrip("/")
             if not url:
                 return
-            # Throttle relay polling to ~every 2s (the main loop runs at 0.5s).
+            # Throttle relay traffic to ~every 2s (the main loop runs at 0.5s).
             now = time.monotonic()
             if now - getattr(self, "_last_relay_poll", 0) < 2.0:
                 return
@@ -947,10 +959,15 @@ class AutoEngine:
             ident = self._lobby_identity()
             if not ident:
                 return
-            group, _my_key, members, is_leader, _party = ident
+            group, my_key, members, is_leader, party, can_start = ident
 
-            ready_keys = self._relay_ready_set(url, group)
-            member_keys = {self._h("m", _party, m.get("summonerId")) for m in members}
+            # Heartbeat: keep my ready entry fresh so a long queue doesn't let it
+            # expire (which would otherwise look like an unready and cancel queue).
+            if self._i_am_ready:
+                self._post_ready(url, group, my_key, True)
+
+            ready_keys  = self._relay_ready_set(url, group)
+            member_keys = {self._h("m", party, m.get("summonerId")) for m in members}
             ready_count = len(ready_keys & member_keys)
             total = len(members)
 
@@ -959,15 +976,24 @@ class AutoEngine:
                 self._log(f"Party ready: {ready_count}/{total} ready.")
                 self._last_ready_status = status
 
-            if (is_leader and total >= 1 and ready_count == total
-                    and not self._queue_started
-                    and self._lcu.get("/lol-lobby/v2/lobby").json().get("canStartActivity", True)):
+            if not is_leader:
+                return
+            all_ready = (total >= 1 and ready_count == total)
+            if all_ready and not self._queue_started and can_start:
                 r = self._lcu.post("/lol-lobby/v2/lobby/matchmaking/search")
                 if r.status_code in (200, 204):
                     self._queue_started = True
                     self._log("Everyone is ready — starting queue!")
                 else:
                     self._log(f"[party] start queue HTTP {r.status_code} {r.text[:120]}")
+            elif not all_ready and self._queue_started:
+                # Someone switched to unready after the queue started — cancel it.
+                r = self._lcu.delete("/lol-lobby/v2/lobby/matchmaking/search")
+                if r.status_code in (200, 204):
+                    self._queue_started = False
+                    self._log("Someone unreadied — queue canceled.")
+                else:
+                    self._log(f"[party] cancel queue HTTP {r.status_code} {r.text[:120]}")
         except Exception as exc:
             self._log(f"[party] error: {exc}")
 
@@ -1281,7 +1307,8 @@ class App(tk.Tk):
         self.cfg     = load_config()
         self.ddragon = DDragon()
         self._lcu    = LCU()
-        self._engine = AutoEngine(self._lcu, lambda: self.cfg, self.log, self.ddragon)
+        self._engine = AutoEngine(self._lcu, lambda: self.cfg, self.log,
+                                  self.ddragon, self._on_phase_change)
 
         self._role_panels: dict = {}   # role → RolePanel
         self._delay_vars:  dict = {}
@@ -1654,10 +1681,24 @@ class App(tk.Tk):
         self._btn_start.config(state="normal")
         self.log("Automation stopped.")
 
+    def _on_phase_change(self, phase):
+        """Engine callback: grey the Ready Up button during champion select
+        (ready-up only applies in the pre-game lobby) and reset it afterward."""
+        def _do():
+            if not hasattr(self, "_btn_ready"):
+                return
+            if phase == "ChampSelect":
+                self._party_ready = False
+                self._btn_ready.config(state="disabled", text="✓   READY UP",
+                                       bg=GREEN, fg=WHITE)
+            else:
+                self._btn_ready.config(state="normal")
+        self.after(0, _do)
+
     def _toggle_party_ready(self):
-        """Toggle your ready state and broadcast it to the party chat so every
-        party member's tool can tally it. The leader's tool starts queue once
-        everyone is ready."""
+        """Toggle your ready state and broadcast it to the relay so every party
+        member's tool can tally it. The leader's tool starts queue once everyone
+        is ready."""
         if not self._connected:
             self.log("Ready Up: connect to the League client first.")
             return
