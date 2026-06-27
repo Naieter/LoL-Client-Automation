@@ -9,7 +9,7 @@ WARNING: Third-party automation tools may violate Riot Games' Terms of Service
 and could result in account penalties. Use at your own risk.
 """
 
-import sys, os, json, threading, time, random, hashlib, re as _re, math as _math
+import sys, os, json, threading, time, random, hashlib, subprocess, re as _re, math as _math
 from pathlib import Path
 from collections import defaultdict
 
@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -71,6 +71,17 @@ OPGG_POSITION = {
     "top": "top", "jungle": "jungle", "middle": "mid",
     "bottom": "adc", "utility": "support",
 }
+
+# webRegion → a regional Riot host used to estimate ping (TCP RTT to :443)
+REGION_HOST = {
+    "na":   "na1.api.riotgames.com",   "euw":  "euw1.api.riotgames.com",
+    "eune": "eun1.api.riotgames.com",  "eun":  "eun1.api.riotgames.com",
+    "kr":   "kr.api.riotgames.com",    "br":   "br1.api.riotgames.com",
+    "lan":  "la1.api.riotgames.com",   "las":  "la2.api.riotgames.com",
+    "oce":  "oc1.api.riotgames.com",   "tr":   "tr1.api.riotgames.com",
+    "ru":   "ru.api.riotgames.com",    "jp":   "jp1.api.riotgames.com",
+}
+DEFAULT_PING_HOST = "na1.api.riotgames.com"
 
 META_BANS = {
     "top":     ["Darius", "Camille", "Fiora", "Renekton", "Garen"],
@@ -1326,6 +1337,9 @@ class App(tk.Tk):
         # Watch the ready-up relay's reachability for the header status bubble
         threading.Thread(target=self._watch_relay, daemon=True).start()
 
+        # Live ping to the regional Riot servers, shown under the Ready Up button
+        threading.Thread(target=self._watch_ping, daemon=True).start()
+
         # Check for updates 3 s after startup so the UI is fully loaded first
         self.after(3000, lambda: threading.Thread(
             target=_update_check, args=(self, self.log), daemon=True,
@@ -1453,7 +1467,12 @@ class App(tk.Tk):
             bg=GREEN, fg=WHITE, activebackground="#1f8f4e",
             activeforeground=WHITE, relief="flat", cursor="hand2",
             font=("Segoe UI", 15, "bold"), command=self._toggle_party_ready)
-        self._btn_ready.pack(fill="x", padx=12, pady=(10, 4), ipady=12)
+        self._btn_ready.pack(fill="x", padx=12, pady=(10, 0), ipady=12)
+
+        # Live ping to the regional Riot servers, shown under the button.
+        self._lbl_ping = tk.Label(parent, text="Ping: —", bg=DARK, fg="#888888",
+                                  font=("Segoe UI", 9, "bold"))
+        self._lbl_ping.pack(pady=(2, 4))
 
         # Assigned role indicator (updated while automation runs)
         self._lbl_role = tk.Label(parent, text="Assigned role: —",
@@ -1610,6 +1629,59 @@ class App(tk.Tk):
                  font=("Segoe UI", 9), justify="left").pack(anchor="w", pady=(4, 0))
 
     # ── Auto-connect watcher ──────────────────────────────────────────────────
+    def _ping_host(self):
+        """Resolve the regional Riot host from the client (cached)."""
+        host = getattr(self, "_cached_ping_host", None)
+        if host:
+            return host
+        host = DEFAULT_PING_HOST
+        try:
+            if self._connected:
+                r = self._lcu.get("/riotclient/region-locale")
+                if r.status_code == 200:
+                    wr = str(r.json().get("webRegion", "")).lower()
+                    host = REGION_HOST.get(wr, DEFAULT_PING_HOST)
+                    self._cached_ping_host = host   # cache only once we know region
+        except Exception:
+            pass
+        return host
+
+    def _watch_ping(self):
+        """Background thread: real ICMP ping to the regional Riot host, averaged
+        over a few samples and smoothed, shown colour-coded under Ready Up."""
+        ema = None  # exponential moving average for a steady readout
+        while True:
+            host = self._ping_host()
+            ms = self._icmp_ms(host)
+            if ms is None:
+                ema = None
+                self.after(0, lambda: self._lbl_ping.config(
+                    text="Ping: —", fg="#888888"))
+            else:
+                ema = ms if ema is None else (0.6 * ema + 0.4 * ms)
+                val = max(1, int(round(ema)))   # never show the impossible 0
+                fg  = GREEN if val < 60 else (GOLD if val < 120 else RED)
+                self.after(0, lambda v=val, c=fg: self._lbl_ping.config(
+                    text=f"Ping: {v} ms", fg=c))
+            time.sleep(3)
+
+    @staticmethod
+    def _icmp_ms(host):
+        """Average ICMP round-trip (ms) over 4 pings, or None if unreachable."""
+        try:
+            out = subprocess.run(
+                ["ping", "-n", "4", "-w", "1500", host],
+                capture_output=True, text=True, timeout=10,
+                creationflags=0x08000000,   # CREATE_NO_WINDOW
+            ).stdout
+            times = [int(t) for t in _re.findall(r"time[=<](\d+)\s*ms", out)]
+            times = [t for t in times if t >= 1]   # drop sub-ms (local) artifacts
+            if times:
+                return sum(times) / len(times)
+        except Exception:
+            pass
+        return None
+
     def _watch_relay(self):
         """Background thread: ping the ready-up relay and reflect its status in
         the header bubble (not set / connected / offline)."""
