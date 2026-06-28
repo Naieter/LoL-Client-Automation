@@ -10,6 +10,7 @@ and could result in account penalties. Use at your own risk.
 """
 
 import sys, os, json, threading, time, random, hashlib, subprocess, re as _re, math as _math
+import ctypes, ctypes.wintypes
 from pathlib import Path
 from collections import defaultdict
 
@@ -39,7 +40,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.6.9"
+APP_VERSION = "1.7.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -417,6 +418,8 @@ class AutoEngine:
         self._queue_started     = False  # leader already started queue this lobby
         self._last_ready_status = None   # last "X/Y ready" string logged
         self._last_relay_poll   = 0.0    # throttle relay polling
+        self._ready_count       = 0      # exposed to overlay
+        self._present_count     = 0      # exposed to overlay
         self._champ_select_start = 0.0   # monotonic when champ select began
         self._i_am_ready        = False  # my own ready state (for relay heartbeat)
         self._accept_time       = None   # monotonic when ReadyCheck began
@@ -1018,6 +1021,9 @@ class AutoEngine:
             present_count = len(present_set & member_keys)
             ready_count   = len(ready_set & member_keys)
 
+            self._ready_count   = ready_count
+            self._present_count = present_count
+
             status = f"{ready_count}/{present_count}"
             if status != self._last_ready_status:
                 extra = ("" if present_count == len(members)
@@ -1344,6 +1350,199 @@ class OpGGDialog(tk.Toplevel):
             self.after(0, lambda: self._btn_fetch.config(state="normal"))
 
 
+# ── Always-on-top overlay ─────────────────────────────────────────────────────
+class LCUOverlay:
+    """Frameless always-on-top button that floats over the League client window.
+    Shows FIND MATCH in lobby and ACCEPT during a ready check.
+    Drag to reposition."""
+
+    _LCU_CLASS = "RCLIENT"   # LeagueClientUx window class
+
+    def __init__(self, app: "App"):
+        self._app         = app
+        self._phase       = ""
+        self._drag_x      = self._drag_y = 0
+        self._dragged     = False
+        self._rel_x       = None   # overlay offset from LCU top-left (logical px)
+        self._rel_y       = None   # None = not yet placed
+        self._hwnd_cache  = None   # cached LCU hwnd for use during drag
+
+        win = tk.Toplevel(app)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.wm_attributes("-topmost", True)
+        win.wm_attributes("-alpha", 0.93)
+        win.configure(bg="#0a1428")
+
+        btn = tk.Button(
+            win, text="", font=("Arial", 11, "bold"),
+            relief="flat", cursor="hand2", bd=0, padx=16, pady=9,
+            command=self._click,
+        )
+        btn.pack(fill="both", expand=True, padx=1, pady=1)
+
+        for w in (win, btn):
+            w.bind("<ButtonPress-1>", self._drag_start)
+            w.bind("<B1-Motion>",     self._drag_move)
+
+        self._win = win
+        self._btn = btn
+        self._tick()
+
+    # ── League client window ──────────────────────────────────────────────────
+    @staticmethod
+    def _find_lcu():
+        # Try known class name first
+        hwnd = ctypes.windll.user32.FindWindowW(LCUOverlay._LCU_CLASS, None)
+        if hwnd:
+            return hwnd
+        # Fall back: find the largest visible window owned by LeagueClientUx.exe
+        result: list = []
+        _Proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        def _cb(hwnd, _):
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+            pid = ctypes.wintypes.DWORD()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            try:
+                if "LeagueClientUx" in psutil.Process(pid.value).name():
+                    r = ctypes.wintypes.RECT()
+                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+                    result.append(((r.right - r.left) * (r.bottom - r.top), hwnd))
+            except Exception:
+                pass
+            return True
+        ctypes.windll.user32.EnumWindows(_Proc(_cb), 0)
+        return max(result, default=(0, None))[1]
+
+    @staticmethod
+    def _lcu_rect(hwnd):
+        r = ctypes.wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+        return r
+
+    @staticmethod
+    def _dpi_scale():
+        try:
+            hdc = ctypes.windll.user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+            return dpi / 96.0
+        except Exception:
+            return 1.0
+
+    # ── phase + visibility ────────────────────────────────────────────────────
+    def set_phase(self, phase: str):
+        self._phase = phase
+        self._refresh()
+
+    def _tick(self):
+        self._refresh()
+        self._app.after(600, self._tick)
+
+    def _refresh(self):
+        phase = self._phase
+        if phase not in ("Lobby", "Matchmaking", "ReadyCheck"):
+            self._win.withdraw()
+            return
+
+        hwnd = self._find_lcu()
+        if not hwnd or ctypes.windll.user32.IsIconic(hwnd):
+            self._win.withdraw()
+            return
+
+        # Hide when the user is in a different app — only show while the
+        # League client (or the overlay button itself) is the active window.
+        fg     = ctypes.windll.user32.GetForegroundWindow()
+        fg_pid = ctypes.wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+        lc_pid = ctypes.wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(lc_pid))
+        overlay_hwnd = self._win.winfo_id()
+        if fg_pid.value != lc_pid.value and fg != overlay_hwnd:
+            self._win.withdraw()
+            return
+
+        if phase == "ReadyCheck":
+            self._btn.config(text="  ACCEPT  ",
+                             bg="#1a9e3a", fg="white",
+                             activebackground="#15832f", activeforeground="white")
+        else:
+            eng    = self._app._engine
+            rc     = getattr(eng, "_ready_count",   0)
+            pc     = getattr(eng, "_present_count",  0)
+            i_rdy  = getattr(eng, "_i_am_ready",    False)
+            label  = f" Ready Up [{rc}/{pc}] " if pc > 0 else " FIND MATCH "
+            if i_rdy:
+                bg, abg, fg = "#1a9e3a", "#15832f", "white"   # green = ready
+            else:
+                bg, abg, fg = "#8b1a1a", "#6e1414", "white"   # red = not ready
+            self._btn.config(text=label, bg=bg, fg=fg,
+                             activebackground=abg, activeforeground=fg)
+
+        rect  = self._lcu_rect(hwnd)
+        scale = self._dpi_scale()
+        lx = int(rect.left  / scale)
+        ly = int(rect.top   / scale)
+        lw = int((rect.right  - rect.left) / scale)
+        lh = int((rect.bottom - rect.top)  / scale)
+
+        self._hwnd_cache = hwnd
+
+        self._win.update_idletasks()
+        ow = max(self._win.winfo_reqwidth(),  160)
+        oh = max(self._win.winfo_reqheight(),  44)
+
+        # Default position: measured from a live session at 1280x720 client.
+        # rel_x scales with client width; rel_y pins to 74 px above client bottom.
+        if self._rel_x is None:
+            self._rel_x = int(lw * 0.35)
+            self._rel_y = lh - oh - 74
+
+        self._win.geometry(f"{ow}x{oh}+{lx + self._rel_x}+{ly + self._rel_y}")
+        self._win.deiconify()
+
+    # ── LCU actions ───────────────────────────────────────────────────────────
+    def _click(self):
+        if self._dragged:
+            self._dragged = False
+            return
+        lcu:  "LCU" = self._app._lcu
+        phase = self._phase
+        hwnd  = self._find_lcu()
+        def _do():
+            try:
+                if phase == "ReadyCheck":
+                    lcu.post("/lol-matchmaking/v1/ready-check/accept")
+                elif phase in ("Lobby", "Matchmaking"):
+                    self._app._toggle_party_ready()
+            except Exception:
+                pass
+            # Return focus to the League client so the overlay stays visible
+            if hwnd:
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ── drag to reposition ────────────────────────────────────────────────────
+    def _drag_start(self, event):
+        self._drag_x  = event.x_root - self._win.winfo_x()
+        self._drag_y  = event.y_root - self._win.winfo_y()
+        self._dragged = False
+
+    def _drag_move(self, event):
+        self._dragged = True
+        nx = event.x_root - self._drag_x
+        ny = event.y_root - self._drag_y
+        self._win.geometry(f"+{nx}+{ny}")
+        # Update the relative offset so the next tick keeps it in place
+        hwnd = self._hwnd_cache
+        if hwnd:
+            rect  = self._lcu_rect(hwnd)
+            scale = self._dpi_scale()
+            self._rel_x = nx - int(rect.left / scale)
+            self._rel_y = ny - int(rect.top  / scale)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1373,6 +1572,9 @@ class App(tk.Tk):
         self._setup_tray()
         if "--startup" in sys.argv and getattr(self, "_tray", None):
             self.withdraw()   # start hidden in the tray
+
+        # Always-on-top overlay over the League client
+        self._overlay = LCUOverlay(self)
 
         # Load champion data in background
         threading.Thread(target=self._load_champs, daemon=True).start()
@@ -1945,6 +2147,8 @@ class App(tk.Tk):
                                        bg=GREEN, fg=WHITE)
             else:
                 self._btn_ready.config(state="normal")
+            if hasattr(self, "_overlay"):
+                self._overlay.set_phase(phase)
         self.after(0, _do)
 
     def _restore_window(self):
