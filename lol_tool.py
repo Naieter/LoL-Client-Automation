@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.6.6"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -102,6 +102,7 @@ DEFAULT_CONFIG = {
     "prePickDelay": 500,
     "acceptDelay":  0,       # wait before auto-accepting a found match (ms)
     "relayUrl":     "",      # ready-up relay server, e.g. http://192.168.1.50:8777
+    "permaBans":    [],      # champion ids always banned first, regardless of role
     "roleChampions": {role: {"picks": [], "bans": []} for role in ROLES},
 }
 
@@ -582,6 +583,11 @@ class AutoEngine:
                 for c in role_cfg_map.get(rk, {}).get("bans", []):
                     if int(c) not in seen:
                         ban_prio.append(int(c)); seen.add(int(c))
+
+        # Permabans always come first, regardless of role.
+        perma = [int(c) for c in cfg.get("permaBans", [])]
+        if perma:
+            ban_prio = perma + [c for c in ban_prio if c not in set(perma)]
 
         # Champions actually selectable this session (Practice Tool → all)
         playable = self._get_pickable_ids()
@@ -1339,6 +1345,11 @@ class App(tk.Tk):
 
         self._build_ui()
 
+        # System tray + start-minimised when auto-launched at Windows startup
+        self._setup_tray()
+        if "--startup" in sys.argv and getattr(self, "_tray", None):
+            self.withdraw()   # start hidden in the tray
+
         # Load champion data in background
         threading.Thread(target=self._load_champs, daemon=True).start()
 
@@ -1405,6 +1416,36 @@ class App(tk.Tk):
                   activebackground=PANEL, relief="flat", cursor="hand2",
                   padx=12, pady=4, font=("Segoe UI", 9),
                   command=self._open_opgg_dialog).pack(side="right", padx=(0, 10), pady=6)
+
+        # Permaban — always banned first, regardless of role.
+        pb = tk.Frame(parent, bg=DARK)
+        pb.pack(fill="x", padx=12, pady=(6, 0))
+        tk.Label(pb, text="Permaban (any role):", bg=DARK, fg=RED,
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._perma_var = tk.StringVar()
+        pe = tk.Entry(pb, textvariable=self._perma_var, width=16, bg=PANEL,
+                      fg=WHITE, relief="flat", insertbackground=WHITE,
+                      font=("Segoe UI", 9))
+        pe.pack(side="left", padx=4)
+        pe.bind("<Return>", lambda *_: self._perma_enter())
+        tk.Button(pb, text="Add", bg=PANEL, fg=TEXT, activebackground=PANEL,
+                  command=self._add_permaban, **BTN_STYLE).pack(side="left", padx=2)
+        tk.Button(pb, text="Remove", bg=PANEL, fg=TEXT, activebackground=PANEL,
+                  command=self._remove_permaban, **BTN_STYLE).pack(side="left", padx=2)
+        self._perma_lb = tk.Listbox(pb, height=1, width=26, bg=DARKER, fg=WHITE,
+                                    selectbackground=RED, selectforeground=WHITE,
+                                    relief="flat", font=("Segoe UI", 9),
+                                    activestyle="none")
+        self._perma_lb.pack(side="left", fill="x", expand=True, padx=6)
+
+        # Live autocomplete dropdown for the permaban entry (hidden until typing).
+        ac_holder = tk.Frame(parent, bg=DARK)
+        ac_holder.pack(fill="x", padx=12)
+        self._perma_ac = tk.Listbox(ac_holder, bg=PANEL, fg=WHITE,
+                                    selectbackground=RED, selectforeground=WHITE,
+                                    relief="flat", height=5, font=("Segoe UI", 9))
+        self._perma_var.trace_add("write", self._perma_ac_update)
+        self._perma_ac.bind("<<ListboxSelect>>", self._perma_ac_select)
 
         holder = tk.Frame(parent, bg=DARK)
         holder.pack(fill="both", expand=True)
@@ -1551,6 +1592,22 @@ class App(tk.Tk):
                            activebackground=DARK, selectcolor=PANEL,
                            font=("Segoe UI", 10),
                            command=_on_toggle).pack(anchor="w", padx=4, pady=1)
+
+        # Startup
+        startup = tk.Frame(body, bg=DARK)
+        startup.pack(padx=20, pady=(16, 0), anchor="nw", fill="x")
+        tk.Label(startup, text="Startup", bg=DARK, fg=GOLD,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
+        self._startup_var = tk.BooleanVar(value=self._startup_enabled())
+        tk.Checkbutton(
+            startup, text="Launch at Windows startup (minimised to tray)",
+            variable=self._startup_var, bg=DARK, fg=TEXT, anchor="w",
+            activebackground=DARK, selectcolor=PANEL, font=("Segoe UI", 10),
+            command=lambda: self._set_startup(self._startup_var.get())
+        ).pack(anchor="w", padx=4, pady=1)
+        tk.Label(startup,
+                 text="Runs quietly in the tray and auto-connects when League opens",
+                 bg=DARK, fg="#555", font=("Segoe UI", 8)).pack(anchor="w", padx=4)
 
         f = tk.Frame(body, bg=DARK)
         f.pack(padx=20, pady=20, anchor="nw")
@@ -1764,10 +1821,89 @@ class App(tk.Tk):
         self._btn_start.config(state="normal")
         self.log("Automation stopped.")
 
+    # ── Launch at Windows startup (per-user, no admin) ─────────────────────────
+    _RUN_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    _RUN_NAME = "LOL Client Tool"
+
+    def _startup_enabled(self) -> bool:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._RUN_KEY) as k:
+                winreg.QueryValueEx(k, self._RUN_NAME)
+            return True
+        except Exception:
+            return False
+
+    def _set_startup(self, enable: bool):
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+                if enable:
+                    if not getattr(sys, "frozen", False):
+                        self.log("Launch at startup only works in the packaged exe.")
+                        return
+                    # "--startup" makes it start hidden in the tray.
+                    cmd = f'"{sys.executable}" --startup'
+                    winreg.SetValueEx(k, self._RUN_NAME, 0, winreg.REG_SZ, cmd)
+                    self.log("Will launch at Windows startup (minimised to tray).")
+                else:
+                    try:
+                        winreg.DeleteValue(k, self._RUN_NAME)
+                    except FileNotFoundError:
+                        pass
+                    self.log("Removed from Windows startup.")
+        except Exception as e:
+            self.log(f"Startup setting failed: {e}")
+
+    # ── System tray ────────────────────────────────────────────────────────────
+    def _setup_tray(self):
+        self._tray = None
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+        except Exception:
+            # No tray support — closing the window just exits (default behaviour).
+            return
+        img = Image.new("RGBA", (64, 64), (24, 24, 24, 255))
+        d = ImageDraw.Draw(img)
+        d.ellipse((8, 8, 56, 56), fill=(200, 170, 60, 255))
+        d.text((26, 22), "L", fill=(20, 20, 20, 255))
+        menu = pystray.Menu(
+            pystray.MenuItem("Open", lambda *_: self.after(0, self._show_window),
+                             default=True),
+            pystray.MenuItem("Quit", lambda *_: self.after(0, self._quit_app)),
+        )
+        self._tray = pystray.Icon("loltool", img, "LOL Client Tool", menu)
+        threading.Thread(target=self._tray.run, daemon=True).start()
+        # Closing the window hides to tray instead of quitting (keeps automation
+        # running in the background).
+        self.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
+
+    def _hide_to_tray(self):
+        self.withdraw()
+
+    def _show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _quit_app(self):
+        try:
+            if self._tray:
+                self._tray.stop()
+        except Exception:
+            pass
+        self.destroy()
+        os._exit(0)
+
     def _on_phase_change(self, phase):
-        """Engine callback: grey the Ready Up button during champion select
-        (ready-up only applies in the pre-game lobby) and reset it afterward."""
+        """Engine callback: grey the Ready Up button during champion select, and
+        bring the tool to the front (maximised) when a game ends."""
         def _do():
+            # When the match ends, restore from tray and maximise the window.
+            if phase == "PreEndOfGame":
+                self._maximize_window()
             if not hasattr(self, "_btn_ready"):
                 return
             if phase == "ChampSelect":
@@ -1777,6 +1913,21 @@ class App(tk.Tk):
             else:
                 self._btn_ready.config(state="normal")
         self.after(0, _do)
+
+    def _maximize_window(self):
+        """Restore the window (from tray/minimised) and maximise it to the front."""
+        try:
+            self.deiconify()
+            self.state("zoomed")
+        except Exception:
+            pass
+        try:
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(400, lambda: self.attributes("-topmost", False))
+            self.focus_force()
+        except Exception:
+            pass
 
     def _toggle_party_ready(self):
         """Toggle your ready state and broadcast it to the relay so every party
@@ -1940,6 +2091,74 @@ class App(tk.Tk):
         for role in ROLES:
             for k in ("picks", "bans"):
                     self.refresh_list(role, k)
+        self._refresh_permabans()
+
+    # ── Permaban (global, always banned first) ─────────────────────────────────
+    def _refresh_permabans(self):
+        if not hasattr(self, "_perma_lb"):
+            return
+        self._perma_lb.delete(0, "end")
+        for cid in self.cfg.get("permaBans", []):
+            self._perma_lb.insert("end", f" {self.ddragon.name(int(cid))}")
+
+    def _perma_ac_update(self, *_):
+        if not hasattr(self, "_perma_ac"):
+            return
+        q = self._perma_var.get().lower().strip()
+        self._perma_ac.delete(0, "end")
+        if not q:
+            self._perma_ac.pack_forget()
+            return
+        hits = [n for n in self.ddragon.all_display_names() if q in n.lower()][:6]
+        if not hits:
+            self._perma_ac.pack_forget()
+            return
+        for h in hits:
+            self._perma_ac.insert("end", "  " + h)
+        self._perma_ac.pack(fill="x")
+
+    def _perma_ac_select(self, _evt):
+        sel = self._perma_ac.curselection()
+        if sel:
+            self._add_permaban(self._perma_ac.get(sel[0]).strip())
+
+    def _perma_enter(self):
+        # Enter adds the top dropdown match; falls back to the typed text.
+        if hasattr(self, "_perma_ac") and self._perma_ac.size() > 0:
+            self._add_permaban(self._perma_ac.get(0).strip())
+        else:
+            self._add_permaban()
+
+    def _add_permaban(self, name: str = ""):
+        name = (name or self._perma_var.get()).strip()
+        if not name:
+            return
+        cid = self.ddragon.find_id(name)
+        if cid is None:
+            self.log(f"Unknown champion: {name!r}")
+            return
+        lst = self.cfg.setdefault("permaBans", [])
+        if cid not in lst:
+            lst.append(cid)
+            save_config(self.cfg)
+            self._refresh_permabans()
+            self.log(f"Permaban added: {self.ddragon.name(cid)}")
+        self._perma_var.set("")
+        if hasattr(self, "_perma_ac"):
+            self._perma_ac.pack_forget()
+
+    def _remove_permaban(self):
+        sel = self._perma_lb.curselection()
+        if not sel:
+            return
+        lst = self.cfg.get("permaBans", [])
+        idx = sel[0]
+        if 0 <= idx < len(lst):
+            removed = self.ddragon.name(int(lst[idx]))
+            lst.pop(idx)
+            save_config(self.cfg)
+            self._refresh_permabans()
+            self.log(f"Permaban removed: {removed}")
 
     def move_item(self, role: str, key: str, delta: int):
         panel = self._role_panels.get(role)

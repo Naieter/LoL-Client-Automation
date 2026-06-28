@@ -18,7 +18,8 @@ log(f"Working dir: {here}")
 
 log("Installing dependencies...")
 subprocess.check_call([sys.executable, "-m", "pip", "install",
-                       "pyinstaller", "requests", "psutil", "urllib3", "-q"])
+                       "pyinstaller", "requests", "psutil", "urllib3",
+                       "pystray", "Pillow", "-q"])
 log("Dependencies installed.")
 
 os.makedirs(tmp, exist_ok=True)
@@ -33,6 +34,8 @@ subprocess.check_call([
     "--distpath", tmp,
     "--workpath", os.path.join(tmp, "build"),
     "--specpath", tmp,
+    "--hidden-import", "pystray._win32",
+    "--hidden-import", "PIL",
     os.path.join(here, "lol_tool.py"),
 ])
 

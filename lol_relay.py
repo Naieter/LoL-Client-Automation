@@ -29,7 +29,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-RELAY_VERSION = "1.6.5"
+RELAY_VERSION = "1.6.6"
 GITHUB_REPO   = "Naieter/LoL-Client-Automation"
 
 DEFAULT_PORT = 8777
