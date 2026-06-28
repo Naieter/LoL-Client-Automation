@@ -14,7 +14,7 @@ from pathlib import Path
 from collections import defaultdict
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 
 
 # ── Auto-install missing dependencies ─────────────────────────────────────────
@@ -2445,5 +2445,20 @@ class App(tk.Tk):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Prevent multiple instances (including different versions) from running
+    # simultaneously. CreateMutexW returns ERROR_ALREADY_EXISTS (183) when
+    # another instance already holds the mutex.
+    import ctypes as _ct
+    _mutex = _ct.windll.kernel32.CreateMutexW(None, False, "Global\\LOL_Client_Tool")
+    if _ct.windll.kernel32.GetLastError() == 183:
+        _r = tk.Tk(); _r.withdraw()
+        tk.messagebox.showerror(
+            "Already Running",
+            "LOL Client Tool is already running.\n\nClose the existing instance first.",
+            parent=_r,
+        )
+        _r.destroy()
+        sys.exit(0)
+
     app = App()
     app.mainloop()
