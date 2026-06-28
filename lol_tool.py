@@ -41,7 +41,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.2"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -103,6 +103,7 @@ DEFAULT_CONFIG = {
     "banDelay":     3000,    # ban this many ms before the ban phase ends
     "prePickDelay": 500,
     "acceptDelay":  0,       # wait before auto-accepting a found match (ms)
+    "readyUpEnabled": True,  # enable/disable the party ready-up feature
     "relayUrl":     "",      # ready-up relay server, e.g. http://192.168.1.50:8777
     "localApiPort": 0,      # Stream Deck REST API port (0 = disabled by default)
     "permaBans":    [],      # champion ids always banned first, regardless of role
@@ -996,6 +997,8 @@ class AutoEngine:
         return None, set()
 
     def _handle_party_ready(self):
+        if not self._cfg().get("readyUpEnabled", True):
+            return
         try:
             url = (self._cfg().get("relayUrl") or "").strip().rstrip("/")
             if not url:
@@ -1502,6 +1505,9 @@ class LCUOverlay:
         if phase not in ("Lobby", "Matchmaking", "ReadyCheck"):
             self._win.withdraw()
             return
+        if not self._app.cfg.get("readyUpEnabled", True):
+            self._win.withdraw()
+            return
 
         hwnd = self._find_lcu()
         if not hwnd or ctypes.windll.user32.IsIconic(hwnd):
@@ -1943,7 +1949,13 @@ class App(tk.Tk):
         # Party Ready-Up relay
         tk.Label(f, text="Party Ready-Up", bg=DARK, fg=GOLD,
                  font=("Segoe UI", 11, "bold")).grid(
-            row=5, column=0, columnspan=3, pady=(24, 6), sticky="w")
+            row=5, column=0, pady=(24, 6), sticky="w")
+        self._ready_up_var = tk.BooleanVar(value=bool(self.cfg.get("readyUpEnabled", True)))
+        tk.Checkbutton(f, text="Enabled", variable=self._ready_up_var,
+                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
+                       selectcolor=PANEL, font=("Segoe UI", 9),
+                       command=self._on_ready_up_toggle).grid(
+            row=5, column=1, sticky="w", padx=10)
         tk.Label(f, text="Relay URL:", bg=DARK, fg=TEXT,
                  font=("Segoe UI", 9)).grid(row=6, column=0, sticky="w", pady=4)
         self._relay_var = tk.StringVar(value=str(self.cfg.get("relayUrl", "") or ""))
@@ -2080,6 +2092,11 @@ class App(tk.Tk):
         """Background thread: ping the ready-up relay and reflect its status in
         the header bubble (not set / connected / offline)."""
         while True:
+            if not self.cfg.get("readyUpEnabled", True):
+                self.after(0, lambda: self._lbl_relay.config(
+                    text="● Relay: disabled", fg="#888888"))
+                time.sleep(5)
+                continue
             url = (self.cfg.get("relayUrl") or "").strip().rstrip("/")
             if not url:
                 self.after(0, lambda: self._lbl_relay.config(
@@ -2287,6 +2304,26 @@ class App(tk.Tk):
                          "and make sure you're in a party lobby.")
 
         threading.Thread(target=_do, daemon=True).start()
+
+    def _on_ready_up_toggle(self):
+        enabled = self._ready_up_var.get()
+        self.cfg["readyUpEnabled"] = enabled
+        save_config(self.cfg)
+        if not enabled:
+            def _disconnect():
+                try:
+                    self._engine.broadcast_party_ready(False)
+                except Exception:
+                    pass
+                self._engine._i_am_ready   = False
+                self._engine._ready_count  = 0
+                self._engine._present_count = 0
+                self._party_ready = False
+                self.after(0, lambda: self._btn_ready.config(
+                    text="✓   READY UP", bg=GREEN, fg=WHITE,
+                    activebackground="#1f8f4e"))
+            threading.Thread(target=_disconnect, daemon=True).start()
+        self.log(f"Ready Up {'enabled' if enabled else 'disabled'}.")
 
     def _ultimate_bravery(self):
         """Roll a random available champion and hover it on our pick action.
