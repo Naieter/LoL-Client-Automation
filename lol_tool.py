@@ -11,6 +11,7 @@ and could result in account penalties. Use at your own risk.
 
 import sys, os, json, threading, time, random, hashlib, subprocess, re as _re, math as _math
 import ctypes, ctypes.wintypes
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from collections import defaultdict
 
@@ -40,7 +41,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -103,6 +104,7 @@ DEFAULT_CONFIG = {
     "prePickDelay": 500,
     "acceptDelay":  0,       # wait before auto-accepting a found match (ms)
     "relayUrl":     "",      # ready-up relay server, e.g. http://192.168.1.50:8777
+    "localApiPort": 0,      # Stream Deck REST API port (0 = disabled by default)
     "permaBans":    [],      # champion ids always banned first, regardless of role
     "roleChampions": {role: {"picks": [], "bans": []} for role in ROLES},
 }
@@ -1350,6 +1352,61 @@ class OpGGDialog(tk.Toplevel):
             self.after(0, lambda: self._btn_fetch.config(state="normal"))
 
 
+# ── Local REST API (Stream Deck, home-automation, etc.) ──────────────────────
+def _make_api_handler(app):
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  self._handle()
+        def do_POST(self): self._handle()
+
+        def _handle(self):
+            path = self.path.split("?")[0].rstrip("/") or "/"
+            if path == "/ready-up":
+                app.after(0, app._toggle_party_ready)
+                self._respond({"ok": True, "action": "ready-up"})
+            elif path == "/accept":
+                def _do():
+                    try: app._lcu.post("/lol-matchmaking/v1/ready-check/accept")
+                    except Exception: pass
+                threading.Thread(target=_do, daemon=True).start()
+                self._respond({"ok": True, "action": "accept"})
+            elif path == "/status":
+                eng = app._engine
+                self._respond({
+                    "phase":         getattr(eng, "_last_phase",    ""),
+                    "ready":         getattr(eng, "_i_am_ready",    False),
+                    "ready_count":   getattr(eng, "_ready_count",   0),
+                    "present_count": getattr(eng, "_present_count", 0),
+                })
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def _respond(self, data):
+            body = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_): pass
+
+    return _Handler
+
+
+def _start_local_api(app, port: int):
+    try:
+        srv = HTTPServer(("127.0.0.1", port), _make_api_handler(app))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        app.log(
+            f"Stream Deck API → http://127.0.0.1:{port}"
+            f"  (GET /ready-up  /accept  /status)"
+        )
+    except OSError as e:
+        app.log(f"[api] Could not bind port {port}: {e}")
+
+
 # ── Always-on-top overlay ─────────────────────────────────────────────────────
 class LCUOverlay:
     """Frameless always-on-top button that floats over the League client window.
@@ -1575,6 +1632,11 @@ class App(tk.Tk):
 
         # Always-on-top overlay over the League client
         self._overlay = LCUOverlay(self)
+
+        # Local REST API for Stream Deck / external triggers
+        _api_port = self.cfg.get("localApiPort", 8778)
+        if _api_port:
+            self.after(500, lambda: _start_local_api(self, _api_port))
 
         # Load champion data in background
         threading.Thread(target=self._load_champs, daemon=True).start()
@@ -1904,21 +1966,51 @@ class App(tk.Tk):
                  bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
             row=7, column=1, columnspan=2, padx=10, sticky="w")
 
+        # Stream Deck / Local API
+        tk.Label(f, text="Stream Deck API", bg=DARK, fg=GOLD,
+                 font=("Segoe UI", 11, "bold")).grid(
+            row=8, column=0, columnspan=3, pady=(24, 6), sticky="w")
+        tk.Label(f, text="Port:", bg=DARK, fg=TEXT,
+                 font=("Segoe UI", 9)).grid(row=9, column=0, sticky="w", pady=4)
+        self._api_port_var = tk.StringVar(
+            value=str(self.cfg.get("localApiPort", 8778)))
+        api_port_entry = tk.Entry(
+            f, textvariable=self._api_port_var, width=8, bg=PANEL,
+            fg=WHITE, relief="flat", insertbackground=WHITE)
+        api_port_entry.grid(row=9, column=1, padx=10, sticky="w")
+
+        def _persist_api_port(*_):
+            try:
+                p = int(self._api_port_var.get())
+            except ValueError:
+                return
+            self.cfg["localApiPort"] = p
+            save_config(self.cfg)
+            self.log(f"Stream Deck API port saved to {p} — restart to apply.")
+        api_port_entry.bind("<FocusOut>", _persist_api_port)
+        api_port_entry.bind("<Return>",   _persist_api_port)
+        _api_port_now = self.cfg.get("localApiPort", 8778)
+        tk.Label(f,
+                 text=(f"GET http://127.0.0.1:{_api_port_now}/ready-up  "
+                       f"·  /accept  ·  /status  ·  0 = disabled"),
+                 bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
+            row=9, column=1, columnspan=2, padx=(90, 0), sticky="w")
+
         # Updates
         tk.Label(f, text="Updates", bg=DARK, fg=GOLD,
                  font=("Segoe UI", 11, "bold")).grid(
-            row=8, column=0, columnspan=3, pady=(24, 6), sticky="w")
+            row=10, column=0, columnspan=3, pady=(24, 6), sticky="w")
         tk.Button(f, text="Check for Updates", bg=PANEL, fg=WHITE, relief="flat",
                   font=("Segoe UI", 9), padx=12, pady=4,
                   command=self._manual_update_check).grid(
-            row=9, column=0, sticky="w", pady=2)
+            row=11, column=0, sticky="w", pady=2)
         tk.Label(f, text=f"Current version: v{APP_VERSION}", bg=DARK, fg="#555",
-                 font=("Segoe UI", 8)).grid(row=9, column=1, columnspan=2,
+                 font=("Segoe UI", 8)).grid(row=11, column=1, columnspan=2,
                                             padx=10, sticky="w")
 
         # Warning box
         warn = tk.Frame(f, bg="#2a1a1a", padx=12, pady=10)
-        warn.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(24, 0))
+        warn.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(24, 0))
         tk.Label(warn, text="⚠  Terms of Service Warning", bg="#2a1a1a",
                  fg=RED, font=("Segoe UI", 9, "bold")).pack(anchor="w")
         tk.Label(warn,
