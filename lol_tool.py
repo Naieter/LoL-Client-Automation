@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.6.8"
+APP_VERSION = "1.6.9"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -218,11 +218,13 @@ def _do_update(dl_url: str, log_fn, root):
         # NOTE: use `ping` for delays, not `timeout` — `timeout` needs a console
         # and fails silently in a windowless/detached process, which previously
         # broke the swap. enabledelayedexpansion makes the retry counter work.
+        bak = Path(str(exe) + ".bak")
         bat.write_text(
             "@echo off\r\n"
             "setlocal enableextensions enabledelayedexpansion\r\n"
             f'set "EXE={exe}"\r\n'
             f'set "NEW={tmp}"\r\n'
+            f'set "BAK={bak}"\r\n'
             f'set "LOG={log}"\r\n'
             'echo === update started === > "%LOG%"\r\n'
             ":waitexit\r\n"
@@ -231,19 +233,31 @@ def _do_update(dl_url: str, log_fn, root):
             "  ping -n 2 127.0.0.1 >nul\r\n"
             "  goto waitexit\r\n"
             ")\r\n"
-            'echo process exited; waiting for lock release >> "%LOG%"\r\n'
-            "ping -n 3 127.0.0.1 >nul\r\n"
+            'echo process exited >> "%LOG%"\r\n'
+            # Wait longer for Windows to fully release the exe after process exit
+            "ping -n 6 127.0.0.1 >nul\r\n"
             "set /a tries=0\r\n"
+            # Rename-based swap: rename old→.bak, then rename new→old.
+            # Avoids overwriting a locked file; renames within the same dir are atomic.
             ":swap\r\n"
-            'move /y "%NEW%" "%EXE%" >>"%LOG%" 2>&1\r\n'
-            'if exist "%NEW%" (\r\n'
-            "  set /a tries+=1\r\n"
-            '  echo move retry !tries! >> "%LOG%"\r\n'
-            "  if !tries! lss 20 (\r\n"
-            "    ping -n 2 127.0.0.1 >nul\r\n"
-            "    goto swap\r\n"
-            "  )\r\n"
+            'del /f "%BAK%" 2>nul\r\n'
+            'ren "%EXE%" "LOL_Client_Tool.exe.bak" 2>>"%LOG%"\r\n'
+            'if not exist "%EXE%" (\r\n'
+            '  ren "%NEW%" "LOL_Client_Tool.exe" 2>>"%LOG%"\r\n'
+            '  if exist "%EXE%" (\r\n'
+            '    echo swap ok >> "%LOG%"\r\n'
+            '    del /f "%BAK%" 2>nul\r\n'
+            '    goto launch\r\n'
+            '  )\r\n'
+            '  ren "%BAK%" "LOL_Client_Tool.exe" 2>nul\r\n'
+            ')\r\n'
+            "set /a tries+=1\r\n"
+            '  echo swap retry !tries! >> "%LOG%"\r\n'
+            "if !tries! lss 30 (\r\n"
+            "  ping -n 2 127.0.0.1 >nul\r\n"
+            "  goto swap\r\n"
             ")\r\n"
+            ":launch\r\n"
             "ping -n 2 127.0.0.1 >nul\r\n"
             'echo launching new version >> "%LOG%"\r\n'
             # Relaunch via explorer so the new GUI process gets a clean interactive
@@ -2459,6 +2473,14 @@ if __name__ == "__main__":
         )
         _r.destroy()
         sys.exit(0)
+
+    if getattr(sys, "frozen", False):
+        for _f in (
+            Path(sys.executable).with_name("LOL_Client_Tool_update.exe"),
+            Path(str(sys.executable) + ".bak"),
+        ):
+            try: _f.unlink()
+            except Exception: pass
 
     app = App()
     app.mainloop()
