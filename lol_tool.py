@@ -39,7 +39,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.6.6"
+APP_VERSION = "1.6.7"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -97,8 +97,8 @@ DEFAULT_CONFIG = {
     "autoPrePick":  True,
     "autoBan":      True,
     "autoRunes":    True,
-    "pickDelay":    27000,
-    "banDelay":     2000,
+    "pickDelay":    3000,    # lock this many ms before the pick phase ends
+    "banDelay":     3000,    # ban this many ms before the ban phase ends
     "prePickDelay": 500,
     "acceptDelay":  0,       # wait before auto-accepting a found match (ms)
     "relayUrl":     "",      # ready-up relay server, e.g. http://192.168.1.50:8777
@@ -403,6 +403,7 @@ class AutoEngine:
         self._queue_started     = False  # leader already started queue this lobby
         self._last_ready_status = None   # last "X/Y ready" string logged
         self._last_relay_poll   = 0.0    # throttle relay polling
+        self._champ_select_start = 0.0   # monotonic when champ select began
         self._i_am_ready        = False  # my own ready state (for relay heartbeat)
         self._accept_time       = None   # monotonic when ReadyCheck began
         self._accepted          = False  # already accepted this ready check
@@ -449,8 +450,10 @@ class AutoEngine:
                 self._user_pick.clear()
                 self._pick_rejected.clear()
                 self._ban_hovered.clear()
-                self._runes_key = None
-                self._last_role = None
+                self._runes_key      = None
+                self._last_role      = None
+                self._last_state_key = None   # force [tick] on first poll
+                self._champ_select_start = time.monotonic()  # for pre-pick delay
                 # A game started — the ready cycle is done; clear my ready state.
                 self._i_am_ready = False
                 self._log_champ_select_debug()
@@ -529,6 +532,11 @@ class AutoEngine:
             if intent:
                 pick_intents.add(intent)
 
+        # ── phase timer: how long until the current sub-phase ends ──
+        _timer      = session.get("timer", {})
+        time_left   = int(_timer.get("adjustedTimeLeftInPhase", 0) or 0)   # ms
+        is_infinite = bool(_timer.get("isInfinite", False))
+
         # ── locate our own cell ──
         local_cell_id = session.get("localPlayerCellId")
         if local_cell_id is None:
@@ -601,9 +609,9 @@ class AutoEngine:
             for a in grp
             if str(a.get("actorCellId", "")) == my_cell
         ]
-        _key = f"{_states}|bans={sorted(bans)}|intent={sorted(pick_intents)}"
+        _key = f"{_states}|bans={sorted(bans)}|intent={sorted(pick_intents)}|t={time_left // 2000}"
         if _key != getattr(self, "_last_state_key", None):
-            self._log(f"[tick] {_states}  bans={sorted(bans)}")
+            self._log(f"[tick] {_states}  bans={sorted(bans)}  t={time_left}ms inf={is_infinite}")
             self._last_state_key = _key
 
         # ── action loop (mirrors reference foreach actions → foreach team) ──
@@ -652,10 +660,9 @@ class AutoEngine:
                     override = self._user_pick.get(aid)
                     if aid not in self._action_start:
                         self._action_start[aid] = time.monotonic()
-                    if (time.monotonic() - self._action_start[aid]) * 1000 < cfg.get("pickDelay", 27000):
+                    if (time.monotonic() - self._action_start[aid]) * 1000 < cfg.get("pickDelay", 3000):
                         # Still waiting to lock. Keep the intended champion hovered so a
-                        # role swap mid-turn is reflected — but never override a champion
-                        # the user hovered themselves.
+                        # role swap mid-turn is reflected — but never override a user's hover.
                         if override is None:
                             champ = self._best(pick_prio, set(), playable_now)
                             if champ and self._prepicked.get(aid) != champ:
@@ -708,14 +715,16 @@ class AutoEngine:
                             self._log(f"Banned champion #{champ}")
                             self._done_actions.add(aid)
 
-                # ── PRE-PICK ── hover our intended champion before our turn, unless
-                # the user has already hovered one themselves (then leave it alone).
+                # ── PRE-PICK ── hover our intended champion before our turn (after
+                # the pre-pick delay), unless the user has already hovered one.
                 elif (cfg.get("autoPrePick")
                         and atype == "pick"
                         and not in_progress
                         and not completed
                         and aid not in self._done_actions
-                        and aid not in self._user_pick):
+                        and aid not in self._user_pick
+                        and (time.monotonic() - getattr(self, "_champ_select_start", 0))
+                            * 1000 >= cfg.get("prePickDelay", 500)):
                     champ = self._best(pick_prio, set(), playable_now)
                     if champ and self._prepicked.get(aid) != champ:
                         if self._commit_action(action, champ, complete=False):
@@ -1182,6 +1191,7 @@ class RolePanel:
             lst = app.cfg["roleChampions"][_role][_list_key]
             if cid not in lst:
                 lst.append(cid)
+                save_config(app.cfg)       # persist immediately
                 app.refresh_list(_role, _list_key)
                 app.log(
                     f"Added {app.ddragon.name(cid)} to "
@@ -1325,8 +1335,8 @@ class App(tk.Tk):
         super().__init__()
         self.title(f"{APP_NAME}   v{APP_VERSION}")
         self.configure(bg=DARK)
-        self.geometry("560x520")
-        self.minsize(520, 460)
+        self.geometry("560x480")
+        self.minsize(520, 430)
         self.resizable(True, True)
 
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1403,6 +1413,11 @@ class App(tk.Tk):
         sett_frame = ttk.Frame(nb)
         nb.add(sett_frame, text="  Settings  ")
         self._build_settings(sett_frame)
+
+        # Log tab
+        log_frame = ttk.Frame(nb)
+        nb.add(log_frame, text="  Log  ")
+        self._build_log(log_frame)
 
     def _build_champions(self, parent):
         # Role selector bar — the highlighted button marks the active role.
@@ -1512,27 +1527,30 @@ class App(tk.Tk):
                   padx=10, command=self._ultimate_bravery,
                   **BTN_STYLE).pack(side="left", padx=(0, 6))
 
-        # Prominent party ready-up button
-        self._party_ready = False
-        self._btn_ready = tk.Button(
-            parent, text="✓   READY UP",
-            bg=GREEN, fg=WHITE, activebackground="#1f8f4e",
-            activeforeground=WHITE, relief="flat", cursor="hand2",
-            font=("Segoe UI", 15, "bold"), command=self._toggle_party_ready)
-        self._btn_ready.pack(fill="x", padx=12, pady=(10, 0), ipady=12)
-
-        # Live ping to the regional Riot servers, shown under the button.
-        self._lbl_ping = tk.Label(parent, text="Ping: —", bg=DARK, fg="#888888",
-                                  font=("Segoe UI", 9, "bold"))
-        self._lbl_ping.pack(pady=(2, 4))
-
-        # Assigned role indicator (updated while automation runs)
+        # Assigned role indicator pinned to the bottom of the tab.
         self._lbl_role = tk.Label(parent, text="Assigned role: —",
                                   bg=DARK, fg=GOLD,
                                   font=("Segoe UI", 10, "bold"))
-        self._lbl_role.pack(anchor="w", padx=14, pady=(4, 0))
+        self._lbl_role.pack(side="bottom", anchor="w", padx=14, pady=(4, 8))
 
-        # Log
+        # Ready-up button grows to fill the remaining space (no gaps above/below);
+        # the ping sits just beneath it.
+        mid = tk.Frame(parent, bg=DARK)
+        mid.pack(fill="both", expand=True)
+
+        self._party_ready = False
+        self._btn_ready = tk.Button(
+            mid, text="✓   READY UP",
+            bg=GREEN, fg=WHITE, activebackground="#1f8f4e",
+            activeforeground=WHITE, relief="flat", cursor="hand2",
+            font=("Segoe UI", 16, "bold"), command=self._toggle_party_ready)
+        self._btn_ready.pack(fill="both", expand=True, padx=12, pady=(10, 2))
+
+        self._lbl_ping = tk.Label(mid, text="Ping: —", bg=DARK, fg="#888888",
+                                  font=("Segoe UI", 9, "bold"))
+        self._lbl_ping.pack(pady=(0, 6))
+
+    def _build_log(self, parent):
         self._log_box = scrolledtext.ScrolledText(
             parent, height=10, width=72,
             bg=DARKER, fg="#aaaaaa",
@@ -1617,14 +1635,14 @@ class App(tk.Tk):
             row=0, column=0, columnspan=3, pady=(0, 10), sticky="w")
 
         for i, (label, key, note) in enumerate([
-            ("Accept delay:",    "acceptDelay",
-             "Wait before accepting a found match"),
-            ("Pre-pick delay:",  "prePickDelay",
-             "Hover champion before your turn"),
-            ("Pick delay:",      "pickDelay",
-             "Wait before locking champion"),
-            ("Ban delay:",       "banDelay",
-             "Wait before confirming ban"),
+            ("Accept delay:",   "acceptDelay",
+             "Wait this long after a match is found before accepting"),
+            ("Pre-pick delay:", "prePickDelay",
+             "Wait this long into champion select before hovering your pre-pick"),
+            ("Pick delay:",     "pickDelay",
+             "Wait this long after your pick turn starts before locking in"),
+            ("Ban delay:",      "banDelay",
+             "Wait this long after your ban turn starts before banning"),
         ]):
             tk.Label(f, text=label, bg=DARK, fg=TEXT,
                      font=("Segoe UI", 9)).grid(
@@ -1899,11 +1917,12 @@ class App(tk.Tk):
 
     def _on_phase_change(self, phase):
         """Engine callback: grey the Ready Up button during champion select, and
-        bring the tool to the front (maximised) when a game ends."""
+        bring the tool to the front when a game ends."""
         def _do():
-            # When the match ends, restore from tray and maximise the window.
+            # When the match ends, restore the window to its normal size and
+            # bring it to the front.
             if phase == "PreEndOfGame":
-                self._maximize_window()
+                self._restore_window()
             if not hasattr(self, "_btn_ready"):
                 return
             if phase == "ChampSelect":
@@ -1914,11 +1933,13 @@ class App(tk.Tk):
                 self._btn_ready.config(state="normal")
         self.after(0, _do)
 
-    def _maximize_window(self):
-        """Restore the window (from tray/minimised) and maximise it to the front."""
+    def _restore_window(self):
+        """Restore the window from tray/minimised to its usual size and bring it
+        to the front (without maximising)."""
         try:
             self.deiconify()
-            self.state("zoomed")
+            if self.state() == "zoomed":
+                self.state("normal")   # ensure usual size, not maximised
         except Exception:
             pass
         try:
@@ -2173,6 +2194,7 @@ class App(tk.Tk):
         new = idx + delta
         if 0 <= new < len(lst):
             lst[idx], lst[new] = lst[new], lst[idx]
+            save_config(self.cfg)          # persist the new order immediately
             self.refresh_list(role, key)
             lb.selection_set(new)
 
@@ -2185,6 +2207,7 @@ class App(tk.Tk):
         if not sel:
             return
         self.cfg["roleChampions"][role][key].pop(sel[0])
+        save_config(self.cfg)              # persist the removal immediately
         self.refresh_list(role, key)
 
     # ── op.gg Auto-fill ───────────────────────────────────────────────────────
