@@ -29,7 +29,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-RELAY_VERSION = "1.6.4"
+RELAY_VERSION = "1.6.5"
 GITHUB_REPO   = "Naieter/LoL-Client-Automation"
 
 DEFAULT_PORT = 8777
@@ -39,6 +39,25 @@ FRESH = 20
 
 _lock = threading.Lock()
 _data: dict = {}   # party -> { member -> {"r": ready_bool, "t": timestamp} }
+
+
+def _disable_quick_edit():
+    """Turn off the Windows console 'QuickEdit' mode so a stray click/selection
+    in the relay window can't freeze the process (which would hang request
+    handling on its next print)."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint()
+        if k.GetConsoleMode(h, ctypes.byref(mode)):
+            ENABLE_QUICK_EDIT, ENABLE_EXTENDED_FLAGS = 0x0040, 0x0080
+            k.SetConsoleMode(
+                h, (mode.value & ~ENABLE_QUICK_EDIT) | ENABLE_EXTENDED_FLAGS)
+    except Exception:
+        pass
 
 
 def _ts():
@@ -240,6 +259,7 @@ def _update_loop():
 
 
 def main():
+    _disable_quick_edit()   # don't let a console click freeze request handling
     port = DEFAULT_PORT
     if len(sys.argv) > 1:
         try:
