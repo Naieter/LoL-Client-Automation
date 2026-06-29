@@ -41,7 +41,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.7.3"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1348,9 +1348,11 @@ class OpGGDialog(tk.Toplevel):
 
     def _run(self, game_name: str, tag_line: str, region: str,
              do_picks: bool, do_bans: bool):
-        rows = self._app._opgg_fetch(game_name, tag_line, region, self._set_status)
-        if rows is not None:
-            self.after(0, lambda: self._app._opgg_apply(rows, do_picks, do_bans, self))
+        result = self._app._opgg_fetch(game_name, tag_line, region, self._set_status)
+        if result is not None:
+            rows, champ_role, mastery_by_id = result
+            self.after(0, lambda: self._app._opgg_apply(
+                rows, champ_role, mastery_by_id, do_picks, do_bans, self))
         else:
             self.after(0, lambda: self._btn_fetch.config(state="normal"))
 
@@ -2710,9 +2712,24 @@ class App(tk.Tk):
             status_fn("No champion-role matches found.", RED)
             return None
 
+        # Fetch mastery 4+ champions for the role-fill fallback
+        mastery_by_id: dict = {}   # champ_id -> champion_points
+        try:
+            mr = self._lcu.get(
+                "/lol-champion-mastery/v1/local-player/champion-mastery"
+            )
+            if mr.status_code == 200:
+                for m in mr.json():
+                    if m.get("championLevel", 0) >= 4:
+                        mastery_by_id[int(m["championId"])] = int(
+                            m.get("championPoints", 0)
+                        )
+        except Exception:
+            pass
+
         total = sum(g for _, _, g, _ in rows)
         status_fn(f"Found {len(rows)} champions from {total} season games (recent games weighted 2×).")
-        return rows
+        return rows, champ_role, mastery_by_id
 
     @staticmethod
     def _opgg_role(pos: str) -> str:
@@ -2724,8 +2741,8 @@ class App(tk.Tk):
         if p in ("sup", "supp", "support", "utility"):        return "utility"
         return ""
 
-    def _opgg_apply(self, rows: list, do_picks: bool, do_bans: bool,
-                    dialog: "OpGGDialog"):
+    def _opgg_apply(self, rows: list, champ_role: dict, mastery_by_id: dict,
+                    do_picks: bool, do_bans: bool, dialog: "OpGGDialog"):
         by_role: dict = defaultdict(list)
         for role, name, games, wins in rows:
             bwr   = (wins + 1) / (games + 2)
@@ -2734,17 +2751,44 @@ class App(tk.Tk):
         for role in by_role:
             by_role[role].sort(reverse=True)
 
+        # Build champ_id → primary role for champions with ≥30 % role rate.
+        # Used to decide whether a mastery champion "belongs" in a given role.
+        common_role_by_id: dict = {}
+        for opgg_name, (meta_role, rate) in champ_role.items():
+            if rate >= 0.3:
+                cid = self.ddragon.find_id(opgg_name)
+                if cid is not None:
+                    common_role_by_id[cid] = meta_role
+
         changed: list = []
         for role in ROLES:
             rc = self.cfg["roleChampions"].setdefault(
                 role, {"picks": [], "bans": []}
             )
-            if do_picks and role in by_role:
+            if do_picks:
                 ids = []
-                for _, name in by_role[role][:5]:
+                for _, name in by_role.get(role, [])[:5]:
                     cid = self.ddragon.find_id(name)
                     if cid is not None:
                         ids.append(cid)
+
+                # Supplement with mastery 4+ champs commonly played in this role
+                if len(ids) < 3 and mastery_by_id:
+                    added_names: list = []
+                    for cid in sorted(mastery_by_id, key=mastery_by_id.__getitem__,
+                                      reverse=True):
+                        if len(ids) >= 5:
+                            break
+                        if cid in ids or common_role_by_id.get(cid) != role:
+                            continue
+                        ids.append(cid)
+                        added_names.append(self.ddragon.name(cid) or str(cid))
+                    if added_names:
+                        self.log(
+                            f"op.gg auto-fill: added mastery picks for "
+                            f"{ROLE_LABEL[role]} — {', '.join(added_names)}."
+                        )
+
                 if ids:
                     rc["picks"] = ids
                     changed.append(role)
