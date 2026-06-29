@@ -41,7 +41,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.7.4"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -2243,13 +2243,8 @@ class App(tk.Tk):
         os._exit(0)
 
     def _on_phase_change(self, phase):
-        """Engine callback: grey the Ready Up button during champion select, and
-        bring the tool to the front when a game ends."""
+        """Engine callback: grey the Ready Up button during champion select."""
         def _do():
-            # When the match ends, restore the window to its normal size and
-            # bring it to the front.
-            if phase == "PreEndOfGame":
-                self._restore_window()
             if not hasattr(self, "_btn_ready"):
                 return
             if phase == "ChampSelect":
@@ -2261,23 +2256,6 @@ class App(tk.Tk):
             if hasattr(self, "_overlay"):
                 self._overlay.set_phase(phase)
         self.after(0, _do)
-
-    def _restore_window(self):
-        """Restore the window from tray/minimised to its usual size and bring it
-        to the front (without maximising)."""
-        try:
-            self.deiconify()
-            if self.state() == "zoomed":
-                self.state("normal")   # ensure usual size, not maximised
-        except Exception:
-            pass
-        try:
-            self.lift()
-            self.attributes("-topmost", True)
-            self.after(400, lambda: self.attributes("-topmost", False))
-            self.focus_force()
-        except Exception:
-            pass
 
     def _toggle_party_ready(self):
         """Toggle your ready state and broadcast it to the relay so every party
