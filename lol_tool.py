@@ -41,7 +41,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1419,9 +1419,7 @@ class LCUOverlay:
     Shows FIND MATCH in lobby and ACCEPT during a ready check.
     Drag to reposition."""
 
-    _LCU_CLASS  = "RCLIENT"  # LeagueClientUx window class
-    _GRAPH_W    = 220        # fixed overlay width in ping-graph mode
-    _GRAPH_H    = 70         # fixed overlay height in ping-graph mode
+    _LCU_CLASS = "RCLIENT"   # LeagueClientUx window class
 
     def __init__(self, app: "App"):
         self._app         = app
@@ -1445,9 +1443,7 @@ class LCUOverlay:
             command=self._click,
         )
 
-        canvas = tk.Canvas(win, bg="#0a1428", highlightthickness=0,
-                           cursor="fleur",
-                           width=self._GRAPH_W - 2, height=self._GRAPH_H - 2)
+        canvas = tk.Canvas(win, bg="#0a1428", highlightthickness=0, cursor="fleur")
 
         for w in (win, btn, canvas):
             w.bind("<ButtonPress-1>",   self._drag_start)
@@ -1563,8 +1559,19 @@ class LCUOverlay:
             self._btn.config(text=label, bg=bg, fg=fg,
                              activebackground=abg, activeforeground=fg)
         else:
+            # Set button text before switching so _set_graph_mode can measure
+            # the button and give the canvas the identical pixel size.
+            eng    = self._app._engine
+            ping   = getattr(self._app, "_ping_val", None)
+            ping_s = f"  {ping}ms" if ping is not None else ""
+            rc     = getattr(eng, "_ready_count",  0)
+            pc     = getattr(eng, "_present_count", 0)
+            label  = (f" Ready Up [{rc}/{pc}]{ping_s} "
+                      if (relay_on and use_graph and pc > 0)
+                      else f" FIND MATCH{ping_s} ")
+            self._btn.config(text=label, bg="#8b1a1a", fg="white",
+                             activebackground="#6e1414", activeforeground="white")
             self._set_graph_mode(True)
-            # Hint cursor: hand when clickable (relay live + graph-mode on)
             cur = "hand2" if (relay_on and use_graph) else "fleur"
             self._canvas.config(cursor=cur)
 
@@ -1577,18 +1584,19 @@ class LCUOverlay:
 
         self._hwnd_cache = hwnd
 
+        # Always size from the button — canvas overlays it via place so they
+        # share the exact same pixel footprint.
+        self._win.update_idletasks()
+        ow = max(self._win.winfo_reqwidth(),  160)
+        oh = max(self._win.winfo_reqheight(),  44)
+
         if self._graph_mode:
-            ow = self._GRAPH_W
-            oh = self._GRAPH_H
-            i_rdy            = getattr(self._app._engine, "_i_am_ready", False)
+            i_rdy             = getattr(self._app._engine, "_i_am_ready", False)
             relay_interactive = relay_on and use_graph
             relay_ready       = relay_interactive and i_rdy
-            self._draw_ping_graph(relay_interactive=relay_interactive,
+            self._draw_ping_graph(ow, oh,
+                                  relay_interactive=relay_interactive,
                                   relay_ready=relay_ready)
-        else:
-            self._win.update_idletasks()
-            ow = max(self._win.winfo_reqwidth(),  160)
-            oh = max(self._win.winfo_reqheight(),  44)
 
         # Default position: measured from a live session at 1280x720 client.
         # rel_x scales with client width; rel_y pins to 75 px above client bottom.
@@ -1652,21 +1660,26 @@ class LCUOverlay:
             return
         self._graph_mode = on
         if on:
+            # Measure the button's size before hiding it so the canvas can
+            # be given the exact same width/height.
+            self._win.update_idletasks()
+            bw = max(self._btn.winfo_reqwidth(),  140)
+            bh = max(self._btn.winfo_reqheight(),  34)
             self._btn.pack_forget()
+            self._canvas.config(width=bw, height=bh)
             self._canvas.pack(fill="both", expand=True, padx=1, pady=1)
         else:
             self._canvas.pack_forget()
             self._btn.pack(fill="both", expand=True, padx=1, pady=1)
 
-    def _draw_ping_graph(self, relay_interactive: bool = False, relay_ready: bool = False):
+    def _draw_ping_graph(self, w: int, h: int,
+                         relay_interactive: bool = False, relay_ready: bool = False):
         c = self._canvas
-        w = self._GRAPH_W - 2
-        h = self._GRAPH_H - 2
         c.delete("all")
 
-        # Background tint: light green when ready, light red when not ready
+        # Background tint: subtle teal when ready, warm-brown when not ready
         if relay_interactive:
-            bg_col = "#0c2a10" if relay_ready else "#2a0c0c"
+            bg_col = "#0a1a18" if relay_ready else "#1a0e0a"
             c.create_rectangle(0, 0, w, h, fill=bg_col, outline="")
 
         now      = time.monotonic()
@@ -1687,33 +1700,33 @@ class LCUOverlay:
 
         if not hist_vis:
             c.create_text(w // 2, h // 2 + 2, text="Ping: —",
-                          fill="#2a4060", font=("Arial", 9, "bold"))
+                          fill="#3a3010", font=("Arial", 9, "bold"))
             return
 
         vals   = [v for _, v in hist_vis]
         last_v = vals[-1]
 
-        # Color scheme: green when ready-up is active, otherwise ping-tier colours
+        # Color scheme: League teal always; ping tier shifts glow/fill when no relay
         if relay_ready:
-            col_bright = "#22e86a"
-            col_glow   = "#0b5225"
-            col_fill   = "#091509"
-            col_thresh = "#0d3d1c"
+            col_bright = "#0ae8d5"
+            col_glow   = "#056f68"
+            col_fill   = "#051c1a"
+            col_thresh = "#c8aa6e"
         elif last_v < 60:
-            col_bright = "#22e86a"
-            col_glow   = "#0b5225"
-            col_fill   = "#091509"
-            col_thresh = "#0d3d1c"
+            col_bright = "#0ae8d5"
+            col_glow   = "#056f68"
+            col_fill   = "#051c1a"
+            col_thresh = "#c8aa6e"
         elif last_v < 120:
             col_bright = "#e8c032"
             col_glow   = "#6b500f"
             col_fill   = "#1a1306"
-            col_thresh = "#4a380a"
+            col_thresh = "#c8aa6e"
         else:
             col_bright = "#e83030"
             col_glow   = "#6b1212"
             col_fill   = "#1a0606"
-            col_thresh = "#4a1010"
+            col_thresh = "#c8aa6e"
 
         # Y auto-scale from all buffered data so the axis doesn't jump as new
         # points scroll into the visible window.
@@ -1747,12 +1760,14 @@ class LCUOverlay:
                 c.create_line(pad_x, y, w - pad_x, y,
                               fill=col_thresh, width=1, dash=(3, 4))
 
-        # Filled area — anchors extend off-canvas so the fill is seamless at edges
-        if len(pts_all) >= 2:
+        # Filled area — only when there's no tint background; the tint itself
+        # provides the background depth, and the fill (nearly-black) would
+        # cover it and create a dark gap under the graph line.
+        if not relay_interactive and len(pts_all) >= 2:
             poly = [(pts_all[0][0], bot)] + pts_all + [(pts_all[-1][0], bot)]
             c.create_polygon(
                 [c_ for xy in poly for c_ in xy],
-                fill=col_fill, outline="", smooth=True,
+                fill=col_fill, outline="", smooth=False,
             )
 
         # Glow then bright line — off-screen anchors make edges curve in smoothly
@@ -1766,17 +1781,17 @@ class LCUOverlay:
         # 1-second tick marks along the bottom axis
         for s in range(0, 11):
             tx = pad_x + int(s / span * (w - 2 * pad_x))
-            c.create_line(tx, bot + 1, tx, bot + 4, fill="#1a2d40", width=1)
+            c.create_line(tx, bot + 1, tx, bot + 4, fill="#3a3010", width=1)
 
         # X-axis edge labels
         c.create_text(pad_x, h - 1, text="0s",
-                      fill="#1e3555", font=("Arial", 6), anchor="sw")
+                      fill="#5a4a20", font=("Arial", 6), anchor="sw")
         c.create_text(w - pad_x, h - 1, text="10s",
-                      fill="#1e3555", font=("Arial", 6), anchor="se")
+                      fill="#5a4a20", font=("Arial", 6), anchor="se")
 
         # Current ping value (top-right)
         c.create_text(w - pad_x, 2, text=f"{last_v} ms",
-                      fill=col_bright, font=("Arial", 8, "bold"), anchor="ne")
+                      fill="#c8aa6e", font=("Arial", 8, "bold"), anchor="ne")
 
 
 class App(tk.Tk):
