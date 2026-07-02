@@ -53,7 +53,7 @@ def _dbg(*args):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.8.14"
+APP_VERSION = "1.9.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -486,6 +486,22 @@ class AutoEngine:
 
         r   = self._lcu.get("/lol-gameflow/v1/session")
         if r.status_code != 200:
+            # No active session — use idle_phase so the overlay updates correctly.
+            # Without this, phase stays stale as "Lobby" forever after leaving.
+            idle = idle_phase if idle_phase else "None"
+            if idle != self._last_phase:
+                self._log(f"Phase → {idle}")
+                prev_phase       = self._last_phase
+                self._last_phase = idle
+                self._accept_time = None
+                self._accepted    = False
+                if self._on_phase:
+                    self._on_phase(idle)
+                if prev_phase in ("Lobby", "Matchmaking") and idle not in ("Lobby", "Matchmaking", "ReadyCheck"):
+                    self._party_size       = 0
+                    self._present_count    = 0
+                    self._ready_count      = 0
+                    self._size_none_streak = 0
             return
 
         phase = r.json().get("phase", "")
@@ -524,6 +540,11 @@ class AutoEngine:
                 self._i_am_ready  = False
                 self._ready_count = 0
                 self._log("Match declined/missed — ready state cleared.")
+            # Leaving lobby/matchmaking: immediately clear stale party_size so
+            # the overlay doesn't linger while no lobby is active.
+            if prev_phase in ("Lobby", "Matchmaking") and phase not in ("Lobby", "Matchmaking", "ReadyCheck"):
+                self._party_size       = 0
+                self._size_none_streak = 0
 
         # Auto accept — after the configured delay (default 0 = immediate)
         if cfg.get("autoAccept") and phase == "ReadyCheck" and not self._accepted:
@@ -1045,40 +1066,36 @@ class AutoEngine:
         return None, set()
 
     def _handle_party_ready(self):
-        if not self._cfg().get("readyUpEnabled", True):
-            self._party_size    = 0
-            self._ready_count   = 0
-            self._present_count = 0
-            return
+        cfg = self._cfg()
         try:
-            url = (self._cfg().get("relayUrl") or "").strip().rstrip("/")
-            if not url:
-                self._party_size    = 0
-                self._ready_count   = 0
-                self._present_count = 0
-                return
-
-            now = time.monotonic()
+            now       = time.monotonic()
             size_due  = now - getattr(self, "_last_size_poll",  0) >= 1.0
             relay_due = now - getattr(self, "_last_relay_poll", 0) >= 2.0
 
-            if not size_due and not relay_due:
+            ready_up = cfg.get("readyUpEnabled", True)
+            url      = (cfg.get("relayUrl") or "").strip().rstrip("/")
+            # Relay poll only makes sense when the feature is on and a URL exists.
+            do_relay = relay_due and ready_up and bool(url)
+
+            if not size_due and not do_relay:
                 return
 
-            # One _lobby_identity() call serves both the size update (1s) and
-            # the full relay poll (2s) so we never make two LCU calls at once.
+            # One _lobby_identity() call shared by both polls.
             ident = self._lobby_identity()
+
             if size_due:
                 self._last_size_poll = now
                 if ident:
-                    # Always trust positive LCU data immediately (any member count).
-                    # party_size=1 now shows a ping button, so a transient drop to 1
-                    # no longer causes a wrong withdrawal — no hysteresis needed.
-                    self._party_size = len(ident[2])
-                _dbg(f"size_poll: party_size={self._party_size}" +
-                     (f" members={len(ident[2])}" if ident else " (transient None, unchanged)"))
+                    self._party_size       = len(ident[2])
+                    self._size_none_streak = 0
+                else:
+                    self._size_none_streak = getattr(self, "_size_none_streak", 0) + 1
+                    if self._size_none_streak >= 3:
+                        self._party_size = 0
+                _dbg(f"size_poll: party_size={self._party_size} none_streak={getattr(self,'_size_none_streak',0)}" +
+                     (f" members={len(ident[2])}" if ident else " (None)"))
 
-            if not relay_due:
+            if not do_relay:
                 return
             self._last_relay_poll = now
 
@@ -1721,8 +1738,15 @@ class LCUOverlay:
             self._win.withdraw()
             _dbg("refresh: withdraw (ReadyCheck)")
             return
-        elif not relay_on or not ready_up:
-            # Relay off or feature disabled — show small ping regardless of party size.
+
+        # Hide when not in a lobby — applies regardless of relay status.
+        if party_size == 0:
+            self._win.withdraw()
+            _dbg("refresh: withdraw (party_size=0, not in lobby)")
+            return
+
+        if not relay_on or not ready_up:
+            # In a lobby but relay off or feature disabled — small ping only.
             self._set_btn(f"{ping}ms" if ping is not None else "---ms",
                           "find", small=True)
             _dbg("refresh: show small ping (relay off or ready_up off)")
@@ -1731,18 +1755,13 @@ class LCUOverlay:
             pc    = getattr(eng, "_present_count", 0)
             i_rdy = getattr(eng, "_i_am_ready",   False)
             _dbg(f"refresh: party_size={party_size} pc={pc} rc={rc}")
-            if party_size == 0:
-                # Not in a lobby yet / relay hasn't confirmed lobby state.
-                self._win.withdraw()
-                _dbg("refresh: withdraw (party_size=0)")
-                return
             if party_size >= 2 and pc > 1:
-                # Multi-person party and at least one other user has the tool.
+                # Multi-person party with at least one other tool user.
                 self._set_btn(f"READY UP  [{rc}/{pc}]{ping_s}",
                               "ready" if i_rdy else "notready")
                 _dbg(f"refresh: show READY UP [{rc}/{pc}]")
             else:
-                # Solo in lobby (party_size=1) OR in party but no other tool users.
+                # Solo in lobby OR in party but no other tool users.
                 self._set_btn(f"{ping}ms" if ping is not None else "---ms",
                               "find", small=True)
                 _dbg(f"refresh: show small ping (party_size={party_size} pc={pc})")
