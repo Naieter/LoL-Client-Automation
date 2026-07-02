@@ -53,7 +53,7 @@ def _dbg(*args):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.9.3"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1996,10 +1996,8 @@ class LCUOverlay:
 
     def _draw_lol_btn(self):
         c = self._btn
-        w = c.winfo_width()
-        h = c.winfo_height()
-        if w <= 1:
-            w, h = int(c["width"]), int(c["height"])
+        w = int(c["width"])
+        h = int(c["height"])
 
         theme = (self._BTN_HOVER if self._btn_hover else self._BTN_THEMES).get(
             self._btn_style, self._BTN_THEMES["find"])
