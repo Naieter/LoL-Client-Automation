@@ -16,6 +16,7 @@ from pathlib import Path
 from collections import defaultdict
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, scrolledtext, messagebox
 
 
@@ -38,10 +39,21 @@ _ensure_deps()
 import requests, psutil, urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ── Debug log ─────────────────────────────────────────────────────────────────
+_DEBUG_LOG = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL" / "debug.log"
+
+def _dbg(*args):
+    try:
+        _DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] " + " ".join(str(a) for a in args) + "\n")
+    except Exception:
+        pass
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.8.3"
+APP_VERSION = "1.8.8"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -104,7 +116,9 @@ DEFAULT_CONFIG = {
     "prePickDelay": 500,
     "acceptDelay":  0,       # wait before auto-accepting a found match (ms)
     "readyUpEnabled":  True,  # enable/disable the party ready-up feature
-    "overlayPingGraph": False, # show ping graph instead of ready-up button in overlay
+    "overlayRelX": None,       # saved overlay X offset from LCU left edge (None = auto)
+    "overlayRelY": None,       # saved overlay Y offset from LCU top edge  (None = auto)
+    "overlayPosVersion": "",   # version when position was saved; mismatch clears it
     "relayUrl":     "",      # ready-up relay server, e.g. http://192.168.1.50:8777
     "localApiPort": 0,      # Stream Deck REST API port (0 = disabled by default)
     "autoAcceptInvites": False, # auto-accept lobby invites from friends
@@ -128,6 +142,12 @@ def load_config() -> dict:
                 cfg.setdefault("roleChampions", {})
                 if role not in cfg["roleChampions"]:
                     cfg["roleChampions"][role] = {"picks": [], "bans": []}
+            # Clear saved overlay position on version change so the auto-
+            # placement formula re-runs after an update.
+            if cfg.get("overlayPosVersion") != APP_VERSION:
+                cfg["overlayRelX"] = None
+                cfg["overlayRelY"] = None
+                cfg["overlayPosVersion"] = APP_VERSION
             return cfg
         except Exception:
             pass
@@ -426,6 +446,8 @@ class AutoEngine:
         self._last_relay_poll   = 0.0    # throttle relay polling
         self._ready_count       = 0      # exposed to overlay
         self._present_count     = 0      # exposed to overlay
+        self._party_size        = 0      # total members in lobby (1 = solo, >1 = in party)
+        self._party_size_dec    = 0      # consecutive shrink-polls (hysteresis counter)
         self._champ_select_start = 0.0   # monotonic when champ select began
         self._i_am_ready        = False  # my own ready state (for relay heartbeat)
         self._accept_time       = None   # monotonic when ReadyCheck began
@@ -1016,19 +1038,46 @@ class AutoEngine:
 
     def _handle_party_ready(self):
         if not self._cfg().get("readyUpEnabled", True):
+            self._party_size    = 0
+            self._ready_count   = 0
+            self._present_count = 0
             return
         try:
             url = (self._cfg().get("relayUrl") or "").strip().rstrip("/")
             if not url:
+                self._party_size    = 0
+                self._ready_count   = 0
+                self._present_count = 0
                 return
-            # Throttle relay traffic to ~every 2s (the main loop runs at 0.5s).
+
             now = time.monotonic()
-            if now - getattr(self, "_last_relay_poll", 0) < 2.0:
+            size_due  = now - getattr(self, "_last_size_poll",  0) >= 1.0
+            relay_due = now - getattr(self, "_last_relay_poll", 0) >= 2.0
+
+            if not size_due and not relay_due:
+                return
+
+            # One _lobby_identity() call serves both the size update (1s) and
+            # the full relay poll (2s) so we never make two LCU calls at once.
+            ident = self._lobby_identity()
+            if size_due:
+                self._last_size_poll = now
+                if ident:
+                    # Always trust positive LCU data immediately (any member count).
+                    # party_size=1 now shows a ping button, so a transient drop to 1
+                    # no longer causes a wrong withdrawal — no hysteresis needed.
+                    self._party_size = len(ident[2])
+                _dbg(f"size_poll: party_size={self._party_size}" +
+                     (f" members={len(ident[2])}" if ident else " (transient None, unchanged)"))
+
+            if not relay_due:
                 return
             self._last_relay_poll = now
 
-            ident = self._lobby_identity()
             if not ident:
+                self._ready_count   = 0
+                self._present_count = 0
+                _dbg("relay_poll: no ident → pc=0 rc=0")
                 return
             group, my_key, members, is_leader, party, can_start = ident
 
@@ -1043,6 +1092,8 @@ class AutoEngine:
                 present_set = member_keys
             present_count = len(present_set & member_keys)
             ready_count   = len(ready_set & member_keys)
+            _dbg(f"relay_poll: members={len(members)} present_set={len(present_set)} "
+                 f"member_keys={len(member_keys)} pc={present_count} rc={ready_count}")
 
             self._ready_count   = ready_count
             self._present_count = present_count
@@ -1516,26 +1567,26 @@ class LCUOverlay:
         win.withdraw()
         win.overrideredirect(True)
         win.wm_attributes("-topmost", True)
-        win.wm_attributes("-alpha", 0.93)
-        win.configure(bg="#0a1428")
+        win.wm_attributes("-transparentcolor", "#010A13")
+        win.configure(bg="#010A13")
 
-        btn = tk.Button(
-            win, text="", font=("Arial", 11, "bold"),
-            relief="flat", cursor="hand2", bd=0, padx=16, pady=9,
-            command=self._click,
-        )
+        btn = tk.Canvas(win, bg="#010A13", highlightthickness=0,
+                        cursor="hand2", width=220, height=53)
+        btn.pack(fill="both", expand=True, padx=1, pady=1)
 
-        canvas = tk.Canvas(win, bg="#0a1428", highlightthickness=0, cursor="fleur")
+        for w in (win, btn):
+            w.bind("<ButtonPress-1>",  self._drag_start)
+            w.bind("<B1-Motion>",      self._drag_move)
+        btn.bind("<ButtonRelease-1>", lambda e: (not self._dragged) and self._click())
+        btn.bind("<Enter>", lambda e: self._btn_set_hover(True))
+        btn.bind("<Leave>", lambda e: self._btn_set_hover(False))
 
-        for w in (win, btn, canvas):
-            w.bind("<ButtonPress-1>",   self._drag_start)
-            w.bind("<B1-Motion>",       self._drag_move)
-        canvas.bind("<ButtonRelease-1>", lambda e: self._click())
-
-        self._win        = win
-        self._btn        = btn
-        self._canvas     = canvas
-        self._graph_mode: object = None   # None forces first _set_graph_mode call
+        self._win       = win
+        self._btn       = btn
+        self._btn_label = ""
+        self._btn_style = "find"
+        self._btn_hover = False
+        self._btn_small = False
         self._tick()
 
     # ── League client window ──────────────────────────────────────────────────
@@ -1588,21 +1639,20 @@ class LCUOverlay:
     def _tick(self):
         self._refresh()
         # Faster tick in graph mode for smooth scrolling; slower otherwise
-        delay = 100 if self._graph_mode else 600
+        delay = 600
         self._app.after(delay, self._tick)
 
     def _refresh(self):
         phase = self._phase
+        _dbg(f"refresh: phase={phase!r}")
         if phase not in ("Lobby", "Matchmaking", "ReadyCheck"):
             self._win.withdraw()
+            _dbg("refresh: withdraw (bad phase)")
             return
-        if not self._app.cfg.get("readyUpEnabled", True):
-            self._win.withdraw()
-            return
-
         hwnd = self._find_lcu()
         if not hwnd or ctypes.windll.user32.IsIconic(hwnd):
             self._win.withdraw()
+            _dbg("refresh: withdraw (no hwnd or iconic)")
             return
 
         # Hide when the user is in a different app — only show while the
@@ -1615,47 +1665,45 @@ class LCUOverlay:
         overlay_hwnd = self._win.winfo_id()
         if fg_pid.value != lc_pid.value and fg != overlay_hwnd:
             self._win.withdraw()
+            _dbg(f"refresh: withdraw (fg mismatch fg_pid={fg_pid.value} lc_pid={lc_pid.value})")
             return
 
-        relay_on  = bool(getattr(self._app, "_relay_connected", False))
-        use_graph = bool(self._app.cfg.get("overlayPingGraph", False))
+        relay_on   = bool(getattr(self._app, "_relay_connected", False))
+        ready_up   = bool(self._app.cfg.get("readyUpEnabled", True))
+        ping       = getattr(self._app, "_ping_val", None)
+        ping_s     = f"  {ping}ms" if ping is not None else "  ---ms"
+        eng        = self._app._engine
+        party_size = getattr(eng, "_party_size", 0)
+        _dbg(f"refresh: relay_on={relay_on} ready_up={ready_up} ping={ping} party_size={party_size}")
 
         if phase == "ReadyCheck":
-            self._set_graph_mode(False)
-            self._btn.config(text="  ACCEPT  ",
-                             bg="#1a9e3a", fg="white",
-                             activebackground="#15832f", activeforeground="white")
-        elif relay_on and not use_graph:
-            self._set_graph_mode(False)
-            eng   = self._app._engine
-            rc    = getattr(eng, "_ready_count",   0)
-            pc    = getattr(eng, "_present_count",  0)
-            i_rdy = getattr(eng, "_i_am_ready",    False)
-            ping  = getattr(self._app, "_ping_val", None)
-            ping_s = f"  {ping}ms" if ping is not None else ""
-            label  = f" Ready Up [{rc}/{pc}]{ping_s} " if pc > 0 else f" FIND MATCH{ping_s} "
-            if i_rdy:
-                bg, abg, fg = "#1a9e3a", "#15832f", "white"
-            else:
-                bg, abg, fg = "#8b1a1a", "#6e1414", "white"
-            self._btn.config(text=label, bg=bg, fg=fg,
-                             activebackground=abg, activeforeground=fg)
+            self._set_btn("ACCEPT", "accept")
+            _dbg("refresh: show ACCEPT")
+        elif not relay_on or not ready_up:
+            # Relay off or feature disabled — show small ping regardless of party size.
+            self._set_btn(f"{ping}ms" if ping is not None else "---ms",
+                          "find", small=True)
+            _dbg("refresh: show small ping (relay off or ready_up off)")
         else:
-            # Set button text before switching so _set_graph_mode can measure
-            # the button and give the canvas the identical pixel size.
-            eng    = self._app._engine
-            ping   = getattr(self._app, "_ping_val", None)
-            ping_s = f"  {ping}ms" if ping is not None else ""
-            rc     = getattr(eng, "_ready_count",  0)
-            pc     = getattr(eng, "_present_count", 0)
-            label  = (f" Ready Up [{rc}/{pc}]{ping_s} "
-                      if (relay_on and use_graph and pc > 0)
-                      else f" FIND MATCH{ping_s} ")
-            self._btn.config(text=label, bg="#8b1a1a", fg="white",
-                             activebackground="#6e1414", activeforeground="white")
-            self._set_graph_mode(True)
-            cur = "hand2" if (relay_on and use_graph) else "fleur"
-            self._canvas.config(cursor=cur)
+            rc    = getattr(eng, "_ready_count",  0)
+            pc    = getattr(eng, "_present_count", 0)
+            i_rdy = getattr(eng, "_i_am_ready",   False)
+            _dbg(f"refresh: party_size={party_size} pc={pc} rc={rc}")
+            if party_size == 0:
+                # Not in a lobby yet / relay hasn't confirmed lobby state.
+                self._win.withdraw()
+                _dbg("refresh: withdraw (party_size=0)")
+                return
+            if party_size >= 2 and pc > 1:
+                # Multi-person party and at least one other user has the tool.
+                self._set_btn(f"READY UP  [{rc}/{pc}]{ping_s}",
+                              "ready" if i_rdy else "notready")
+                _dbg(f"refresh: show READY UP [{rc}/{pc}]")
+            else:
+                # Solo in lobby (party_size=1) OR in party but no other tool users.
+                self._set_btn(f"{ping}ms" if ping is not None else "---ms",
+                              "find", small=True)
+                _dbg(f"refresh: show small ping (party_size={party_size} pc={pc})")
 
         rect  = self._lcu_rect(hwnd)
         scale = self._dpi_scale()
@@ -1669,24 +1717,30 @@ class LCUOverlay:
         # Always size from the button — canvas overlays it via place so they
         # share the exact same pixel footprint.
         self._win.update_idletasks()
-        ow = max(self._win.winfo_reqwidth(),  160)
-        oh = max(self._win.winfo_reqheight(),  44)
+        if self._btn_small:
+            ow = max(self._win.winfo_reqwidth(),  68)
+            oh = max(self._win.winfo_reqheight(),  32)
+        else:
+            ow = max(self._win.winfo_reqwidth(),  192)
+            oh = max(self._win.winfo_reqheight(),  53)
 
-        if self._graph_mode:
-            i_rdy             = getattr(self._app._engine, "_i_am_ready", False)
-            relay_interactive = relay_on and use_graph
-            relay_ready       = relay_interactive and i_rdy
-            self._draw_ping_graph(ow, oh,
-                                  relay_interactive=relay_interactive,
-                                  relay_ready=relay_ready)
-
-        # Default position: measured from a live session at 1280x720 client.
-        # rel_x scales with client width; rel_y pins to 75 px above client bottom.
-        if self._rel_x is None:
-            self._rel_x = int(lw * 0.337)
-            self._rel_y = lh - oh - 75
-
-        self._win.geometry(f"{ow}x{oh}+{lx + self._rel_x}+{ly + self._rel_y}")
+        if self._btn_small:
+            # Small ping button: always formula-placed, not saved.
+            # Centre X matches the big button; Y sits just above "Autofill Protected".
+            sx = int(lw * 0.829) // 2 - ow // 2
+            sy = int(lh * 0.865) - oh - 4
+            self._win.geometry(f"{ow}x{oh}+{lx + sx}+{ly + sy}")
+        else:
+            if self._rel_x is None:
+                saved_x = self._app.cfg.get("overlayRelX")
+                saved_y = self._app.cfg.get("overlayRelY")
+                if saved_x is not None and saved_y is not None:
+                    self._rel_x = int(saved_x)
+                    self._rel_y = int(saved_y)
+                else:
+                    self._rel_x = int(lw * 0.829 - ow) // 2
+                    self._rel_y = int(lh * 0.873) - oh // 2
+            self._win.geometry(f"{ow}x{oh}+{lx + self._rel_x}+{ly + self._rel_y}")
         self._win.deiconify()
 
     # ── LCU actions ───────────────────────────────────────────────────────────
@@ -1694,13 +1748,8 @@ class LCUOverlay:
         if self._dragged:
             self._dragged = False
             return
-        # Canvas in graph mode only acts as ready-up when relay is live
-        # and the "ping graph overlay" setting is on.
-        if self._graph_mode:
-            relay_on  = bool(getattr(self._app, "_relay_connected", False))
-            use_graph = bool(self._app.cfg.get("overlayPingGraph", False))
-            if not (relay_on and use_graph):
-                return
+        if self._btn_small:
+            return
         lcu:  "LCU" = self._app._lcu
         phase = self._phase
         hwnd  = self._find_lcu()
@@ -1728,152 +1777,87 @@ class LCUOverlay:
         nx = event.x_root - self._drag_x
         ny = event.y_root - self._drag_y
         self._win.geometry(f"+{nx}+{ny}")
-        # Update the relative offset so the next tick keeps it in place
         hwnd = self._hwnd_cache
         if hwnd:
             rect  = self._lcu_rect(hwnd)
             scale = self._dpi_scale()
             self._rel_x = nx - int(rect.left / scale)
             self._rel_y = ny - int(rect.top  / scale)
+            # Persist so position survives restarts.
+            self._app.cfg["overlayRelX"] = self._rel_x
+            self._app.cfg["overlayRelY"] = self._rel_y
+            save_config(self._app.cfg)
 
-    # ── graph mode ────────────────────────────────────────────────────────────
-    def _set_graph_mode(self, on: bool):
-        if self._graph_mode == on:
-            return
-        self._graph_mode = on
-        if on:
-            # Measure the button's size before hiding it so the canvas can
-            # be given the exact same width/height.
-            self._win.update_idletasks()
-            bw = max(self._btn.winfo_reqwidth(),  140)
-            bh = max(self._btn.winfo_reqheight(),  34)
-            self._btn.pack_forget()
-            self._canvas.config(width=bw, height=bh)
-            self._canvas.pack(fill="both", expand=True, padx=1, pady=1)
+    # ── LoL-style canvas button ───────────────────────────────────────────────
+
+    _LOL_FONT = "Palatino Linotype"   # closest serif to Beaufort on Windows
+
+    # Button themes: (outer_dark, inner_highlight, fill, text)
+    _BTN_THEMES = {
+        "find":     ("#463714", "#C8AA6E", "#091428", "#C8AA6E"),
+        "accept":   ("#004A3A", "#0AC8B9", "#091E14", "#FFFFFF"),
+        "ready":    ("#145A28", "#1EBF5A", "#091A10", "#FFFFFF"),
+        "notready": ("#5A1A10", "#C83232", "#1A0808", "#E88080"),
+    }
+    _BTN_HOVER = {
+        "find":     ("#5A4A1A", "#F0E6D3", "#091428", "#F0E6D3"),
+        "accept":   ("#005A4A", "#4AE8D8", "#091E14", "#FFFFFF"),
+        "ready":    ("#1A7A34", "#4AE87A", "#091A10", "#FFFFFF"),
+        "notready": ("#7A2010", "#E85050", "#1A0808", "#FFFFFF"),
+    }
+
+    @staticmethod
+    def _lol_pts(x0, y0, x1, y1, cut):
+        return [x0+cut,y0, x1-cut,y0, x1,y0+cut, x1,y1-cut,
+                x1-cut,y1, x0+cut,y1, x0,y1-cut, x0,y0+cut]
+
+    def _set_btn(self, text: str, style: str, small: bool = False):
+        self._btn_label = text
+        self._btn_style = style
+        self._btn_small = small
+        # Normalise ping digits → "000ms" so width stays stable as ping fluctuates.
+        stable = _re.sub(r'(\d+|---)\s*ms', '000ms', text)
+        if small:
+            fnt   = tkfont.Font(family=self._LOL_FONT, size=10, weight="bold")
+            new_w = max(fnt.measure(stable) + 28, 68)
+            new_h = 32
         else:
-            self._canvas.pack_forget()
-            self._btn.pack(fill="both", expand=True, padx=1, pady=1)
+            fnt   = tkfont.Font(family=self._LOL_FONT, size=12, weight="bold")
+            if 'ms' not in stable:
+                stable += '  000ms'
+            new_w = max(fnt.measure(stable) + 56, 192)
+            new_h = 53
+        if int(self._btn["width"]) != new_w or int(self._btn["height"]) != new_h:
+            self._btn.config(width=new_w, height=new_h)
+        self._draw_lol_btn()
 
-    def _draw_ping_graph(self, w: int, h: int,
-                         relay_interactive: bool = False, relay_ready: bool = False):
-        c = self._canvas
+    def _btn_set_hover(self, val: bool):
+        self._btn_hover = val
+        self._draw_lol_btn()
+
+    def _draw_lol_btn(self):
+        c = self._btn
         c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w <= 1:
+            w, h = int(c["width"]), int(c["height"])
 
-        # Background tint: subtle teal when ready, warm-brown when not ready
-        if relay_interactive:
-            bg_col = "#0a1a18" if relay_ready else "#1a0e0a"
-            c.create_rectangle(0, 0, w, h, fill=bg_col, outline="")
+        theme = (self._BTN_HOVER if self._btn_hover else self._BTN_THEMES).get(
+            self._btn_style, self._BTN_THEMES["find"])
+        b_dark, b_hi, fill, fg = theme
+        cut      = 5 if self._btn_small else 9
+        font_sz  = 10 if self._btn_small else 12
 
-        now      = time.monotonic()
-        span     = 10.0
-        scroll_t = now - 2.0   # right edge lags 2 s so data is pre-buffered
-        ext      = 2.0         # off-screen anchor seconds on each side
+        c.create_polygon(self._lol_pts(0, 0, w, h, cut),
+                         fill=b_dark, outline="")
+        c.create_polygon(self._lol_pts(1, 1, w-1, h-1, cut-1),
+                         fill=b_hi, outline="")
+        c.create_polygon(self._lol_pts(2, 2, w-2, h-2, cut-2),
+                         fill=fill, outline="")
+        c.create_text(w // 2, h // 2 + 1, text=self._btn_label,
+                      fill=fg, font=(self._LOL_FONT, font_sz, "bold"), anchor="center")
 
-        ping_hist = getattr(self._app, "_ping_hist", [])
-
-        # Full set including off-screen anchors — these drive the spline so the
-        # curve enters/exits the canvas mid-arc rather than starting cold.
-        hist_all = [
-            (t, v) for t, v in ping_hist
-            if scroll_t - span - ext <= t <= scroll_t + ext and v is not None
-        ]
-        # Visible subset only — drives Y-scaling, color tier, and the dot.
-        hist_vis = [(t, v) for t, v in hist_all if t <= scroll_t]
-
-        if not hist_vis:
-            c.create_text(w // 2, h // 2 + 2, text="Ping: —",
-                          fill="#3a3010", font=("Arial", 9, "bold"))
-            return
-
-        vals   = [v for _, v in hist_vis]
-        last_v = vals[-1]
-
-        # Color scheme: League teal always; ping tier shifts glow/fill when no relay
-        if relay_ready:
-            col_bright = "#0ae8d5"
-            col_glow   = "#056f68"
-            col_fill   = "#051c1a"
-            col_thresh = "#c8aa6e"
-        elif last_v < 60:
-            col_bright = "#0ae8d5"
-            col_glow   = "#056f68"
-            col_fill   = "#051c1a"
-            col_thresh = "#c8aa6e"
-        elif last_v < 120:
-            col_bright = "#e8c032"
-            col_glow   = "#6b500f"
-            col_fill   = "#1a1306"
-            col_thresh = "#c8aa6e"
-        else:
-            col_bright = "#e83030"
-            col_glow   = "#6b1212"
-            col_fill   = "#1a0606"
-            col_thresh = "#c8aa6e"
-
-        # Y auto-scale from all buffered data so the axis doesn't jump as new
-        # points scroll into the visible window.
-        all_vals = [v for _, v in hist_all]
-        vmin, vmax = min(all_vals), max(all_vals)
-        margin = max(5, int((vmax - vmin) * 0.25)) if vmax > vmin else 10
-        lo = max(0, vmin - margin)
-        hi = vmax + margin
-
-        pad_x = 3
-        top   = 12
-        bot   = h - 9
-
-        def px(t):
-            return pad_x + int((t - (scroll_t - span)) / span * (w - 2 * pad_x))
-
-        def py(v):
-            return bot - int((v - lo) / (hi - lo) * (bot - top))
-
-        # Points for ALL data (including off-screen anchors)
-        pts_all  = [(px(t), py(v)) for t, v in hist_all]
-        flat_all = [c_ for xy in pts_all for c_ in xy]
-
-        # Last visible point for the dot
-        pts_vis  = [(px(t), py(v)) for t, v in hist_vis]
-
-        # Threshold dashed lines
-        for ms_thresh in (60, 120):
-            if lo < ms_thresh < hi:
-                y = py(ms_thresh)
-                c.create_line(pad_x, y, w - pad_x, y,
-                              fill=col_thresh, width=1, dash=(3, 4))
-
-        # Filled area — only when there's no tint background; the tint itself
-        # provides the background depth, and the fill (nearly-black) would
-        # cover it and create a dark gap under the graph line.
-        if not relay_interactive and len(pts_all) >= 2:
-            poly = [(pts_all[0][0], bot)] + pts_all + [(pts_all[-1][0], bot)]
-            c.create_polygon(
-                [c_ for xy in poly for c_ in xy],
-                fill=col_fill, outline="", smooth=False,
-            )
-
-        # Glow then bright line — off-screen anchors make edges curve in smoothly
-        if len(pts_all) >= 2:
-            c.create_line(flat_all, fill=col_glow, width=6, smooth=True,
-                          capstyle="round", joinstyle="round")
-            c.create_line(flat_all, fill=col_bright, width=2, smooth=True,
-                          capstyle="round", joinstyle="round")
-
-
-        # 1-second tick marks along the bottom axis
-        for s in range(0, 11):
-            tx = pad_x + int(s / span * (w - 2 * pad_x))
-            c.create_line(tx, bot + 1, tx, bot + 4, fill="#3a3010", width=1)
-
-        # X-axis edge labels
-        c.create_text(pad_x, h - 1, text="0s",
-                      fill="#5a4a20", font=("Arial", 6), anchor="sw")
-        c.create_text(w - pad_x, h - 1, text="10s",
-                      fill="#5a4a20", font=("Arial", 6), anchor="se")
-
-        # Current ping value (top-right)
-        c.create_text(w - pad_x, 2, text=f"{last_v} ms",
-                      fill="#c8aa6e", font=("Arial", 8, "bold"), anchor="ne")
 
 
 class App(tk.Tk):
@@ -2214,15 +2198,12 @@ class App(tk.Tk):
                        selectcolor=PANEL, font=("Segoe UI", 9),
                        command=self._on_ready_up_toggle).grid(
             row=5, column=1, sticky="w", padx=10)
-        self._overlay_graph_var = tk.BooleanVar(
-            value=bool(self.cfg.get("overlayPingGraph", False)))
-        tk.Checkbutton(f, text="Ping graph overlay", variable=self._overlay_graph_var,
-                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
-                       selectcolor=PANEL, font=("Segoe UI", 9),
-                       command=self._on_overlay_graph_toggle).grid(
-            row=5, column=2, sticky="w", padx=4)
+        tk.Button(f, text="Reset overlay position", bg=PANEL, fg=TEXT, relief="flat",
+                  font=("Segoe UI", 9), padx=8, pady=2, cursor="hand2",
+                  command=self._reset_overlay_pos).grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
         tk.Label(f, text="Relay URL:", bg=DARK, fg=TEXT,
-                 font=("Segoe UI", 9)).grid(row=6, column=0, sticky="w", pady=4)
+                 font=("Segoe UI", 9)).grid(row=7, column=0, sticky="w", pady=4)
         self._relay_var = tk.StringVar(value=str(self.cfg.get("relayUrl", "") or ""))
         # Apply live as typed so Ready Up works immediately…
         self._relay_var.trace_add(
@@ -2230,7 +2211,7 @@ class App(tk.Tk):
             lambda *a: self.cfg.__setitem__("relayUrl", self._relay_var.get().strip()))
         relay_entry = tk.Entry(f, textvariable=self._relay_var, width=34, bg=PANEL,
                                fg=WHITE, relief="flat", insertbackground=WHITE)
-        relay_entry.grid(row=6, column=1, padx=10, sticky="w")
+        relay_entry.grid(row=7, column=1, padx=10, sticky="w")
 
         # …and persist to disk when you finish editing (click away or press Enter).
         def _persist_relay(*_):
@@ -2241,20 +2222,20 @@ class App(tk.Tk):
         relay_entry.bind("<Return>",  _persist_relay)
         tk.Label(f, text="e.g. http://your-server-ip:8777  (same for everyone in the party)",
                  bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
-            row=7, column=1, columnspan=2, padx=10, sticky="w")
+            row=8, column=1, columnspan=2, padx=10, sticky="w")
 
         # Stream Deck / Local API
         tk.Label(f, text="Stream Deck API", bg=DARK, fg=GOLD,
                  font=("Segoe UI", 11, "bold")).grid(
-            row=8, column=0, columnspan=3, pady=(24, 6), sticky="w")
+            row=9, column=0, columnspan=3, pady=(24, 6), sticky="w")
         tk.Label(f, text="Port:", bg=DARK, fg=TEXT,
-                 font=("Segoe UI", 9)).grid(row=9, column=0, sticky="w", pady=4)
+                 font=("Segoe UI", 9)).grid(row=10, column=0, sticky="w", pady=4)
         self._api_port_var = tk.StringVar(
             value=str(self.cfg.get("localApiPort", 8778)))
         api_port_entry = tk.Entry(
             f, textvariable=self._api_port_var, width=8, bg=PANEL,
             fg=WHITE, relief="flat", insertbackground=WHITE)
-        api_port_entry.grid(row=9, column=1, padx=10, sticky="w")
+        api_port_entry.grid(row=10, column=1, padx=10, sticky="w")
 
         def _persist_api_port(*_):
             try:
@@ -2271,12 +2252,12 @@ class App(tk.Tk):
                  text=(f"GET http://127.0.0.1:{_api_port_now}/ready-up  "
                        f"·  /accept  ·  /status  ·  0 = disabled"),
                  bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
-            row=9, column=1, columnspan=2, padx=(90, 0), sticky="w")
+            row=10, column=1, columnspan=2, padx=(90, 0), sticky="w")
 
         # Auto-Accept Invites
         tk.Label(f, text="Auto-Accept Invites", bg=DARK, fg=GOLD,
                  font=("Segoe UI", 11, "bold")).grid(
-            row=10, column=0, columnspan=3, pady=(24, 6), sticky="w")
+            row=11, column=0, columnspan=3, pady=(24, 6), sticky="w")
         self._invite_var = tk.BooleanVar(
             value=bool(self.cfg.get("autoAcceptInvites", False)))
         tk.Checkbutton(f, text="Enabled  (accepts lobby invites from friends)",
@@ -2285,14 +2266,14 @@ class App(tk.Tk):
                        selectcolor=PANEL, font=("Segoe UI", 9),
                        command=lambda: self.cfg.__setitem__(
                            "autoAcceptInvites", self._invite_var.get())).grid(
-            row=11, column=0, columnspan=3, sticky="w", padx=4)
+            row=12, column=0, columnspan=3, sticky="w", padx=4)
         tk.Label(f, text="Friends only:", bg=DARK, fg=TEXT,
-                 font=("Segoe UI", 9)).grid(row=12, column=0, sticky="w", pady=4)
+                 font=("Segoe UI", 9)).grid(row=13, column=0, sticky="w", pady=4)
         whitelist_str = ", ".join(self.cfg.get("inviteWhitelist", []))
         self._invite_whitelist_var = tk.StringVar(value=whitelist_str)
         wl_entry = tk.Entry(f, textvariable=self._invite_whitelist_var, width=34,
                             bg=PANEL, fg=WHITE, relief="flat", insertbackground=WHITE)
-        wl_entry.grid(row=12, column=1, padx=10, sticky="w")
+        wl_entry.grid(row=13, column=1, padx=10, sticky="w")
         def _persist_whitelist(*_):
             raw = self._invite_whitelist_var.get()
             self.cfg["inviteWhitelist"] = [n.strip() for n in raw.split(",")
@@ -2302,23 +2283,23 @@ class App(tk.Tk):
         wl_entry.bind("<Return>",   _persist_whitelist)
         tk.Label(f, text="Comma-separated names — leave blank to accept from any friend",
                  bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
-            row=12, column=2, padx=4, sticky="w")
+            row=13, column=2, padx=4, sticky="w")
 
         # Updates
         tk.Label(f, text="Updates", bg=DARK, fg=GOLD,
                  font=("Segoe UI", 11, "bold")).grid(
-            row=13, column=0, columnspan=3, pady=(24, 6), sticky="w")
+            row=14, column=0, columnspan=3, pady=(24, 6), sticky="w")
         tk.Button(f, text="Check for Updates", bg=PANEL, fg=WHITE, relief="flat",
                   font=("Segoe UI", 9), padx=12, pady=4,
                   command=self._manual_update_check).grid(
-            row=14, column=0, sticky="w", pady=2)
+            row=15, column=0, sticky="w", pady=2)
         tk.Label(f, text=f"Current version: v{APP_VERSION}", bg=DARK, fg="#555",
-                 font=("Segoe UI", 8)).grid(row=14, column=1, columnspan=2,
+                 font=("Segoe UI", 8)).grid(row=15, column=1, columnspan=2,
                                             padx=10, sticky="w")
 
         # Warning box
         warn = tk.Frame(f, bg="#2a1a1a", padx=12, pady=10)
-        warn.grid(row=15, column=0, columnspan=3, sticky="ew", pady=(24, 0))
+        warn.grid(row=16, column=0, columnspan=3, sticky="ew", pady=(24, 0))
         tk.Label(warn, text="⚠  Terms of Service Warning", bg="#2a1a1a",
                  fg=RED, font=("Segoe UI", 9, "bold")).pack(anchor="w")
         tk.Label(warn,
@@ -2376,7 +2357,7 @@ class App(tk.Tk):
             # Prune to last 60 s
             cutoff = now - 60
             self._ping_hist = [(t, v) for t, v in self._ping_hist if t >= cutoff]
-            time.sleep(1)
+            time.sleep(3)
 
     @staticmethod
     def _icmp_ms(host):
@@ -2603,9 +2584,14 @@ class App(tk.Tk):
 
         threading.Thread(target=_do, daemon=True).start()
 
-    def _on_overlay_graph_toggle(self):
-        self.cfg["overlayPingGraph"] = self._overlay_graph_var.get()
+    def _reset_overlay_pos(self):
+        for k in ("overlayRelX", "overlayRelY", "overlayPosVersion"):
+            self.cfg.pop(k, None)
         save_config(self.cfg)
+        if self._overlay:
+            self._overlay._rel_x = None
+            self._overlay._rel_y = None
+        self.log("Overlay position reset — it will re-centre next time the client is detected.")
 
     def _on_ready_up_toggle(self):
         enabled = self._ready_up_var.get()
