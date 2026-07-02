@@ -41,7 +41,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.8.2"
+APP_VERSION = "1.8.3"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -100,13 +100,15 @@ DEFAULT_CONFIG = {
     "autoBan":      True,
     "autoRunes":    True,
     "pickDelay":    3000,    # lock this many ms before the pick phase ends
-    "banDelay":     3000,    # ban this many ms before the ban phase ends
+    "banDelay":     8000,    # ban this many ms before the ban phase ends
     "prePickDelay": 500,
     "acceptDelay":  0,       # wait before auto-accepting a found match (ms)
     "readyUpEnabled":  True,  # enable/disable the party ready-up feature
     "overlayPingGraph": False, # show ping graph instead of ready-up button in overlay
     "relayUrl":     "",      # ready-up relay server, e.g. http://192.168.1.50:8777
     "localApiPort": 0,      # Stream Deck REST API port (0 = disabled by default)
+    "autoAcceptInvites": False, # auto-accept lobby invites from friends
+    "inviteWhitelist":   [],    # restrict to these summoner names; empty = all friends
     "permaBans":    [],      # champion ids always banned first, regardless of role
     "roleChampions": {role: {"picks": [], "bans": []} for role in ROLES},
 }
@@ -428,6 +430,10 @@ class AutoEngine:
         self._i_am_ready        = False  # my own ready state (for relay heartbeat)
         self._accept_time       = None   # monotonic when ReadyCheck began
         self._accepted          = False  # already accepted this ready check
+        self._accepted_invites: set   = set()   # invite IDs already accepted this session
+        self._invite_seen:      dict  = {}      # invitationId → monotonic time first seen
+        self._friends_cache:    set   = set()   # cached set of friend summoner IDs
+        self._friends_ts:       float = 0.0     # monotonic time of last friends fetch
 
     def start(self):
         self._stop.clear()
@@ -449,6 +455,13 @@ class AutoEngine:
 
     def _tick(self):
         cfg = self._cfg()
+
+        # Invites must fire even when idle (no active session → 404 from session endpoint).
+        rp = self._lcu.get("/lol-gameflow/v1/gameflow-phase")
+        idle_phase = rp.json() if rp.status_code == 200 else ""
+        if idle_phase in ("", "None", "Lobby") or rp.status_code != 200:
+            self._handle_invites(cfg)
+
         r   = self._lcu.get("/lol-gameflow/v1/session")
         if r.status_code != 200:
             return
@@ -498,6 +511,8 @@ class AutoEngine:
         # Runs during Matchmaking too so the leader can cancel if someone unreadies.
         if phase in ("Lobby", "Matchmaking"):
             self._handle_party_ready()
+
+        # Invite handling already ran above for idle/lobby phases.
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
     def _log_champ_select_debug(self):
@@ -681,7 +696,7 @@ class AutoEngine:
                     override = self._user_pick.get(aid)
                     if aid not in self._action_start:
                         self._action_start[aid] = time.monotonic()
-                    if (time.monotonic() - self._action_start[aid]) * 1000 < cfg.get("pickDelay", 3000):
+                    if (time.monotonic() - self._action_start[aid]) * 1000 < min(cfg.get("pickDelay", 3000), 29000):
                         # Still waiting to lock. Keep the intended champion hovered so a
                         # role swap mid-turn is reflected — but never override a user's hover.
                         if override is None:
@@ -714,7 +729,9 @@ class AutoEngine:
                         and aid not in self._done_actions):
                     if aid not in self._action_start:
                         self._action_start[aid] = time.monotonic()
-                    champ = self._best(ban_prio, bans | pick_intents, set(range(1_000_000)))
+                    # Permabans are never blocked by pick_intents — only by bans already placed.
+                    perma_set = {int(c) for c in cfg.get("permaBans", [])}
+                    champ = self._best(ban_prio, bans | (pick_intents - perma_set), set(range(1_000_000)))
                     if not champ:
                         self._log(f"No valid ban for {ROLE_LABEL.get(role_key, role_key)}. Add champions to the ban list!")
                     elif self._ban_hovered.get(aid) != champ:
@@ -723,7 +740,7 @@ class AutoEngine:
                             self._ban_hovered[aid] = champ
                             self._action_start[aid] = time.monotonic()  # start delay after hover
                             self._log(f"[debug] Ban hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
-                    elif (time.monotonic() - self._action_start[aid]) * 1000 >= cfg.get("banDelay", 2000):
+                    elif (time.monotonic() - self._action_start[aid]) * 1000 >= min(cfg.get("banDelay", 8000), 8000):
                         # Phase 2 — champion is hovered, lock it the SAME way the pick
                         # locks: atomic PATCH completed:true (the pick proves this works
                         # once the champion is already hovered).
@@ -1110,6 +1127,71 @@ class AutoEngine:
             if cid not in unavailable and cid in playable:
                 return cid
         return None
+
+    def _get_friends(self) -> set:
+        """Return the set of friend summoner IDs, cached for 30 seconds."""
+        if time.monotonic() - self._friends_ts < 30:
+            return self._friends_cache
+        try:
+            r = self._lcu.get("/lol-chat/v1/friends")
+            if r.status_code == 200:
+                self._friends_cache = {
+                    int(f["summonerId"])
+                    for f in r.json()
+                    if f.get("summonerId")
+                }
+                self._friends_ts = time.monotonic()
+        except Exception:
+            pass
+        return self._friends_cache
+
+    def _handle_invites(self, cfg: dict):
+        """Accept pending lobby invites from friends (optionally whitelist-filtered)."""
+        if not cfg.get("autoAcceptInvites"):
+            return
+        try:
+            r = self._lcu.get("/lol-lobby/v2/received-invitations")
+            if r.status_code != 200:
+                return
+            pending = [
+                inv for inv in r.json()
+                if inv.get("state") == "Pending"
+                and inv.get("invitationId") not in self._accepted_invites
+            ]
+        except Exception:
+            return
+        if not pending:
+            return
+
+        friends   = self._get_friends()
+        whitelist = {n.strip().lower()
+                     for n in cfg.get("inviteWhitelist", []) if n.strip()}
+
+        for inv in pending:
+            inv_id      = inv.get("invitationId", "")
+            sender_id   = int(inv.get("fromSummonerId", 0) or 0)
+            sender_name = inv.get("fromSummonerName", str(sender_id))
+
+            if sender_id not in friends:
+                continue
+            if whitelist and sender_name.lower() not in whitelist:
+                continue
+
+            first_seen = self._invite_seen.get(inv_id)
+            if first_seen is None:
+                self._invite_seen[inv_id] = time.monotonic()
+                continue
+            if time.monotonic() - first_seen < 0.5:
+                continue
+
+            r2 = self._lcu.post(
+                f"/lol-lobby/v2/received-invitations/{inv_id}/accept")
+            if r2.status_code in (200, 204):
+                self._log(f"Auto-accepted invite from {sender_name}")
+                self._accepted_invites.add(inv_id)
+                self._invite_seen.pop(inv_id, None)
+            else:
+                self._log(f"[invite] Accept failed for {sender_name}: HTTP {r2.status_code}")
 
 
 # ── Theme colors ──────────────────────────────────────────────────────────────
@@ -2016,12 +2098,13 @@ class App(tk.Tk):
             ("Auto Pre-Pick",     "autoPrePick"),
             ("Auto Ban",          "autoBan"),
             ("Auto Runes/Spells", "autoRunes"),
+            ("Accept Invites",    "autoAcceptInvites"),
         ]
         for (label, key), (row, col) in zip(
-            _auto_items, [(0,0),(0,1),(1,0),(1,1),(2,0)]
+            _auto_items, [(0,0),(0,1),(1,0),(1,1),(2,0),(2,1)]
         ):
-            active  = bool(self.cfg.get(key, True))
-            colspan = 2 if key == "autoRunes" else 1
+            active  = bool(self.cfg.get(key, DEFAULT_CONFIG.get(key, True)))
+            colspan = 1
             btn = tk.Button(mid, text=label, relief="flat", cursor="hand2",
                             font=("Segoe UI", 11, "bold"),
                             command=lambda k=key: self._toggle_auto(k))
@@ -2093,15 +2176,15 @@ class App(tk.Tk):
                  font=("Segoe UI", 11, "bold")).grid(
             row=0, column=0, columnspan=3, pady=(0, 10), sticky="w")
 
-        for i, (label, key, note) in enumerate([
+        for i, (label, key, note, max_val) in enumerate([
             ("Accept delay:",   "acceptDelay",
-             "Wait this long after a match is found before accepting"),
+             "Wait this long after a match is found before accepting",        60),
             ("Pre-pick delay:", "prePickDelay",
-             "Wait this long into champion select before hovering your pre-pick"),
+             "Wait this long into champion select before hovering your pre-pick", 60),
             ("Pick delay:",     "pickDelay",
-             "Wait this long after your pick turn starts before locking in"),
+             "Wait this long after your pick turn starts before locking in",  29),
             ("Ban delay:",      "banDelay",
-             "Wait this long after your ban turn starts before banning"),
+             "Wait this long after your ban turn starts before banning",       8),
         ]):
             tk.Label(f, text=label, bg=DARK, fg=TEXT,
                      font=("Segoe UI", 9)).grid(
@@ -2111,10 +2194,10 @@ class App(tk.Tk):
             var = tk.DoubleVar(value=round(int(self.cfg.get(key, 1000)) / 1000, 1))
             self._delay_vars[key] = var
 
-            def _on_change(k=key, v=var):
-                self.cfg[k] = int(round(v.get() * 1000))
+            def _on_change(k=key, v=var, mx=max_val):
+                self.cfg[k] = int(round(min(v.get(), mx) * 1000))
 
-            tk.Spinbox(f, from_=0, to=60, increment=0.5, textvariable=var,
+            tk.Spinbox(f, from_=0, to=max_val, increment=0.5, textvariable=var,
                        width=8, bg=PANEL, fg=WHITE, relief="flat", format="%.1f",
                        command=_on_change).grid(row=i+1, column=1, padx=10, sticky="w")
 
@@ -2190,21 +2273,52 @@ class App(tk.Tk):
                  bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
             row=9, column=1, columnspan=2, padx=(90, 0), sticky="w")
 
+        # Auto-Accept Invites
+        tk.Label(f, text="Auto-Accept Invites", bg=DARK, fg=GOLD,
+                 font=("Segoe UI", 11, "bold")).grid(
+            row=10, column=0, columnspan=3, pady=(24, 6), sticky="w")
+        self._invite_var = tk.BooleanVar(
+            value=bool(self.cfg.get("autoAcceptInvites", False)))
+        tk.Checkbutton(f, text="Enabled  (accepts lobby invites from friends)",
+                       variable=self._invite_var,
+                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
+                       selectcolor=PANEL, font=("Segoe UI", 9),
+                       command=lambda: self.cfg.__setitem__(
+                           "autoAcceptInvites", self._invite_var.get())).grid(
+            row=11, column=0, columnspan=3, sticky="w", padx=4)
+        tk.Label(f, text="Friends only:", bg=DARK, fg=TEXT,
+                 font=("Segoe UI", 9)).grid(row=12, column=0, sticky="w", pady=4)
+        whitelist_str = ", ".join(self.cfg.get("inviteWhitelist", []))
+        self._invite_whitelist_var = tk.StringVar(value=whitelist_str)
+        wl_entry = tk.Entry(f, textvariable=self._invite_whitelist_var, width=34,
+                            bg=PANEL, fg=WHITE, relief="flat", insertbackground=WHITE)
+        wl_entry.grid(row=12, column=1, padx=10, sticky="w")
+        def _persist_whitelist(*_):
+            raw = self._invite_whitelist_var.get()
+            self.cfg["inviteWhitelist"] = [n.strip() for n in raw.split(",")
+                                           if n.strip()]
+            save_config(self.cfg)
+        wl_entry.bind("<FocusOut>", _persist_whitelist)
+        wl_entry.bind("<Return>",   _persist_whitelist)
+        tk.Label(f, text="Comma-separated names — leave blank to accept from any friend",
+                 bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
+            row=12, column=2, padx=4, sticky="w")
+
         # Updates
         tk.Label(f, text="Updates", bg=DARK, fg=GOLD,
                  font=("Segoe UI", 11, "bold")).grid(
-            row=10, column=0, columnspan=3, pady=(24, 6), sticky="w")
+            row=13, column=0, columnspan=3, pady=(24, 6), sticky="w")
         tk.Button(f, text="Check for Updates", bg=PANEL, fg=WHITE, relief="flat",
                   font=("Segoe UI", 9), padx=12, pady=4,
                   command=self._manual_update_check).grid(
-            row=11, column=0, sticky="w", pady=2)
+            row=14, column=0, sticky="w", pady=2)
         tk.Label(f, text=f"Current version: v{APP_VERSION}", bg=DARK, fg="#555",
-                 font=("Segoe UI", 8)).grid(row=11, column=1, columnspan=2,
+                 font=("Segoe UI", 8)).grid(row=14, column=1, columnspan=2,
                                             padx=10, sticky="w")
 
         # Warning box
         warn = tk.Frame(f, bg="#2a1a1a", padx=12, pady=10)
-        warn.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(24, 0))
+        warn.grid(row=15, column=0, columnspan=3, sticky="ew", pady=(24, 0))
         tk.Label(warn, text="⚠  Terms of Service Warning", bg="#2a1a1a",
                  fg=RED, font=("Segoe UI", 9, "bold")).pack(anchor="w")
         tk.Label(warn,
@@ -2456,12 +2570,16 @@ class App(tk.Tk):
                        activebackground="#6e1414", activeforeground=WHITE)
 
     def _toggle_auto(self, key: str):
-        active = not bool(self.cfg.get(key, True))
+        default = DEFAULT_CONFIG.get(key, True)
+        active = not bool(self.cfg.get(key, default))
         self.cfg[key] = active
         save_config(self.cfg)
         btn = self._auto_btns.get(key)
         if btn:
             self._apply_auto_btn_color(btn, active)
+        # Keep Settings panel checkbox in sync if it exists.
+        if key == "autoAcceptInvites" and hasattr(self, "_invite_var"):
+            self._invite_var.set(active)
 
     def _toggle_party_ready(self):
         """Toggle your ready state and broadcast it to the relay so every party
@@ -2583,6 +2701,12 @@ class App(tk.Tk):
             self.cfg[k] = v.get()
         if hasattr(self, "_relay_var"):
             self.cfg["relayUrl"] = self._relay_var.get().strip()
+        if hasattr(self, "_invite_var"):
+            self.cfg["autoAcceptInvites"] = self._invite_var.get()
+        if hasattr(self, "_invite_whitelist_var"):
+            raw = self._invite_whitelist_var.get()
+            self.cfg["inviteWhitelist"] = [n.strip() for n in raw.split(",")
+                                           if n.strip()]
         save_config(self.cfg)
         self.log("Config saved.")
 
