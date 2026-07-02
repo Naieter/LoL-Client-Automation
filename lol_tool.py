@@ -53,7 +53,7 @@ def _dbg(*args):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.8.12"
+APP_VERSION = "1.8.14"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -492,6 +492,7 @@ class AutoEngine:
 
         if phase != self._last_phase:
             self._log(f"Phase → {phase}")
+            prev_phase       = self._last_phase
             self._last_phase = phase
             # Reset the per-ready-check accept timer on any phase change.
             self._accept_time = None
@@ -516,6 +517,13 @@ class AutoEngine:
             if phase == "Lobby":
                 self._queue_started     = False
                 self._last_ready_status = None
+            # Match declined or missed: ReadyCheck → Lobby/Matchmaking means
+            # the accept window closed without a game starting. Auto-unready so
+            # the user doesn't stay locked in a ready state they can't undo.
+            if prev_phase == "ReadyCheck" and phase in ("Lobby", "Matchmaking"):
+                self._i_am_ready  = False
+                self._ready_count = 0
+                self._log("Match declined/missed — ready state cleared.")
 
         # Auto accept — after the configured delay (default 0 = immediate)
         if cfg.get("autoAccept") and phase == "ReadyCheck" and not self._accepted:
@@ -1710,8 +1718,9 @@ class LCUOverlay:
         _dbg(f"refresh: relay_on={relay_on} ready_up={ready_up} ping={ping} party_size={party_size}")
 
         if phase == "ReadyCheck":
-            self._set_btn("ACCEPT", "accept")
-            _dbg("refresh: show ACCEPT")
+            self._win.withdraw()
+            _dbg("refresh: withdraw (ReadyCheck)")
+            return
         elif not relay_on or not ready_up:
             # Relay off or feature disabled — show small ping regardless of party size.
             self._set_btn(f"{ping}ms" if ping is not None else "---ms",
@@ -2598,7 +2607,11 @@ class App(tk.Tk):
     def _on_phase_change(self, phase):
         """Engine callback: reset ready state on champ select, update overlay."""
         def _do():
+            prev = getattr(self, "_prev_phase", "")
+            self._prev_phase = phase
             if phase == "ChampSelect":
+                self._party_ready = False
+            if prev == "ReadyCheck" and phase in ("Lobby", "Matchmaking"):
                 self._party_ready = False
             if hasattr(self, "_overlay"):
                 self._overlay.set_phase(phase)
