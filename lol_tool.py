@@ -53,7 +53,7 @@ def _dbg(*args):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.8.8"
+APP_VERSION = "1.8.11"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1196,6 +1196,30 @@ class AutoEngine:
             pass
         return self._friends_cache
 
+    def _send_party_chat(self, message: str, delay: float = 1.5):
+        """Post a message to the party lobby chat. Waits `delay` seconds first so
+        the lobby has time to initialise after an invite accept."""
+        def _do():
+            time.sleep(delay)
+            try:
+                r = self._lcu.get("/lol-chat/v1/conversations")
+                if r.status_code != 200:
+                    return
+                party_conv = next(
+                    (c for c in r.json() if c.get("type") == "party"), None)
+                if not party_conv:
+                    return
+                cid = party_conv.get("id", "")
+                if not cid:
+                    return
+                self._lcu.post(
+                    f"/lol-chat/v1/conversations/{cid}/messages",
+                    json={"body": message, "type": "chat"},
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+
     def _handle_invites(self, cfg: dict):
         """Accept pending lobby invites from friends (optionally whitelist-filtered)."""
         if not cfg.get("autoAcceptInvites"):
@@ -1241,6 +1265,7 @@ class AutoEngine:
                 self._log(f"Auto-accepted invite from {sender_name}")
                 self._accepted_invites.add(inv_id)
                 self._invite_seen.pop(inv_id, None)
+                self._send_party_chat("Invite auto-accepted")
             else:
                 self._log(f"[invite] Accept failed for {sender_name}: HTTP {r2.status_code}")
 
@@ -1729,7 +1754,7 @@ class LCUOverlay:
             # Centre X matches the big button; Y sits just above "Autofill Protected".
             sx = int(lw * 0.829) // 2 - ow // 2
             sy = int(lh * 0.865) - oh - 4
-            self._win.geometry(f"{ow}x{oh}+{lx + sx}+{ly + sy}")
+            new_geom = f"{ow}x{oh}+{lx + sx}+{ly + sy}"
         else:
             if self._rel_x is None:
                 saved_x = self._app.cfg.get("overlayRelX")
@@ -1740,8 +1765,13 @@ class LCUOverlay:
                 else:
                     self._rel_x = int(lw * 0.829 - ow) // 2
                     self._rel_y = int(lh * 0.873) - oh // 2
-            self._win.geometry(f"{ow}x{oh}+{lx + self._rel_x}+{ly + self._rel_y}")
-        self._win.deiconify()
+            new_geom = f"{ow}x{oh}+{lx + self._rel_x}+{ly + self._rel_y}"
+
+        if new_geom != getattr(self, "_last_geom", None):
+            self._last_geom = new_geom
+            self._win.geometry(new_geom)
+        if self._win.state() == "withdrawn":
+            self._win.deiconify()
 
     # ── LCU actions ───────────────────────────────────────────────────────────
     def _click(self):
@@ -1812,9 +1842,6 @@ class LCUOverlay:
                 x1-cut,y1, x0+cut,y1, x0,y1-cut, x0,y0+cut]
 
     def _set_btn(self, text: str, style: str, small: bool = False):
-        self._btn_label = text
-        self._btn_style = style
-        self._btn_small = small
         # Normalise ping digits → "000ms" so width stays stable as ping fluctuates.
         stable = _re.sub(r'(\d+|---)\s*ms', '000ms', text)
         if small:
@@ -1827,17 +1854,30 @@ class LCUOverlay:
                 stable += '  000ms'
             new_w = max(fnt.measure(stable) + 56, 192)
             new_h = 53
-        if int(self._btn["width"]) != new_w or int(self._btn["height"]) != new_h:
+
+        size_changed = (int(self._btn["width"]) != new_w or
+                        int(self._btn["height"]) != new_h)
+        if size_changed:
             self._btn.config(width=new_w, height=new_h)
-        self._draw_lol_btn()
+
+        content_changed = (text != self._btn_label or
+                           style != self._btn_style or
+                           small != self._btn_small)
+        self._btn_label = text
+        self._btn_style = style
+        self._btn_small = small
+
+        if content_changed or size_changed:
+            self._draw_lol_btn()
 
     def _btn_set_hover(self, val: bool):
+        if val == self._btn_hover:
+            return
         self._btn_hover = val
         self._draw_lol_btn()
 
     def _draw_lol_btn(self):
         c = self._btn
-        c.delete("all")
         w = c.winfo_width()
         h = c.winfo_height()
         if w <= 1:
@@ -1846,17 +1886,32 @@ class LCUOverlay:
         theme = (self._BTN_HOVER if self._btn_hover else self._BTN_THEMES).get(
             self._btn_style, self._BTN_THEMES["find"])
         b_dark, b_hi, fill, fg = theme
-        cut      = 5 if self._btn_small else 9
-        font_sz  = 10 if self._btn_small else 12
+        cut     = 5 if self._btn_small else 9
+        font_sz = 10 if self._btn_small else 12
 
-        c.create_polygon(self._lol_pts(0, 0, w, h, cut),
-                         fill=b_dark, outline="")
-        c.create_polygon(self._lol_pts(1, 1, w-1, h-1, cut-1),
-                         fill=b_hi, outline="")
-        c.create_polygon(self._lol_pts(2, 2, w-2, h-2, cut-2),
-                         fill=fill, outline="")
-        c.create_text(w // 2, h // 2 + 1, text=self._btn_label,
-                      fill=fg, font=(self._LOL_FONT, font_sz, "bold"), anchor="center")
+        pts_outer  = self._lol_pts(0, 0, w, h, cut)
+        pts_border = self._lol_pts(1, 1, w-1, h-1, cut-1)
+        pts_inner  = self._lol_pts(2, 2, w-2, h-2, cut-2)
+        cx, cy     = w // 2, h // 2 + 1
+
+        if c.find_withtag("bg"):
+            # Update existing items in-place — no blank frame between delete and redraw.
+            c.coords("bg",     pts_outer)
+            c.itemconfig("bg", fill=b_dark)
+            c.coords("border",     pts_border)
+            c.itemconfig("border", fill=b_hi)
+            c.coords("fill_",     pts_inner)
+            c.itemconfig("fill_", fill=fill)
+            c.coords("label", cx, cy)
+            c.itemconfig("label", text=self._btn_label, fill=fg,
+                         font=(self._LOL_FONT, font_sz, "bold"))
+        else:
+            c.create_polygon(pts_outer,  fill=b_dark, outline="", tags="bg")
+            c.create_polygon(pts_border, fill=b_hi,   outline="", tags="border")
+            c.create_polygon(pts_inner,  fill=fill,   outline="", tags="fill_")
+            c.create_text(cx, cy, text=self._btn_label, fill=fg,
+                          font=(self._LOL_FONT, font_sz, "bold"),
+                          anchor="center", tags="label")
 
 
 
@@ -2570,15 +2625,24 @@ class App(tk.Tk):
             self.log("Ready Up: connect to the League client first.")
             return
 
+        want = not self._party_ready
+        # Optimistic update — reflect the new state immediately in the overlay.
+        eng = self._engine
+        pc  = eng._present_count
+        self._party_ready        = want
+        eng._i_am_ready          = want
+        eng._ready_count         = max(0, min(pc, eng._ready_count + (1 if want else -1)))
+
         def _do():
-            want = not self._party_ready
-            # Log the available chat conversations on the first ready of a session
-            # so we can confirm the party chat is being found.
-            ok = self._engine.broadcast_party_ready(want, log_all=not self._party_ready)
+            ok = eng.broadcast_party_ready(want, log_all=want)
             if ok:
-                self._party_ready = want
                 self.log(f"You are {'READY' if want else 'not ready'}.")
             else:
+                # Server rejected — revert all three optimistic fields.
+                self._party_ready = not want
+                eng._i_am_ready   = not want
+                eng._ready_count  = max(0, min(eng._present_count,
+                                               eng._ready_count - (1 if want else -1)))
                 self.log("Ready Up: couldn't register — set a Relay URL in Settings "
                          "and make sure you're in a party lobby.")
 
