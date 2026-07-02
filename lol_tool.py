@@ -53,7 +53,7 @@ def _dbg(*args):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -502,6 +502,8 @@ class AutoEngine:
                     self._present_count    = 0
                     self._ready_count      = 0
                     self._size_none_streak = 0
+                    self._accepted_invites.clear()
+                    self._invite_seen.clear()
             return
 
         phase = r.json().get("phase", "")
@@ -545,6 +547,8 @@ class AutoEngine:
             if prev_phase in ("Lobby", "Matchmaking") and phase not in ("Lobby", "Matchmaking", "ReadyCheck"):
                 self._party_size       = 0
                 self._size_none_streak = 0
+                self._accepted_invites.clear()
+                self._invite_seen.clear()
 
         # Auto accept — after the configured delay (default 0 = immediate)
         if cfg.get("autoAccept") and phase == "ReadyCheck" and not self._accepted:
@@ -1277,19 +1281,25 @@ class AutoEngine:
             return
         try:
             r = self._lcu.get("/lol-lobby/v2/received-invitations")
+            _dbg(f"[invite] received-invitations status={r.status_code}")
             if r.status_code != 200:
                 return
+            all_invs = r.json()
+            _dbg(f"[invite] raw invites: {all_invs}")
             pending = [
-                inv for inv in r.json()
+                inv for inv in all_invs
                 if inv.get("state") == "Pending"
                 and inv.get("invitationId") not in self._accepted_invites
             ]
-        except Exception:
+            _dbg(f"[invite] pending count={len(pending)}")
+        except Exception as exc:
+            _dbg(f"[invite] exception fetching invites: {exc}")
             return
         if not pending:
             return
 
         friends   = self._get_friends()
+        _dbg(f"[invite] friends count={len(friends)} ids={list(friends)[:10]}")
         whitelist = {n.strip().lower()
                      for n in cfg.get("inviteWhitelist", []) if n.strip()}
 
@@ -1297,21 +1307,26 @@ class AutoEngine:
             inv_id      = inv.get("invitationId", "")
             sender_id   = int(inv.get("fromSummonerId", 0) or 0)
             sender_name = inv.get("fromSummonerName", str(sender_id))
+            _dbg(f"[invite] checking inv={inv_id} sender_id={sender_id} sender_name={sender_name!r}")
 
             if sender_id not in friends:
+                _dbg(f"[invite] sender_id={sender_id} not in friends — skipping")
                 continue
             if whitelist and sender_name.lower() not in whitelist:
+                _dbg(f"[invite] {sender_name!r} not in whitelist {whitelist} — skipping")
                 continue
 
             first_seen = self._invite_seen.get(inv_id)
             if first_seen is None:
                 self._invite_seen[inv_id] = time.monotonic()
+                _dbg(f"[invite] first_seen — waiting one tick")
                 continue
             if time.monotonic() - first_seen < 0.5:
                 continue
 
             r2 = self._lcu.post(
                 f"/lol-lobby/v2/received-invitations/{inv_id}/accept")
+            _dbg(f"[invite] accept status={r2.status_code} body={r2.text[:200]}")
             if r2.status_code in (200, 204):
                 self._log(f"Auto-accepted invite from {sender_name}")
                 self._accepted_invites.add(inv_id)
