@@ -42,4 +42,8 @@ subprocess.check_call([
 built = os.path.join(tmp, "LOL_Client_Tool.exe")
 shutil.copy2(built, dest)
 log(f"Copied to Desktop: {dest}")
+dist_dir = os.path.join(here, "dist")
+os.makedirs(dist_dir, exist_ok=True)
+shutil.copy2(built, os.path.join(dist_dir, "LOL_Client_Tool.exe"))
+log(f"Copied to dist/")
 log("=== Build Complete ===")
