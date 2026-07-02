@@ -53,7 +53,7 @@ def _dbg(*args):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.9.4"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1717,13 +1717,17 @@ class LCUOverlay:
         btn.bind("<Enter>", lambda e: self._btn_set_hover(True))
         btn.bind("<Leave>", lambda e: self._btn_set_hover(False))
 
-        self._win       = win
-        self._btn       = btn
-        self._btn_label = ""
-        self._btn_style = "find"
-        self._btn_hover = False
-        self._btn_small = False
+        self._win           = win
+        self._btn           = btn
+        self._btn_label     = ""
+        self._btn_style     = "find"
+        self._btn_hover     = False
+        self._btn_small     = False
+        self._ct_state      = None   # "clickable" | "passthrough" | "hidden"
+        self._ct_lmb_was    = False
+        self._ct_hide_until = 0.0
         self._tick()
+        self._ct_poll()
 
     # ── League client window ──────────────────────────────────────────────────
     @staticmethod
@@ -1772,6 +1776,96 @@ class LCUOverlay:
         self._phase = phase
         self._refresh()
 
+    # ── Click-through / auto-hide management ─────────────────────────────────
+    _GWL_EXSTYLE       = -20
+    _WS_EX_TRANSPARENT = 0x00000020
+
+    def _ct_update(self, state: str):
+        """Apply one of three states to the overlay window:
+        'clickable'   — fully visible, receives mouse events
+        'passthrough' — fully visible, clicks fall through to League client
+        'hidden'      — invisible and click-through (role selection in progress)
+        """
+        if state == self._ct_state:
+            return
+        self._ct_state = state
+        user32 = ctypes.windll.user32
+        hwnd   = self._win.winfo_id()
+        style  = user32.GetWindowLongW(hwnd, self._GWL_EXSTYLE)
+        if state == "clickable":
+            user32.SetWindowLongW(hwnd, self._GWL_EXSTYLE,
+                                  style & ~self._WS_EX_TRANSPARENT)
+            self._win.wm_attributes("-alpha", 1.0)
+        elif state == "passthrough":
+            user32.SetWindowLongW(hwnd, self._GWL_EXSTYLE,
+                                  style | self._WS_EX_TRANSPARENT)
+            self._win.wm_attributes("-alpha", 1.0)
+            self._btn_set_hover(False)
+        else:  # hidden
+            user32.SetWindowLongW(hwnd, self._GWL_EXSTYLE,
+                                  style | self._WS_EX_TRANSPARENT)
+            self._win.wm_attributes("-alpha", 0.0)
+            self._btn_set_hover(False)
+
+    # Proportional region of the LCU window that contains the role-select button
+    # (the asterisk * at the bottom of the lobby, right of Find Match).
+    # Values are (x0, y0, x1, y1) as fractions of the LCU window size.
+    # Derived from screenshot: button sits at ~54 % across, ~95 % down.
+    _ROLE_ZONE = (0.46, 0.88, 0.62, 1.00)
+
+    def _ct_poll(self):
+        """Poll at 80ms:
+        - Hide when user clicks the role-select button in the LCU window.
+        - Pass mouse events through to LCU when cursor is not over the overlay.
+        - Become fully interactive when cursor is over the overlay.
+        """
+        if self._win.state() != "withdrawn":
+            try:
+                user32 = ctypes.windll.user32
+
+                # Cursor position — physical screen pixels
+                pt = ctypes.wintypes.POINT()
+                user32.GetCursorPos(ctypes.byref(pt))
+                cx, cy = pt.x, pt.y
+
+                # Overlay bounds — physical screen pixels via GetWindowRect
+                ov_rect = ctypes.wintypes.RECT()
+                user32.GetWindowRect(self._win.winfo_id(), ctypes.byref(ov_rect))
+                over = (ov_rect.left <= cx <= ov_rect.right and
+                        ov_rect.top  <= cy <= ov_rect.bottom)
+
+                # Role-select zone — proportional to LCU window
+                in_role_zone = False
+                lcu_hwnd = self._find_lcu()
+                if lcu_hwnd:
+                    lcu_rect = ctypes.wintypes.RECT()
+                    user32.GetWindowRect(lcu_hwnd, ctypes.byref(lcu_rect))
+                    lx, ly = lcu_rect.left, lcu_rect.top
+                    lw = lcu_rect.right  - lcu_rect.left
+                    lh = lcu_rect.bottom - lcu_rect.top
+                    x0, y0, x1, y1 = self._ROLE_ZONE
+                    in_role_zone = (lx + int(lw * x0) <= cx <= lx + int(lw * x1) and
+                                    ly + int(lh * y0) <= cy <= ly + int(lh * y1))
+
+                lmb     = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+                was_lmb = self._ct_lmb_was
+                self._ct_lmb_was = lmb
+
+                # Click in role zone (but not on the overlay itself) → hide for 3 s
+                if lmb and not was_lmb and in_role_zone and not over:
+                    self._ct_hide_until = time.monotonic() + 3.0
+
+                if time.monotonic() < self._ct_hide_until:
+                    self._ct_update("hidden")
+                elif over:
+                    self._ct_update("clickable")
+                else:
+                    self._ct_update("passthrough")
+            except Exception:
+                pass
+        self._app.after(80, self._ct_poll)
+
+    # ── Refresh loop ──────────────────────────────────────────────────────────
     def _tick(self):
         self._refresh()
         # Faster tick in graph mode for smooth scrolling; slower otherwise
@@ -1889,6 +1983,7 @@ class LCUOverlay:
             self._last_geom = new_geom
             self._win.geometry(new_geom)
         if self._win.state() == "withdrawn":
+            self._ct_state = None   # force style re-apply after hiding
             self._win.deiconify()
 
     # ── LCU actions ───────────────────────────────────────────────────────────
