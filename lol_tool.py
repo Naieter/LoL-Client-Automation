@@ -53,7 +53,7 @@ def _dbg(*args):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.8.11"
+APP_VERSION = "1.8.12"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1097,6 +1097,14 @@ class AutoEngine:
 
             self._ready_count   = ready_count
             self._present_count = present_count
+
+            # If the user drops to being the only tool user (or solo), clear
+            # their ready state so it doesn't silently persist into the next
+            # party (where the button won't be visible to let them undo it).
+            if present_count <= 1 and self._i_am_ready:
+                self._i_am_ready  = False
+                self._ready_count = 0
+                ready_count       = 0
 
             status = f"{ready_count}/{present_count}"
             if status != self._last_ready_status:
@@ -2625,9 +2633,11 @@ class App(tk.Tk):
             self.log("Ready Up: connect to the League client first.")
             return
 
-        want = not self._party_ready
+        eng  = self._engine
+        # Use the engine's state as truth — it may have auto-reset _i_am_ready
+        # (e.g. when dropping to solo) without the App's _party_ready following.
+        want = not eng._i_am_ready
         # Optimistic update — reflect the new state immediately in the overlay.
-        eng = self._engine
         pc  = eng._present_count
         self._party_ready        = want
         eng._i_am_ready          = want
