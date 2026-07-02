@@ -53,7 +53,7 @@ def _dbg(*args):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1229,28 +1229,46 @@ class AutoEngine:
             pass
         return self._friends_cache
 
-    def _send_party_chat(self, message: str, delay: float = 1.5):
+    def _send_party_chat(self, message: str, delay: float = 2.5):
         """Post a message to the party lobby chat. Waits `delay` seconds first so
-        the lobby has time to initialise after an invite accept."""
+        the lobby has time to initialise after an invite accept. Retries up to 4×."""
         def _do():
             time.sleep(delay)
-            try:
-                r = self._lcu.get("/lol-chat/v1/conversations")
-                if r.status_code != 200:
+            for attempt in range(5):
+                try:
+                    r = self._lcu.get("/lol-chat/v1/conversations")
+                    _dbg(f"party_chat attempt={attempt} status={r.status_code}")
+                    if r.status_code != 200:
+                        self._log(f"[chat] conversations {r.status_code} (attempt {attempt})")
+                        time.sleep(1.0)
+                        continue
+                    convs = r.json()
+                    types = [c.get("type") for c in convs]
+                    _dbg(f"party_chat: {len(convs)} convs types={types}")
+                    party_conv = next(
+                        (c for c in convs
+                         if c.get("type") in ("party", "customGame")), None)
+                    if not party_conv:
+                        self._log(f"[chat] no party conv yet (types={types}, attempt {attempt})")
+                        time.sleep(1.0)
+                        continue
+                    cid = party_conv.get("id", "")
+                    if not cid:
+                        self._log("[chat] party conv has no id")
+                        return
+                    r2 = self._lcu.post(
+                        f"/lol-chat/v1/conversations/{cid}/messages",
+                        {"body": message, "type": "chat"},
+                    )
+                    _dbg(f"party_chat: post status={r2.status_code}")
+                    if r2.status_code in (200, 204):
+                        return   # success
+                    self._log(f"[chat] post failed {r2.status_code}")
                     return
-                party_conv = next(
-                    (c for c in r.json() if c.get("type") == "party"), None)
-                if not party_conv:
+                except Exception as exc:
+                    _dbg(f"party_chat: exception {exc}")
+                    self._log(f"[chat] exception: {exc}")
                     return
-                cid = party_conv.get("id", "")
-                if not cid:
-                    return
-                self._lcu.post(
-                    f"/lol-chat/v1/conversations/{cid}/messages",
-                    json={"body": message, "type": "chat"},
-                )
-            except Exception:
-                pass
         threading.Thread(target=_do, daemon=True).start()
 
     def _handle_invites(self, cfg: dict):
@@ -1298,7 +1316,7 @@ class AutoEngine:
                 self._log(f"Auto-accepted invite from {sender_name}")
                 self._accepted_invites.add(inv_id)
                 self._invite_seen.pop(inv_id, None)
-                self._send_party_chat("Invite auto-accepted")
+                self._send_party_chat("Party invite auto-accepted")
             else:
                 self._log(f"[invite] Accept failed for {sender_name}: HTTP {r2.status_code}")
 
@@ -1312,6 +1330,51 @@ GREEN  = "#27ae60"
 RED    = "#c0392b"
 TEXT   = "#cccccc"
 WHITE  = "#ffffff"
+
+# Virtual-key codes for F-keys and navigation keys (overlay hotkey system)
+_OVERLAY_VK = {
+    "F1":  0x70, "F2":  0x71, "F3":  0x72, "F4":  0x73,
+    "F5":  0x74, "F6":  0x75, "F7":  0x76, "F8":  0x77,
+    "F9":  0x78, "F10": 0x79, "F11": 0x7A, "F12": 0x7B,
+    "Home": 0x24, "End": 0x23, "Insert": 0x2D, "Delete": 0x2E,
+    "Prior": 0x21, "Next": 0x22,   # PgUp / PgDn (tkinter keysym names)
+}
+_OVERLAY_MOD_VK      = {"Ctrl": 0x11, "Shift": 0x10, "Alt": 0x12}
+_OVERLAY_KEY_DISPLAY = {"Prior": "PgUp", "Next": "PgDn"}
+# Tkinter keysyms that are pure modifier keys — skip these during capture.
+_OVERLAY_IGNORE_KEYS = {
+    "Control_L", "Control_R", "Shift_L", "Shift_R",
+    "Alt_L", "Alt_R", "Meta_L", "Meta_R",
+    "Super_L", "Super_R", "Caps_Lock", "Num_Lock", "Scroll_Lock",
+}
+
+def _overlay_key_vk(key: str) -> int:
+    """Resolve a bare key name to a Windows VK code (0 if unknown)."""
+    vk = _OVERLAY_VK.get(key)
+    if vk:
+        return vk
+    if len(key) == 1:
+        k = key.upper()
+        if "A" <= k <= "Z":
+            return ord(k)          # 0x41–0x5A
+        if "0" <= k <= "9":
+            return ord(k)          # 0x30–0x39
+    return 0
+
+def _overlay_parse_combo(combo: str):
+    """'Ctrl+K' → ([mod_vk, …], key_vk). Returns ([], 0) if unresolvable."""
+    parts = combo.strip().split("+")
+    key   = parts[-1]
+    mods  = [_OVERLAY_MOD_VK[p] for p in parts[:-1] if p in _OVERLAY_MOD_VK]
+    return (mods, _overlay_key_vk(key))
+
+def _overlay_combo_label(combo: str) -> str:
+    """Human-readable form of a stored combo string, e.g. 'Ctrl+Prior' → 'Ctrl+PgUp'."""
+    if not combo:
+        return "None"
+    parts = combo.split("+")
+    parts[-1] = _OVERLAY_KEY_DISPLAY.get(parts[-1], parts[-1])
+    return "+".join(parts)
 
 BTN_STYLE = dict(relief="flat", cursor="hand2", font=("Segoe UI", 9),
                  activeforeground=WHITE)
@@ -1703,6 +1766,10 @@ class LCUOverlay:
     def _refresh(self):
         phase = self._phase
         _dbg(f"refresh: phase={phase!r}")
+        if not self._app.cfg.get("overlayEnabled", True):
+            self._win.withdraw()
+            _dbg("refresh: withdraw (overlay disabled)")
+            return
         if phase not in ("Lobby", "Matchmaking", "ReadyCheck"):
             self._win.withdraw()
             _dbg("refresh: withdraw (bad phase)")
@@ -1984,6 +2051,9 @@ class App(tk.Tk):
         # Always-on-top overlay over the League client
         self._overlay = LCUOverlay(self)
 
+        # Global hotkey for overlay enable/disable toggle
+        threading.Thread(target=self._watch_overlay_hotkey, daemon=True).start()
+
         # Local REST API for Stream Deck / external triggers
         _api_port = self.cfg.get("localApiPort", 8778)
         if _api_port:
@@ -2201,7 +2271,7 @@ class App(tk.Tk):
         self._log_box.pack(fill="both", expand=True, padx=8, pady=8)
 
     def _build_settings(self, parent):
-        # Save button, anchored to the lower-right of the tab.
+        # Save button anchored to the lower-right of the tab.
         savebar = tk.Frame(parent, bg=DARK)
         savebar.pack(side="bottom", fill="x", padx=16, pady=(0, 12))
         tk.Button(savebar, text="💾  Save Config",
@@ -2222,111 +2292,262 @@ class App(tk.Tk):
                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>",
                     lambda e: canvas.itemconfigure(win, width=e.width))
-        # Mouse-wheel scrolling while the cursor is over the settings tab.
         def _wheel(e):
             canvas.yview_scroll(int(-e.delta / 120), "units")
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _wheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-        # Startup
-        startup = tk.Frame(body, bg=DARK)
-        startup.pack(padx=20, pady=(16, 0), anchor="nw", fill="x")
-        tk.Label(startup, text="Startup", bg=DARK, fg=GOLD,
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
-        self._startup_var = tk.BooleanVar(value=self._startup_enabled())
-        tk.Checkbutton(
-            startup, text="Launch at Windows startup (minimised to tray)",
-            variable=self._startup_var, bg=DARK, fg=TEXT, anchor="w",
-            activebackground=DARK, selectcolor=PANEL, font=("Segoe UI", 10),
-            command=lambda: self._set_startup(self._startup_var.get())
-        ).pack(anchor="w", padx=4, pady=1)
-        tk.Label(startup,
-                 text="Runs quietly in the tray and auto-connects when League opens",
-                 bg=DARK, fg="#555", font=("Segoe UI", 8)).pack(anchor="w", padx=4)
+        # Helper — thin separator line between sections.
+        def _sep():
+            tk.Frame(body, bg="#2e3338", height=1).pack(fill="x", padx=20, pady=(16, 0))
 
-        f = tk.Frame(body, bg=DARK)
-        f.pack(padx=20, pady=20, anchor="nw")
+        # Helper — section header + container frame.
+        def _section(title):
+            frm = tk.Frame(body, bg=DARK)
+            frm.pack(fill="x", padx=20, pady=(16, 0))
+            tk.Label(frm, text=title, bg=DARK, fg=GOLD,
+                     font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+            return frm
 
-        tk.Label(f, text="Timing  (seconds)", bg=DARK, fg=GOLD,
-                 font=("Segoe UI", 11, "bold")).grid(
-            row=0, column=0, columnspan=3, pady=(0, 10), sticky="w")
+        # Helper — labelled row (label left, widget right).
+        def _row(parent, label_text):
+            r = tk.Frame(parent, bg=DARK)
+            r.pack(anchor="w", padx=4, pady=(4, 0))
+            tk.Label(r, text=label_text, bg=DARK, fg=TEXT,
+                     font=("Segoe UI", 9)).pack(side="left")
+            return r
 
-        for i, (label, key, note, max_val) in enumerate([
-            ("Accept delay:",   "acceptDelay",
-             "Wait this long after a match is found before accepting",        60),
-            ("Pre-pick delay:", "prePickDelay",
-             "Wait this long into champion select before hovering your pre-pick", 60),
-            ("Pick delay:",     "pickDelay",
-             "Wait this long after your pick turn starts before locking in",  29),
-            ("Ban delay:",      "banDelay",
-             "Wait this long after your ban turn starts before banning",       8),
-        ]):
-            tk.Label(f, text=label, bg=DARK, fg=TEXT,
-                     font=("Segoe UI", 9)).grid(
-                row=i+1, column=0, sticky="w", pady=4)
+        # Helper — hint text below a control.
+        def _hint(parent, text):
+            tk.Label(parent, text=text, bg=DARK, fg="#555",
+                     font=("Segoe UI", 8)).pack(anchor="w", padx=4, pady=(2, 0))
 
-            # Config is stored in milliseconds; the UI works in seconds.
-            var = tk.DoubleVar(value=round(int(self.cfg.get(key, 1000)) / 1000, 1))
-            self._delay_vars[key] = var
+        # ── Overlay ───────────────────────────────────────────────────────────
+        s = _section("Overlay")
 
-            def _on_change(k=key, v=var, mx=max_val):
-                self.cfg[k] = int(round(min(v.get(), mx) * 1000))
-
-            tk.Spinbox(f, from_=0, to=max_val, increment=0.5, textvariable=var,
-                       width=8, bg=PANEL, fg=WHITE, relief="flat", format="%.1f",
-                       command=_on_change).grid(row=i+1, column=1, padx=10, sticky="w")
-
-            tk.Label(f, text=note, bg=DARK, fg="#555",
-                     font=("Segoe UI", 8)).grid(row=i+1, column=2, sticky="w")
-
-        # Party Ready-Up relay
-        tk.Label(f, text="Party Ready-Up", bg=DARK, fg=GOLD,
-                 font=("Segoe UI", 11, "bold")).grid(
-            row=5, column=0, pady=(24, 6), sticky="w")
-        self._ready_up_var = tk.BooleanVar(value=bool(self.cfg.get("readyUpEnabled", True)))
-        tk.Checkbutton(f, text="Enabled", variable=self._ready_up_var,
+        self._overlay_enabled_var = tk.BooleanVar(
+            value=bool(self.cfg.get("overlayEnabled", True)))
+        tk.Checkbutton(s, text="Show overlay on League client",
+                       variable=self._overlay_enabled_var,
                        bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
                        selectcolor=PANEL, font=("Segoe UI", 9),
-                       command=self._on_ready_up_toggle).grid(
-            row=5, column=1, sticky="w", padx=10)
-        tk.Button(f, text="Reset overlay position", bg=PANEL, fg=TEXT, relief="flat",
+                       command=lambda: (
+                           self.cfg.__setitem__(
+                               "overlayEnabled", self._overlay_enabled_var.get()),
+                           save_config(self.cfg),
+                       )).pack(anchor="w", padx=4, pady=1)
+
+        # Keybind capture widget.
+        kb_row = _row(s, "Toggle keybind:")
+
+        raw_key = str(self.cfg.get("overlayToggleKey") or "")
+        self._kb_btn = tk.Button(
+            kb_row,
+            text=f"  {_overlay_combo_label(raw_key)}  ",
+            bg=PANEL, fg=WHITE, relief="flat",
+            font=("Segoe UI", 9, "bold"), padx=8, pady=2, cursor="hand2")
+        self._kb_btn.pack(side="left", padx=(8, 0))
+
+        def _start_kb_capture():
+            self.focus_set()   # pull focus away from any text entry
+            self._kb_btn.config(text="  Press a key…  ", fg="#888888", state="disabled")
+            _tid = [None]
+
+            def _commit(combo):
+                if _tid[0]:
+                    self.after_cancel(_tid[0])
+                try:
+                    self.unbind("<KeyPress>")
+                except Exception:
+                    pass
+                self.cfg["overlayToggleKey"] = combo
+                save_config(self.cfg)
+                lbl = _overlay_combo_label(combo) if combo else "None"
+                self._kb_btn.config(text=f"  {lbl}  ", fg=WHITE, state="normal")
+
+            def _on_key(ev):
+                key = ev.keysym
+                if key in _OVERLAY_IGNORE_KEYS:
+                    return   # modifier-only press — keep waiting
+                # Plain Escape = clear the keybind
+                if key == "Escape" and not (ev.state & 0x4) and not (ev.state & 0x1):
+                    _commit("")
+                    return
+                # Build modifier prefix
+                mods = []
+                if ev.state & 0x4:      mods.append("Ctrl")
+                if ev.state & 0x1:      mods.append("Shift")
+                if ev.state & 0x20000:  mods.append("Alt")
+                # Normalise single-letter keysym to uppercase
+                if len(key) == 1:
+                    key2 = key.upper()
+                else:
+                    key2 = key
+                combo = "+".join(mods + [key2])
+                # Accept only if the key part resolves to a VK code
+                if _overlay_key_vk(key2):
+                    _commit(combo)
+                else:
+                    _commit(self.cfg.get("overlayToggleKey") or "")  # restore
+
+            self.bind("<KeyPress>", _on_key)
+            _tid[0] = self.after(5000, lambda: _commit(
+                self.cfg.get("overlayToggleKey") or ""))   # 5 s timeout
+
+        self._kb_btn.config(command=_start_kb_capture)
+
+        # Hover tooltip on the keybind button.
+        _kbt = [None]
+        def _kbt_show(e):
+            x = self._kb_btn.winfo_rootx()
+            y = self._kb_btn.winfo_rooty() + self._kb_btn.winfo_height() + 4
+            w = tk.Toplevel(self._kb_btn)
+            w.wm_overrideredirect(True)
+            w.wm_geometry(f"+{x}+{y}")
+            tk.Label(w,
+                     text="Click, then press any key:\n"
+                          "  A–Z  ·  0–9  ·  F1–F12\n"
+                          "  Home  ·  End  ·  Insert  ·  Delete  ·  PgUp  ·  PgDn\n\n"
+                          "Hold Ctrl, Alt, or Shift for combos (e.g. Ctrl+K)\n"
+                          "Press Esc to clear the keybind",
+                     bg="#2a2f35", fg=TEXT, font=("Segoe UI", 9),
+                     padx=10, pady=8, justify="left",
+                     relief="solid", borderwidth=1).pack()
+            _kbt[0] = w
+        def _kbt_hide(e):
+            if _kbt[0]:
+                _kbt[0].destroy()
+                _kbt[0] = None
+        self._kb_btn.bind("<Enter>", _kbt_show)
+        self._kb_btn.bind("<Leave>", _kbt_hide)
+
+        tk.Button(s, text="Reset overlay position", bg=PANEL, fg=TEXT, relief="flat",
                   font=("Segoe UI", 9), padx=8, pady=2, cursor="hand2",
-                  command=self._reset_overlay_pos).grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        tk.Label(f, text="Relay URL:", bg=DARK, fg=TEXT,
-                 font=("Segoe UI", 9)).grid(row=7, column=0, sticky="w", pady=4)
+                  command=self._reset_overlay_pos).pack(anchor="w", padx=4, pady=(8, 0))
+
+        # ── Party Ready-Up ────────────────────────────────────────────────────
+        _sep()
+        s = _section("Party Ready-Up")
+
+        self._ready_up_var = tk.BooleanVar(
+            value=bool(self.cfg.get("readyUpEnabled", True)))
+        tk.Checkbutton(s, text="Enabled",
+                       variable=self._ready_up_var,
+                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
+                       selectcolor=PANEL, font=("Segoe UI", 9),
+                       command=self._on_ready_up_toggle).pack(
+            anchor="w", padx=4, pady=1)
+
+        relay_row = _row(s, "Relay URL:")
         self._relay_var = tk.StringVar(value=str(self.cfg.get("relayUrl", "") or ""))
-        # Apply live as typed so Ready Up works immediately…
         self._relay_var.trace_add(
             "write",
             lambda *a: self.cfg.__setitem__("relayUrl", self._relay_var.get().strip()))
-        relay_entry = tk.Entry(f, textvariable=self._relay_var, width=34, bg=PANEL,
-                               fg=WHITE, relief="flat", insertbackground=WHITE)
-        relay_entry.grid(row=7, column=1, padx=10, sticky="w")
+        relay_entry = tk.Entry(relay_row, textvariable=self._relay_var, width=36,
+                               bg=PANEL, fg=WHITE, relief="flat", insertbackground=WHITE)
+        relay_entry.pack(side="left", padx=(8, 0))
 
-        # …and persist to disk when you finish editing (click away or press Enter).
         def _persist_relay(*_):
             self.cfg["relayUrl"] = self._relay_var.get().strip()
             save_config(self.cfg)
             self.log("Relay URL saved.")
         relay_entry.bind("<FocusOut>", _persist_relay)
         relay_entry.bind("<Return>",  _persist_relay)
-        tk.Label(f, text="e.g. http://your-server-ip:8777  (same for everyone in the party)",
-                 bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
-            row=8, column=1, columnspan=2, padx=10, sticky="w")
+        _hint(s, "e.g. http://your-server-ip:8777  (same for everyone in the party)")
 
-        # Stream Deck / Local API
-        tk.Label(f, text="Stream Deck API", bg=DARK, fg=GOLD,
-                 font=("Segoe UI", 11, "bold")).grid(
-            row=9, column=0, columnspan=3, pady=(24, 6), sticky="w")
-        tk.Label(f, text="Port:", bg=DARK, fg=TEXT,
-                 font=("Segoe UI", 9)).grid(row=10, column=0, sticky="w", pady=4)
+        # ── Auto-Accept Invites ───────────────────────────────────────────────
+        _sep()
+        s = _section("Auto-Accept Invites")
+
+        self._invite_var = tk.BooleanVar(
+            value=bool(self.cfg.get("autoAcceptInvites", False)))
+        tk.Checkbutton(s, text="Accept lobby invites from friends",
+                       variable=self._invite_var,
+                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
+                       selectcolor=PANEL, font=("Segoe UI", 9),
+                       command=lambda: self.cfg.__setitem__(
+                           "autoAcceptInvites", self._invite_var.get())).pack(
+            anchor="w", padx=4, pady=1)
+
+        wl_row = _row(s, "Friends only:")
+        whitelist_str = ", ".join(self.cfg.get("inviteWhitelist", []))
+        self._invite_whitelist_var = tk.StringVar(value=whitelist_str)
+        wl_entry = tk.Entry(wl_row, textvariable=self._invite_whitelist_var, width=36,
+                            bg=PANEL, fg=WHITE, relief="flat", insertbackground=WHITE)
+        wl_entry.pack(side="left", padx=(8, 0))
+
+        def _persist_whitelist(*_):
+            raw = self._invite_whitelist_var.get()
+            self.cfg["inviteWhitelist"] = [n.strip() for n in raw.split(",")
+                                           if n.strip()]
+            save_config(self.cfg)
+        wl_entry.bind("<FocusOut>", _persist_whitelist)
+        wl_entry.bind("<Return>",   _persist_whitelist)
+        _hint(s, "Comma-separated  ·  leave blank to accept from any friend")
+
+        # Tooltip on the whitelist entry showing the name#tag format.
+        _tip = [None]
+        def _tip_show(e):
+            x = wl_entry.winfo_rootx()
+            y = wl_entry.winfo_rooty() + wl_entry.winfo_height() + 4
+            w = tk.Toplevel(wl_entry)
+            w.wm_overrideredirect(True)
+            w.wm_geometry(f"+{x}+{y}")
+            tk.Label(w,
+                     text="Format: SummonerName#TagLine\n"
+                          "e.g.  CoolPlayer#NA1, FriendName#EUW",
+                     bg="#2a2f35", fg=TEXT, font=("Segoe UI", 8),
+                     padx=8, pady=5, justify="left",
+                     relief="solid", borderwidth=1).pack()
+            _tip[0] = w
+        def _tip_hide(e):
+            if _tip[0]:
+                _tip[0].destroy()
+                _tip[0] = None
+        wl_entry.bind("<Enter>", _tip_show)
+        wl_entry.bind("<Leave>", _tip_hide)
+
+        # ── Timings ───────────────────────────────────────────────────────────
+        _sep()
+        s = _section("Timings  (seconds)")
+
+        g = tk.Frame(s, bg=DARK)
+        g.pack(anchor="nw", padx=4)
+        for i, (label, key, note, max_val) in enumerate([
+            ("Accept delay:",   "acceptDelay",
+             "Wait before auto-accepting a found match",               60),
+            ("Pre-pick delay:", "prePickDelay",
+             "Wait into champ select before hovering your pre-pick",   60),
+            ("Pick delay:",     "pickDelay",
+             "Wait after your pick turn starts before locking in",     29),
+            ("Ban delay:",      "banDelay",
+             "Wait after your ban turn starts before banning",          8),
+        ]):
+            tk.Label(g, text=label, bg=DARK, fg=TEXT,
+                     font=("Segoe UI", 9)).grid(row=i, column=0, sticky="w", pady=4)
+            var = tk.DoubleVar(value=round(int(self.cfg.get(key, 1000)) / 1000, 1))
+            self._delay_vars[key] = var
+
+            def _on_change(k=key, v=var, mx=max_val):
+                self.cfg[k] = int(round(min(v.get(), mx) * 1000))
+
+            tk.Spinbox(g, from_=0, to=max_val, increment=0.5, textvariable=var,
+                       width=8, bg=PANEL, fg=WHITE, relief="flat", format="%.1f",
+                       command=_on_change).grid(row=i, column=1, padx=(12, 16), sticky="w")
+            tk.Label(g, text=note, bg=DARK, fg="#555",
+                     font=("Segoe UI", 8)).grid(row=i, column=2, sticky="w")
+
+        # ── Stream Deck API ───────────────────────────────────────────────────
+        _sep()
+        s = _section("Stream Deck API")
+
+        api_row = _row(s, "Port:")
         self._api_port_var = tk.StringVar(
             value=str(self.cfg.get("localApiPort", 8778)))
-        api_port_entry = tk.Entry(
-            f, textvariable=self._api_port_var, width=8, bg=PANEL,
-            fg=WHITE, relief="flat", insertbackground=WHITE)
-        api_port_entry.grid(row=10, column=1, padx=10, sticky="w")
+        api_port_entry = tk.Entry(api_row, textvariable=self._api_port_var, width=8,
+                                  bg=PANEL, fg=WHITE, relief="flat",
+                                  insertbackground=WHITE)
+        api_port_entry.pack(side="left", padx=(8, 0))
 
         def _persist_api_port(*_):
             try:
@@ -2339,58 +2560,38 @@ class App(tk.Tk):
         api_port_entry.bind("<FocusOut>", _persist_api_port)
         api_port_entry.bind("<Return>",   _persist_api_port)
         _api_port_now = self.cfg.get("localApiPort", 8778)
-        tk.Label(f,
-                 text=(f"GET http://127.0.0.1:{_api_port_now}/ready-up  "
-                       f"·  /accept  ·  /status  ·  0 = disabled"),
-                 bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
-            row=10, column=1, columnspan=2, padx=(90, 0), sticky="w")
+        _hint(s, (f"GET http://127.0.0.1:{_api_port_now}/ready-up"
+                  f"  ·  /accept  ·  /status  ·  0 = disabled"))
 
-        # Auto-Accept Invites
-        tk.Label(f, text="Auto-Accept Invites", bg=DARK, fg=GOLD,
-                 font=("Segoe UI", 11, "bold")).grid(
-            row=11, column=0, columnspan=3, pady=(24, 6), sticky="w")
-        self._invite_var = tk.BooleanVar(
-            value=bool(self.cfg.get("autoAcceptInvites", False)))
-        tk.Checkbutton(f, text="Enabled  (accepts lobby invites from friends)",
-                       variable=self._invite_var,
-                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
-                       selectcolor=PANEL, font=("Segoe UI", 9),
-                       command=lambda: self.cfg.__setitem__(
-                           "autoAcceptInvites", self._invite_var.get())).grid(
-            row=12, column=0, columnspan=3, sticky="w", padx=4)
-        tk.Label(f, text="Friends only:", bg=DARK, fg=TEXT,
-                 font=("Segoe UI", 9)).grid(row=13, column=0, sticky="w", pady=4)
-        whitelist_str = ", ".join(self.cfg.get("inviteWhitelist", []))
-        self._invite_whitelist_var = tk.StringVar(value=whitelist_str)
-        wl_entry = tk.Entry(f, textvariable=self._invite_whitelist_var, width=34,
-                            bg=PANEL, fg=WHITE, relief="flat", insertbackground=WHITE)
-        wl_entry.grid(row=13, column=1, padx=10, sticky="w")
-        def _persist_whitelist(*_):
-            raw = self._invite_whitelist_var.get()
-            self.cfg["inviteWhitelist"] = [n.strip() for n in raw.split(",")
-                                           if n.strip()]
-            save_config(self.cfg)
-        wl_entry.bind("<FocusOut>", _persist_whitelist)
-        wl_entry.bind("<Return>",   _persist_whitelist)
-        tk.Label(f, text="Comma-separated names — leave blank to accept from any friend",
-                 bg=DARK, fg="#555", font=("Segoe UI", 8)).grid(
-            row=13, column=2, padx=4, sticky="w")
+        # ── Startup ───────────────────────────────────────────────────────────
+        _sep()
+        s = _section("Startup")
 
-        # Updates
-        tk.Label(f, text="Updates", bg=DARK, fg=GOLD,
-                 font=("Segoe UI", 11, "bold")).grid(
-            row=14, column=0, columnspan=3, pady=(24, 6), sticky="w")
-        tk.Button(f, text="Check for Updates", bg=PANEL, fg=WHITE, relief="flat",
-                  font=("Segoe UI", 9), padx=12, pady=4,
-                  command=self._manual_update_check).grid(
-            row=15, column=0, sticky="w", pady=2)
-        tk.Label(f, text=f"Current version: v{APP_VERSION}", bg=DARK, fg="#555",
-                 font=("Segoe UI", 8)).grid(row=15, column=1, columnspan=2,
-                                            padx=10, sticky="w")
+        self._startup_var = tk.BooleanVar(value=self._startup_enabled())
+        tk.Checkbutton(
+            s, text="Launch at Windows startup (minimised to tray)",
+            variable=self._startup_var, bg=DARK, fg=TEXT, anchor="w",
+            activebackground=DARK, selectcolor=PANEL, font=("Segoe UI", 9),
+            command=lambda: self._set_startup(self._startup_var.get())
+        ).pack(anchor="w", padx=4, pady=1)
+        _hint(s, "Runs quietly in the tray and auto-connects when League opens")
 
-        # Warning box
-        warn = tk.Frame(f, bg="#2a1a1a", padx=12, pady=10)
-        warn.grid(row=16, column=0, columnspan=3, sticky="ew", pady=(24, 0))
+        # ── Updates ───────────────────────────────────────────────────────────
+        _sep()
+        s = _section("Updates")
+
+        upd_row = tk.Frame(s, bg=DARK)
+        upd_row.pack(anchor="w", padx=4)
+        tk.Button(upd_row, text="Check for Updates", bg=PANEL, fg=WHITE,
+                  relief="flat", font=("Segoe UI", 9), padx=12, pady=4,
+                  command=self._manual_update_check).pack(side="left")
+        tk.Label(upd_row, text=f"Current version:  v{APP_VERSION}",
+                 bg=DARK, fg="#555",
+                 font=("Segoe UI", 8)).pack(side="left", padx=(12, 0))
+
+        # ── ToS Warning ───────────────────────────────────────────────────────
+        warn = tk.Frame(body, bg="#2a1a1a", padx=12, pady=10)
+        warn.pack(fill="x", padx=20, pady=(24, 16))
         tk.Label(warn, text="⚠  Terms of Service Warning", bg="#2a1a1a",
                  fg=RED, font=("Segoe UI", 9, "bold")).pack(anchor="w")
         tk.Label(warn,
@@ -2699,6 +2900,32 @@ class App(tk.Tk):
             self._overlay._rel_y = None
         self.log("Overlay position reset — it will re-centre next time the client is detected.")
 
+    def _toggle_overlay_enabled(self):
+        new_val = not self.cfg.get("overlayEnabled", True)
+        self.cfg["overlayEnabled"] = new_val
+        save_config(self.cfg)
+        if hasattr(self, "_overlay_enabled_var"):
+            self._overlay_enabled_var.set(new_val)
+        self.log(f"Overlay {'enabled' if new_val else 'disabled'} (hotkey).")
+
+    def _watch_overlay_hotkey(self):
+        """Background thread: polls GetAsyncKeyState for the overlay toggle keybind."""
+        was_down = False
+        while True:
+            combo = (self.cfg.get("overlayToggleKey") or "").strip()
+            mod_vks, key_vk = _overlay_parse_combo(combo) if combo else ([], 0)
+            if key_vk:
+                gaks = ctypes.windll.user32.GetAsyncKeyState
+                key_down  = bool(gaks(key_vk) & 0x8000)
+                mods_down = all(bool(gaks(m) & 0x8000) for m in mod_vks)
+                is_down   = key_down and mods_down
+                if is_down and not was_down:
+                    self.after(0, self._toggle_overlay_enabled)
+                was_down = is_down
+            else:
+                was_down = False
+            time.sleep(0.05)
+
     def _on_ready_up_toggle(self):
         enabled = self._ready_up_var.get()
         self.cfg["readyUpEnabled"] = enabled
@@ -2791,6 +3018,10 @@ class App(tk.Tk):
             self.cfg[k] = int(round(v.get() * 1000))   # seconds (UI) → ms (config)
         for k, v in self._bool_vars.items():
             self.cfg[k] = v.get()
+        if hasattr(self, "_overlay_enabled_var"):
+            self.cfg["overlayEnabled"] = self._overlay_enabled_var.get()
+        if hasattr(self, "_ready_up_var"):
+            self.cfg["readyUpEnabled"] = self._ready_up_var.get()
         if hasattr(self, "_relay_var"):
             self.cfg["relayUrl"] = self._relay_var.get().strip()
         if hasattr(self, "_invite_var"):

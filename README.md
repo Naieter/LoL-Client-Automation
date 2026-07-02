@@ -29,11 +29,18 @@ Coordinate queue with your party — everyone marks themselves ready in the tool
 
 - Shows a **floating overlay button** over the League client (draggable, always-on-top)
   - **Red** = not ready, **Green** = ready — click to toggle
-  - Displays `Ready Up [X/Y]` (tool users ready / tool users present)
-  - Switches to **ACCEPT** during a ready check
-  - Stays visible through matchmaking so you can unready
-  - Hides when you switch to another app
-- The Ready Up button and overlay can be **enabled/disabled** in Settings
+  - Displays `READY UP [X/Y]` (tool users ready / tool users present)
+  - Shows a small **ping button** when solo in a lobby or when no other party members have the tool
+  - Hides automatically during a ready check, when not in a lobby, or when you switch to another app
+- Ready state **auto-clears** when a match is declined or missed, or when all other tool users leave
+- The overlay can be **toggled on/off** from Settings, or via a configurable keybind (any key, with optional Ctrl/Alt/Shift modifier)
+
+### Auto-Accept Invites
+Automatically accepts lobby invites from friends.
+
+- Optionally restrict to a whitelist of specific summoners (`SummonerName#TagLine` format, comma-separated)
+- Sends `"Invite auto-accepted"` in party chat after joining
+- Leave the whitelist blank to accept from any friend
 
 ### Stream Deck Integration
 A local REST API lets a Stream Deck (or any HTTP client) trigger actions:
@@ -44,22 +51,22 @@ A local REST API lets a Stream Deck (or any HTTP client) trigger actions:
 | `GET /accept` | Accept a ready check |
 | `GET /status` | JSON: current phase, ready state, party counts |
 
-Enable it in **Settings → Stream Deck API** by entering a port (e.g. `8778`). Disabled by default. Requires restart after changing the port.
+Enable it in **Settings → Stream Deck API** by entering a port (e.g. `8778`). Set to `0` to disable. Requires restart after changing the port.
 
 **Stream Deck setup:** add a "Website" button pointed at `http://127.0.0.1:8778/ready-up`.
 
 ### Other
-- **Ping display** — live latency to Riot's regional servers, shown under Ready Up
+- **Ping display** — live latency to Riot's regional servers, shown under the overlay button
 - **Auto-update** — checks GitHub for new releases on launch and prompts to update
-- **System tray** — minimizes to tray; launches hidden when added to Windows startup
-- **Ultimate Bravery** — rolls a random champion for champion select
+- **System tray** — minimizes to tray; can launch hidden at Windows startup
+- **Ultimate Bravery** — rolls a random available champion during champion select
 
 ---
 
 ## Client Tool Setup
 
 1. Download **`LOL_Client_Tool.exe`** from [Releases](https://github.com/Naieter/LoL-Client-Automation/releases/latest)
-2. Run it — it connects to the League client automatically when you open League
+2. Run it — it connects to the League client automatically when League opens
 3. Go to each role tab (Top, Jungle, Mid, ADC, Support) and add your champion priorities
 4. Automations are on by default — toggle them in **Settings**
 
@@ -73,7 +80,7 @@ Champions in the perma-ban list are always banned first, before role-specific ba
 
 ### Configuring Delays
 
-All delays are in **Settings → Timing**. Setting a delay of `0` acts immediately. The default is 3 seconds before lock/ban to avoid being obvious.
+All delays are in **Settings → Timings**. Setting a delay of `0` acts immediately. The default is 3 seconds before lock/ban.
 
 ---
 
@@ -113,20 +120,42 @@ The overlay button over the League client shows the current state and lets you t
 
 ## Settings Reference
 
+### Overlay
 | Setting | Default | Description |
 |---|---|---|
-| Auto Accept | On | Accepts ready checks |
-| Accept Delay | 0s | Wait before accepting |
-| Auto Pick | On | Locks your champion |
-| Pick Delay | 3s | Wait before locking |
-| Auto Pre-Pick | On | Hovers during planning |
-| Pre-Pick Delay | 0.5s | Wait before hovering |
-| Auto Ban | On | Bans your champion |
-| Ban Delay | 3s | Wait before banning |
-| Auto Runes | On | Imports meta runes + spells |
-| Party Ready-Up | On | Enable relay coordination |
-| Relay URL | — | URL of the relay server |
-| Stream Deck API Port | 0 (off) | Local REST API port |
+| Show overlay | On | Show the floating overlay button over the League client |
+| Toggle keybind | None | Global key (or combo) to toggle the overlay on/off |
+| Reset overlay position | — | Move the overlay back to its default position |
+
+### Party Ready-Up
+| Setting | Default | Description |
+|---|---|---|
+| Enabled | On | Enable relay-based party coordination |
+| Relay URL | — | URL of the relay server (e.g. `http://192.168.1.50:8777`) |
+
+### Auto-Accept Invites
+| Setting | Default | Description |
+|---|---|---|
+| Accept lobby invites | Off | Auto-accept invites from friends |
+| Friends only | — | Comma-separated `Name#Tag` list; blank = any friend |
+
+### Timings
+| Setting | Default | Description |
+|---|---|---|
+| Accept delay | 0s | Wait before accepting a ready check |
+| Pre-pick delay | 0.5s | Wait into champ select before hovering pre-pick |
+| Pick delay | 3s | Wait after your pick turn starts before locking in |
+| Ban delay | 3s | Wait after your ban turn starts before banning |
+
+### Stream Deck API
+| Setting | Default | Description |
+|---|---|---|
+| Port | 0 (off) | Local REST API port; `0` = disabled |
+
+### Startup
+| Setting | Default | Description |
+|---|---|---|
+| Launch at Windows startup | Off | Start hidden in the system tray when Windows starts |
 
 ---
 
