@@ -19,7 +19,7 @@ log(f"Working dir: {here}")
 log("Installing dependencies...")
 subprocess.check_call([sys.executable, "-m", "pip", "install",
                        "pyinstaller", "requests", "psutil", "urllib3",
-                       "pystray", "Pillow", "-q"])
+                       "pystray", "Pillow", "pygame", "-q"])
 log("Dependencies installed.")
 
 os.makedirs(tmp, exist_ok=True)
@@ -36,6 +36,8 @@ subprocess.check_call([
     "--specpath", tmp,
     "--hidden-import", "pystray._win32",
     "--hidden-import", "PIL",
+    "--hidden-import", "pygame",
+    "--hidden-import", "pygame.mixer",
     os.path.join(here, "lol_tool.py"),
 ])
 

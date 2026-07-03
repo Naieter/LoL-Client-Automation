@@ -51,14 +51,46 @@ def _dbg(*args):
         pass
 
 
+_mixer_ready = False
+_mixer_lock  = threading.Lock()
+
+def _play_sound(path: str, volume: float = 1.0):
+    def _do():
+        global _mixer_ready
+        try:
+            import pygame.mixer
+            with _mixer_lock:
+                if not _mixer_ready:
+                    pygame.mixer.pre_init(44100, -16, 2, 2048)
+                    pygame.mixer.init()
+                    _mixer_ready = True
+            snd = pygame.mixer.Sound(path)
+            snd.set_volume(max(0.0, min(1.0, volume)))
+            snd.play()
+            time.sleep(snd.get_length() + 0.2)
+        except Exception as exc:
+            _dbg(f"_play_sound: {exc}")
+    threading.Thread(target=_do, daemon=True).start()
+
+def _delayed_play(path: str, cancel: threading.Event,
+                  delay: float = 30.0, volume: float = 1.0):
+    """Play `path` after `delay` seconds unless `cancel` is set first."""
+    def _do():
+        if cancel.wait(timeout=delay):
+            return   # cancelled before timeout
+        _play_sound(path, volume)
+    threading.Thread(target=_do, daemon=True).start()
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.9.5"
+APP_VERSION = "1.9.6"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE    = CONFIG_DIR / "lol_tool.log"
-DDRAGON_URL = "https://ddragon.leagueoflegends.com"
+DDRAGON_URL  = "https://ddragon.leagueoflegends.com"
+READY_SOUND  = r"C:\Users\naiet\Downloads\Neeko_Original_R_0.ogg"
 
 # LCU assignedPosition values
 ROLES = ["top", "jungle", "middle", "bottom", "utility"]
@@ -457,6 +489,8 @@ class AutoEngine:
         self._invite_seen:      dict  = {}      # invitationId → monotonic time first seen
         self._friends_cache:    set   = set()   # cached set of friend summoner IDs
         self._friends_ts:       float = 0.0     # monotonic time of last friends fetch
+        self._others_ready_notified: bool = False
+        self._sound_cancel: threading.Event = threading.Event()
 
     def start(self):
         self._stop.clear()
@@ -499,10 +533,12 @@ class AutoEngine:
                 if self._on_phase:
                     self._on_phase(idle)
                 if prev_phase in ("Lobby", "Matchmaking") and idle not in ("Lobby", "Matchmaking", "ReadyCheck"):
-                    self._party_size       = 0
-                    self._present_count    = 0
-                    self._ready_count      = 0
-                    self._size_none_streak = 0
+                    self._party_size             = 0
+                    self._present_count          = 0
+                    self._ready_count            = 0
+                    self._size_none_streak       = 0
+                    self._others_ready_notified  = False
+                    self._sound_cancel.set()
                     self._accepted_invites.clear()
                     self._invite_seen.clear()
             return
@@ -547,8 +583,10 @@ class AutoEngine:
             # Leaving lobby/matchmaking: immediately clear stale party_size so
             # the overlay doesn't linger while no lobby is active.
             if prev_phase in ("Lobby", "Matchmaking") and phase not in ("Lobby", "Matchmaking", "ReadyCheck"):
-                self._party_size       = 0
-                self._size_none_streak = 0
+                self._party_size            = 0
+                self._size_none_streak      = 0
+                self._others_ready_notified = False
+                self._sound_cancel.set()
                 self._accepted_invites.clear()
                 self._invite_seen.clear()
 
@@ -1157,6 +1195,20 @@ class AutoEngine:
 
             self._ready_count   = ready_count
             self._present_count = present_count
+
+            # Sound: play once when all OTHER tool users in the party are ready.
+            others_present   = present_count - 1
+            others_ready_cnt = ready_count - (1 if self._i_am_ready else 0)
+            all_others_ready = others_present > 0 and others_ready_cnt == others_present
+            if all_others_ready and not self._others_ready_notified:
+                self._others_ready_notified = True
+                if cfg.get("neekoSoundEnabled", True):
+                    vol = max(0, min(100, int(cfg.get("neekoSoundVolume", 80)))) / 100.0
+                    self._sound_cancel.clear()
+                    _delayed_play(READY_SOUND, self._sound_cancel, delay=30.0, volume=vol)
+            elif not all_others_ready:
+                self._others_ready_notified = False
+                self._sound_cancel.set()
 
             # If the user drops to being the only tool user (or solo), clear
             # their ready state so it doesn't silently persist into the next
@@ -2735,6 +2787,50 @@ class App(tk.Tk):
                  bg=DARK, fg="#555",
                  font=("Segoe UI", 8)).pack(side="left", padx=(12, 0))
 
+        # ── Audio ─────────────────────────────────────────────────────────────────
+        _sep()
+        s = _section("Audio")
+
+        self._neeko_sound_var = tk.BooleanVar(
+            value=bool(self.cfg.get("neekoSoundEnabled", True)))
+        tk.Checkbutton(s, text="Neeko's friendly ready up reminder",
+                       variable=self._neeko_sound_var,
+                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
+                       selectcolor=PANEL, font=("Segoe UI", 9),
+                       command=lambda: (
+                           self.cfg.__setitem__("neekoSoundEnabled",
+                                                self._neeko_sound_var.get()),
+                           save_config(self.cfg),
+                       )).pack(anchor="w", padx=4, pady=1)
+        _hint(s, "Plays after 30 s when all other tool users in your party are ready")
+
+        vol_row = _row(s, "Volume:")
+        self._neeko_vol_var = tk.IntVar(
+            value=int(self.cfg.get("neekoSoundVolume", 80)))
+        pct_str = tk.StringVar(value=f"{self._neeko_vol_var.get()}%")
+
+        def _on_vol_change(v):
+            val = int(float(v))
+            pct_str.set(f"{val}%")
+            self.cfg["neekoSoundVolume"] = val
+            save_config(self.cfg)
+
+        tk.Scale(vol_row, from_=0, to=100, orient="horizontal",
+                 variable=self._neeko_vol_var, length=160,
+                 bg=DARK, fg=TEXT, highlightthickness=0, sliderrelief="flat",
+                 troughcolor=PANEL, activebackground=GOLD, showvalue=False,
+                 command=_on_vol_change).pack(side="left", padx=(8, 0))
+        tk.Label(vol_row, textvariable=pct_str, bg=DARK, fg=TEXT,
+                 font=("Segoe UI", 9), width=4, anchor="w").pack(
+            side="left", padx=(6, 0))
+        tk.Button(vol_row, text="🔊", bg=PANEL, fg=TEXT,
+                  relief="flat", cursor="hand2", padx=6, pady=1,
+                  font=("Segoe UI", 10),
+                  command=lambda: _play_sound(
+                      READY_SOUND,
+                      max(0, min(100, self._neeko_vol_var.get())) / 100.0,
+                  )).pack(side="left", padx=(8, 0))
+
         # ── ToS Warning ───────────────────────────────────────────────────────
         warn = tk.Frame(body, bg="#2a1a1a", padx=12, pady=10)
         warn.pack(fill="x", padx=20, pady=(24, 16))
@@ -3176,6 +3272,10 @@ class App(tk.Tk):
             raw = self._invite_whitelist_var.get()
             self.cfg["inviteWhitelist"] = [n.strip() for n in raw.split(",")
                                            if n.strip()]
+        if hasattr(self, "_neeko_sound_var"):
+            self.cfg["neekoSoundEnabled"] = self._neeko_sound_var.get()
+        if hasattr(self, "_neeko_vol_var"):
+            self.cfg["neekoSoundVolume"] = self._neeko_vol_var.get()
         save_config(self.cfg)
         self.log("Config saved.")
 
