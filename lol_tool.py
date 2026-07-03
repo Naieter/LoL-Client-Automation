@@ -53,7 +53,7 @@ def _dbg(*args):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.9.4"
+APP_VERSION = "1.9.5"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -439,6 +439,7 @@ class AutoEngine:
         self._user_pick:     dict = {}   # aid → championId the USER manually hovered
         self._pick_rejected: dict = {}   # aid → champs that became banned/taken
         self._ban_hovered:   dict = {}   # aid → championId hovered for ban (two-phase)
+        self._ally_ban_hover: dict = {}  # cell_id → (championId, monotonic_time) ally hovering for ban
         self._runes_key      = None      # (champ_id, role) of last runes import
         self._last_role      = None      # assignedPosition seen last poll (detect swaps)
         self._queue_started     = False  # leader already started queue this lobby
@@ -525,6 +526,7 @@ class AutoEngine:
                 self._user_pick.clear()
                 self._pick_rejected.clear()
                 self._ban_hovered.clear()
+                self._ally_ban_hover.clear()
                 self._runes_key      = None
                 self._last_role      = None
                 self._last_state_key = None   # force [tick] on first poll
@@ -705,6 +707,29 @@ class AutoEngine:
             self._log(f"[tick] {_states}  bans={sorted(bans)}  t={time_left}ms inf={is_infinite}")
             self._last_state_key = _key
 
+        # ── track ally ban hovers so we can skip our target if they've had it for 2 s ──
+        _now = time.monotonic()
+        for _grp in session.get("actions", []):
+            for _act in _grp:
+                if str(_act.get("actorCellId", "")) == my_cell:
+                    continue
+                if _act.get("type") != "ban" or not _act.get("isInProgress") or _act.get("completed"):
+                    continue
+                _actor = str(_act.get("actorCellId", ""))
+                _cid   = int(_act.get("championId", 0) or 0)
+                if _cid:
+                    prev = self._ally_ban_hover.get(_actor)
+                    if not prev or prev[0] != _cid:
+                        self._ally_ban_hover[_actor] = (_cid, _now)
+                else:
+                    self._ally_ban_hover.pop(_actor, None)
+
+        # Champions an ally has been hovering for 2+ seconds — treat as taken for bans.
+        ally_banning: set = {
+            cid for (_cid, _t) in self._ally_ban_hover.values()
+            for cid in [_cid] if _now - _t >= 2.0
+        }
+
         # ── action loop (mirrors reference foreach actions → foreach team) ──
         for action_group in session.get("actions", []):
             for action in action_group:
@@ -785,8 +810,14 @@ class AutoEngine:
                     if aid not in self._action_start:
                         self._action_start[aid] = time.monotonic()
                     # Permabans are never blocked by pick_intents — only by bans already placed.
+                    # Ally_banning skips any champion an ally has been hovering for 2+ s.
                     perma_set = {int(c) for c in cfg.get("permaBans", [])}
-                    champ = self._best(ban_prio, bans | (pick_intents - perma_set), set(range(1_000_000)))
+                    champ = self._best(ban_prio, bans | (pick_intents - perma_set) | ally_banning, set(range(1_000_000)))
+                    # If we were already hovering a champion that an ally just claimed, log and reset.
+                    prev_hover = self._ban_hovered.get(aid)
+                    if prev_hover and prev_hover in ally_banning and prev_hover != champ:
+                        self._log(f"Ally hovering #{prev_hover} for ban — switching to #{champ}.")
+                        self._ban_hovered[aid] = None
                     if not champ:
                         self._log(f"No valid ban for {ROLE_LABEL.get(role_key, role_key)}. Add champions to the ban list!")
                     elif self._ban_hovered.get(aid) != champ:
@@ -1889,18 +1920,25 @@ class LCUOverlay:
             _dbg("refresh: withdraw (no hwnd or iconic)")
             return
 
-        # Hide when the user is in a different app — only show while the
-        # League client (or the overlay button itself) is the active window.
-        fg     = ctypes.windll.user32.GetForegroundWindow()
-        fg_pid = ctypes.wintypes.DWORD()
-        ctypes.windll.user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
-        lc_pid = ctypes.wintypes.DWORD()
-        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(lc_pid))
+        # Hide if another app's window is covering the centre of the League client.
+        # This lets the overlay stay visible when League is on a second monitor or
+        # beside a smaller window, while hiding it when League is behind a full-screen
+        # or large foreground window.
+        user32       = ctypes.windll.user32
+        fg           = user32.GetForegroundWindow()
         overlay_hwnd = self._win.winfo_id()
-        if fg_pid.value != lc_pid.value and fg != overlay_hwnd:
-            self._win.withdraw()
-            _dbg(f"refresh: withdraw (fg mismatch fg_pid={fg_pid.value} lc_pid={lc_pid.value})")
-            return
+        if fg and fg != hwnd and fg != overlay_hwnd:
+            lc_rect = ctypes.wintypes.RECT()
+            fg_rect = ctypes.wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(lc_rect))
+            user32.GetWindowRect(fg,   ctypes.byref(fg_rect))
+            lc_cx = (lc_rect.left + lc_rect.right)  // 2
+            lc_cy = (lc_rect.top  + lc_rect.bottom) // 2
+            if (fg_rect.left <= lc_cx <= fg_rect.right and
+                    fg_rect.top <= lc_cy <= fg_rect.bottom):
+                self._win.withdraw()
+                _dbg("refresh: withdraw (fg window covering league centre)")
+                return
 
         relay_on   = bool(getattr(self._app, "_relay_connected", False))
         ready_up   = bool(self._app.cfg.get("readyUpEnabled", True))
