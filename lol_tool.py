@@ -84,7 +84,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.9.9"
+APP_VERSION = "1.10.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -450,6 +450,71 @@ class LCU:
         )
 
 
+# ── TFT "attack click on left click" override ───────────────────────────────
+# Verified against a real install: the setting lives at
+#   game.cfg:               [General] section, line "EnableLeftMouseButtonAttackMove=0/1"
+#   PersistedSettings.json: files[name="Game.cfg"].sections[name="General"]
+#                           .settings[name="EnableLeftMouseButtonAttackMove"].value
+# Both are patched together so the change survives whichever file the client
+# actually reads at game launch.
+_TFT_SETTING = "EnableLeftMouseButtonAttackMove"
+
+def _league_config_dir():
+    """<League install dir>/Config, located via the running LeagueClientUx.exe."""
+    for proc in psutil.process_iter(["name", "exe"]):
+        try:
+            if proc.info["name"] and "LeagueClientUx" in proc.info["name"]:
+                cfg_dir = Path(proc.info["exe"]).parent / "Config"
+                if cfg_dir.is_dir():
+                    return cfg_dir
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return None
+
+def _read_game_cfg_setting(cfg_dir: Path):
+    text = (cfg_dir / "game.cfg").read_text(encoding="utf-8")
+    m = _re.search(rf"^{_TFT_SETTING}=(\S+)$", text, _re.M)
+    return m.group(1) if m else None
+
+def _write_game_cfg_setting(cfg_dir: Path, value: str) -> bool:
+    path = cfg_dir / "game.cfg"
+    text = path.read_text(encoding="utf-8")
+    new_text, n = _re.subn(rf"^{_TFT_SETTING}=\S+$",
+                           f"{_TFT_SETTING}={value}", text, count=1, flags=_re.M)
+    if not n:
+        return False
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    tmp.replace(path)
+    return True
+
+def _write_persisted_setting(cfg_dir: Path, value: str) -> bool:
+    path = cfg_dir / "PersistedSettings.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    entry = None
+    for f in data.get("files", []):
+        if f.get("name") == "Game.cfg":
+            for sec in f.get("sections", []):
+                if sec.get("name") == "General":
+                    for s in sec.get("settings", []):
+                        if s.get("name") == _TFT_SETTING:
+                            entry = s
+    if entry is None:
+        return False
+    entry["value"] = value
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    tmp.replace(path)
+    return True
+
+def _set_attack_click_on_left_click(cfg_dir: Path, value: str) -> bool:
+    """Write `value` ("0" or "1") to both game.cfg and PersistedSettings.json.
+    Returns True if at least one file was updated."""
+    ok1 = _write_game_cfg_setting(cfg_dir, value)
+    ok2 = _write_persisted_setting(cfg_dir, value)
+    return ok1 or ok2
+
+
 # ── Automation engine ─────────────────────────────────────────────────────────
 class AutoEngine:
     """Polls the LCU every 2 s and acts based on game flow phase."""
@@ -491,6 +556,9 @@ class AutoEngine:
         self._friends_ts:       float = 0.0     # monotonic time of last friends fetch
         self._others_ready_notified: bool = False
         self._sound_cancel: threading.Event = threading.Event()
+        self._last_tft_poll:        float = 0.0   # throttle TFT gameMode checks
+        self._tft_saved_click_value: str  = None  # pre-TFT value pending restore
+        self._tft_detected_logged:  bool  = False # already reported this TFT session
 
     def start(self):
         self._stop.clear()
@@ -606,8 +674,93 @@ class AutoEngine:
         # Runs during Matchmaking too so the leader can cancel if someone unreadies.
         if phase in ("Lobby", "Matchmaking"):
             self._handle_party_ready()
+            self._handle_tft_settings(cfg)
 
         # Invite handling already ran above for idle/lobby phases.
+
+    # ── TFT settings override ────────────────────────────────────────────────
+    def _current_game_mode(self):
+        """Best-effort current LCU gameMode ('TFT', 'CLASSIC', ...), or None."""
+        try:
+            r = self._lcu.get("/lol-lobby/v2/lobby")
+            if r.status_code == 200:
+                gm = r.json().get("gameConfig", {}).get("gameMode")
+                if gm:
+                    return gm
+        except Exception:
+            pass
+        try:
+            r = self._lcu.get("/lol-gameflow/v1/session")
+            if r.status_code == 200:
+                gm = r.json().get("gameData", {}).get("queue", {}).get("gameMode")
+                if gm:
+                    return gm
+        except Exception:
+            pass
+        return None
+
+    def _handle_tft_settings(self, cfg):
+        """When a TFT lobby/queue is detected, turn off attack-click-on-left-
+        click and remember the previous value for a manual restore later.
+        Always logs once per TFT session so detection is visible even when
+        no file change was needed (e.g. it was already off)."""
+        if not cfg.get("tftFixEnabled", True):
+            return
+        now = time.monotonic()
+        if now - self._last_tft_poll < 2.0:
+            return
+        self._last_tft_poll = now
+
+        if self._current_game_mode() != "TFT":
+            self._tft_detected_logged = False   # re-arm for the next TFT lobby
+            return
+        if self._tft_detected_logged:
+            return   # already reported this TFT session
+
+        cfg_dir = _league_config_dir()
+        if not cfg_dir:
+            self._log("TFT lobby detected, but the League install folder "
+                      "couldn't be located.")
+            self._tft_detected_logged = True
+            return
+        try:
+            current = _read_game_cfg_setting(cfg_dir)
+            if current is None:
+                self._log("TFT lobby detected, but the click setting "
+                          "couldn't be read from game.cfg.")
+            elif current == "0":
+                self._log("TFT lobby detected — attack-click on left click "
+                          "is already off, nothing to change.")
+            elif _set_attack_click_on_left_click(cfg_dir, "0"):
+                self._tft_saved_click_value = current
+                self._log(
+                    f"TFT lobby detected — disabled attack-click on left "
+                    f"click (was {current})."
+                )
+            else:
+                self._log("TFT lobby detected, but writing the setting failed.")
+        except Exception as exc:
+            self._log(f"TFT settings error: {exc}")
+        self._tft_detected_logged = True
+
+    def restore_tft_settings(self) -> bool:
+        """Manual restore of the pre-TFT value. Returns True if a restore
+        actually happened (False if nothing was pending)."""
+        if self._tft_saved_click_value is None:
+            return False
+        cfg_dir = _league_config_dir()
+        if not cfg_dir:
+            self._log("Restore failed: League client not found.")
+            return False
+        value = self._tft_saved_click_value
+        try:
+            if _set_attack_click_on_left_click(cfg_dir, value):
+                self._log(f"Restored attack-click on left click to {value}.")
+                self._tft_saved_click_value = None
+                return True
+        except Exception as exc:
+            self._log(f"Restore error: {exc}")
+        return False
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
     def _log_champ_select_debug(self):
@@ -3228,6 +3381,29 @@ class App(tk.Tk):
         wl_entry.bind("<Enter>", _tip_show)
         wl_entry.bind("<Leave>", _tip_hide)
 
+        # ── TFT Left-Click Fix ───────────────────────────────────────────────
+        s = _section("TFT Left-Click Fix")
+
+        self._tft_fix_var = tk.BooleanVar(
+            value=bool(self.cfg.get("tftFixEnabled", True)))
+        _check(s, 'Disable "attack click on left click" in TFT lobbies',
+               self._tft_fix_var,
+               lambda: (
+                   self.cfg.__setitem__("tftFixEnabled", self._tft_fix_var.get()),
+                   save_config(self.cfg),
+               )).pack(anchor="w")
+        _hint(s, "Applied automatically once a Teamfight Tactics lobby or "
+                 "queue is detected")
+
+        tft_row = tk.Frame(s, bg=CARD)
+        tft_row.pack(anchor="w", pady=(10, 0))
+        self._tft_status_var = tk.StringVar()
+        tk.Label(tft_row, textvariable=self._tft_status_var, bg=CARD,
+                 fg=MUTED, font=FONT_SMALL).pack(side="left", padx=(0, 10))
+        _sbtn(tft_row, "Restore normal settings",
+              self._on_restore_tft).pack(side="left")
+        self._update_tft_status()
+
         # ── Timings ───────────────────────────────────────────────────────────
         s = _section("Timings  (seconds)")
 
@@ -3720,8 +3896,26 @@ class App(tk.Tk):
             self.cfg["neekoSoundEnabled"] = self._neeko_sound_var.get()
         if hasattr(self, "_neeko_vol_var"):
             self.cfg["neekoSoundVolume"] = self._neeko_vol_var.get()
+        if hasattr(self, "_tft_fix_var"):
+            self.cfg["tftFixEnabled"] = self._tft_fix_var.get()
         save_config(self.cfg)
         self.log("Config saved.")
+
+    def _on_restore_tft(self):
+        if self._engine.restore_tft_settings():
+            self.log("TFT click setting restored to normal.")
+        else:
+            self.log("Nothing to restore — no TFT override is active.")
+        self._update_tft_status(reschedule=False)
+
+    def _update_tft_status(self, reschedule=True):
+        if hasattr(self, "_tft_status_var"):
+            pending = self._engine._tft_saved_click_value
+            self._tft_status_var.set(
+                f"Override active (will restore to {pending})"
+                if pending is not None else "No override pending")
+        if reschedule:
+            self.after(1000, self._update_tft_status)
 
     def _manual_update_check(self):
         """Settings button: check GitHub for a newer release and, if found,
