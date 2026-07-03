@@ -84,7 +84,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.9.6"
+APP_VERSION = "1.9.7"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1419,15 +1419,32 @@ class AutoEngine:
                 self._log(f"[invite] Accept failed for {sender_name}: HTTP {r2.status_code}")
 
 
-# ── Theme colors ──────────────────────────────────────────────────────────────
-DARK   = "#1e2327"
-DARKER = "#14181b"
-PANEL  = "#2a2f35"
-GOLD   = "#c89b3c"
-GREEN  = "#27ae60"
-RED    = "#c0392b"
-TEXT   = "#cccccc"
-WHITE  = "#ffffff"
+# ── Theme colors  (League of Legends "hextech" palette) ────────────────────────
+DARK   = "#0a141f"   # main content background (deep navy)
+DARKER = "#050a12"   # sidebar / header background
+PANEL  = "#0f1c2b"   # inputs, listboxes, secondary buttons
+GOLD   = "#c8aa6e"   # hextech gold accent
+GREEN  = "#0fb894"   # on / connected (hextech teal-green)
+RED    = "#c0392b"   # off / errors
+TEXT   = "#cdd6e0"   # primary text
+WHITE  = "#f0e6d2"   # LoL parchment off-white
+
+# Redesign palette
+SIDEBAR     = DARKER
+HEADER      = DARKER
+CARD        = "#0d1a28"   # card / tile surface
+CARD_BORDER = "#785a28"   # hextech gold hairline outline
+EDGE_GOLD   = "#5c4a24"   # dim gold edge / rules
+BRIGHT_GOLD = "#f0d5a0"   # highlight ticks
+TRACK_OFF   = "#32414f"   # toggle track when off
+TEXT_BRIGHT = "#f0e6d2"   # card titles, stat values (parchment)
+MUTED       = "#7a8ba0"   # subtitles (muted blue-grey)
+FAINT       = "#586a7c"   # hints / stat labels
+NAV_ACTIVE  = "#0f2133"   # highlighted sidebar row
+TEAL        = "#0ac8b9"   # hextech teal highlight
+FIELD_BG    = "#050a12"   # recessed input fields (clearly visible on cards)
+BTN_BG      = "#1e3350"   # secondary buttons (visible on DARK and CARD)
+BTN_HOV     = "#2a456a"   # secondary button hover
 
 # Virtual-key codes for F-keys and navigation keys (overlay hotkey system)
 _OVERLAY_VK = {
@@ -1474,8 +1491,278 @@ def _overlay_combo_label(combo: str) -> str:
     parts[-1] = _OVERLAY_KEY_DISPLAY.get(parts[-1], parts[-1])
     return "+".join(parts)
 
-BTN_STYLE = dict(relief="flat", cursor="hand2", font=("Segoe UI", 9),
+# ── Typography  (one source of truth for every widget) ─────────────────────────
+FONT_SECTION = ("Segoe UI", 12, "bold")   # ornamented section headers
+FONT_TITLE   = ("Segoe UI", 13)           # card / automation titles
+FONT_LABEL   = ("Segoe UI", 10)           # standard labels
+FONT_SMALL   = ("Segoe UI", 9)            # secondary text / inputs
+FONT_HINT    = ("Segoe UI", 8)            # sub-hints
+FONT_BTN     = ("Segoe UI", 9, "bold")    # buttons
+FONT_MONO    = ("Consolas", 10)           # log console
+FONT_STATUS  = ("Segoe UI", 10)           # header status readouts (uniform)
+
+# Shared surfaces
+TIP_BG  = "#12263a"   # tooltip background (dark navy)
+WARN_BG = "#2a1418"   # ToS warning tint
+
+BTN_STYLE = dict(relief="flat", cursor="hand2", font=FONT_BTN,
                  activeforeground=WHITE)
+
+
+def _shade(hex_color: str, factor: float) -> str:
+    """Lighten (factor>1) or darken (factor<1) a #rrggbb colour."""
+    try:
+        r = int(hex_color[1:3], 16); g = int(hex_color[3:5], 16); b = int(hex_color[5:7], 16)
+        r = max(0, min(255, int(r * factor)))
+        g = max(0, min(255, int(g * factor)))
+        b = max(0, min(255, int(b * factor)))
+        return f"#{r:02x}{g:02x}{b:02x}"
+    except Exception:
+        return hex_color
+
+
+def _blend(c1: str, c2: str, t: float) -> str:
+    """Linearly interpolate between two #rrggbb colours (t: 0→c1, 1→c2)."""
+    try:
+        a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+        r = [int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3)]
+        return f"#{r[0]:02x}{r[1]:02x}{r[2]:02x}"
+    except Exception:
+        return c2 if t >= 0.5 else c1
+
+
+class HexCard(tk.Canvas):
+    """A League-style angular panel: chamfered corners, a gold hairline border,
+    and bright gold ticks on two opposite corners. Content goes in `.body`.
+
+    autofit=True makes the card grow to fit its content's height (for panels
+    with variable content, e.g. settings sections)."""
+
+    def __init__(self, parent, fill=CARD, border=CARD_BORDER, chamfer=13,
+                 width=300, height=96, bg=DARK, autofit=False):
+        super().__init__(parent, width=width, height=height, bg=bg,
+                         highlightthickness=0, bd=0)
+        self._fill    = fill
+        self._border  = border
+        self._ch      = chamfer
+        self._autofit = autofit
+        self.body     = tk.Frame(self, bg=fill)
+        self._win     = self.create_window(3, 3, window=self.body, anchor="nw")
+        self.bind("<Configure>", self._redraw)
+        if autofit:
+            self.body.bind("<Configure>", self._on_body)
+
+    def _on_body(self, _e):
+        need = self.body.winfo_reqheight() + 6
+        if need != int(self["height"]):
+            self.config(height=need)
+
+    def _redraw(self, e):
+        self.delete("shape")
+        w, h, c = e.width, e.height, self._ch
+        pts = [c, 0, w - c, 0, w - 1, c, w - 1, h - c,
+               w - c, h - 1, c, h - 1, 0, h - c, 0, c]
+        self.create_polygon(pts, fill=self._fill, outline=self._border,
+                            width=1, tags="shape")
+        # Bright hextech ticks on the top-left and bottom-right chamfers.
+        self.create_line(0, c, c, 0, fill=GOLD, width=2, tags="shape")
+        self.create_line(w - c, h - 1, w - 1, h - c, fill=GOLD, width=2,
+                         tags="shape")
+        self.tag_lower("shape")
+        # Keep the content frame inset just inside the border.
+        self.coords(self._win, 3, 3)
+        if self._autofit:
+            self.itemconfig(self._win, width=w - 6)          # height = content
+        else:
+            self.itemconfig(self._win, width=w - 6, height=h - 6)
+
+
+class HexButton(tk.Canvas):
+    """A League-style angular action button with chamfered corners, a gold
+    border and corner ticks. Reconfigure its look with set_look()."""
+
+    def __init__(self, parent, command, width=230, height=46, chamfer=9, bg=DARK):
+        super().__init__(parent, width=width, height=height, bg=bg,
+                         highlightthickness=0, bd=0)
+        self._command = command
+        self._ch      = chamfer
+        self._text    = "START"
+        self._fill    = DARK
+        self._border  = GOLD
+        self._fg      = GOLD
+        self._enabled = True
+        self._hover   = False
+        self.bind("<Button-1>", self._click)
+        self.bind("<Enter>", self._enter)
+        self.bind("<Leave>", self._leave)
+        self.bind("<Configure>", lambda _e: self._draw())
+        self.config(cursor="hand2")
+
+    def set_look(self, text, fill, border, fg, enabled):
+        self._text, self._fill, self._border = text, fill, border
+        self._fg, self._enabled = fg, enabled
+        self.config(cursor="hand2" if enabled else "arrow")
+        self._draw()
+
+    def _click(self, _e):
+        if self._enabled and self._command:
+            self._command()
+
+    def _enter(self, _e):
+        self._hover = True;  self._draw()
+
+    def _leave(self, _e):
+        self._hover = False; self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1:
+            w = int(self["width"])
+        if h <= 1:
+            h = int(self["height"])
+        c = self._ch
+        fill = self._fill
+        if self._enabled and self._hover:
+            fill = _shade(fill, 1.18)
+        pts = [c, 0, w - c, 0, w - 1, c, w - 1, h - c,
+               w - c, h - 1, c, h - 1, 0, h - c, 0, c]
+        self.create_polygon(pts, fill=fill, outline=self._border, width=1)
+        tick = DARK if fill.lower() == GOLD.lower() else GOLD
+        self.create_line(0, c, c, 0, fill=tick, width=2)
+        self.create_line(w - c, h - 1, w - 1, h - c, fill=tick, width=2)
+        self.create_text(w / 2, h / 2, text=self._text, fill=self._fg,
+                         font=("Segoe UI", 12, "bold"))
+
+
+class HexSlider(tk.Canvas):
+    """A horizontal slider with an always-visible gold diamond handle and a
+    gold-filled track. Click or drag to set a 0–100 value; calls command(value)."""
+
+    def __init__(self, parent, value=80, command=None, width=170, height=24,
+                 bg=CARD):
+        super().__init__(parent, width=width, height=height, bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._val     = max(0, min(100, int(value)))
+        self._command = command
+        self._pad     = 10
+        self.bind("<Button-1>", self._set_from_x)
+        self.bind("<B1-Motion>", self._set_from_x)
+        self.bind("<Configure>", lambda _e: self._draw())
+        self._draw()
+
+    def _pxw(self):
+        w = self.winfo_width()
+        return w if w > 1 else int(self["width"])
+
+    def _draw(self):
+        self.delete("all")
+        w = self._pxw()
+        h = int(self["height"])
+        pad, cy = self._pad, h // 2
+        x0, x1 = pad, w - pad
+        hx = x0 + (x1 - x0) * self._val / 100.0
+        # groove, then gold fill up to the handle
+        self.create_line(x0, cy, x1, cy, fill=EDGE_GOLD, width=3,
+                         capstyle="round")
+        self.create_line(x0, cy, hx, cy, fill=GOLD, width=3, capstyle="round")
+        # always-visible gold diamond handle
+        r = 7
+        self.create_polygon(hx, cy - r, hx + r, cy, hx, cy + r, hx - r, cy,
+                            fill=GOLD, outline=BRIGHT_GOLD)
+
+    def _set_from_x(self, e):
+        w = self._pxw()
+        pad = self._pad
+        frac = (e.x - pad) / max(1, (w - 2 * pad))
+        val = int(round(max(0.0, min(1.0, frac)) * 100))
+        self._val = val
+        self._draw()
+        if self._command:
+            self._command(val)
+
+    def set(self, val):
+        self._val = max(0, min(100, int(val)))
+        self._draw()
+
+    def get(self):
+        return self._val
+
+
+class ToggleSwitch(tk.Canvas):
+    """iOS-style pill toggle. Green track when on, grey when off.
+
+    Clicking flips the state, redraws, and calls command(new_state).
+    Use .set(value) to change state programmatically (silent by default)."""
+
+    W, H = 48, 26
+
+    def __init__(self, parent, initial=False, command=None, bg=CARD):
+        super().__init__(parent, width=self.W, height=self.H, bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._on      = bool(initial)
+        self._pos     = 1.0 if self._on else 0.0   # animation progress 0→1
+        self._anim    = None
+        self._command = command
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _pill(self, x0, y0, x1, y1, fill):
+        r = (y1 - y0) / 2
+        self.create_oval(x0, y0, x0 + 2 * r, y1, fill=fill, outline=fill)
+        self.create_oval(x1 - 2 * r, y0, x1, y1, fill=fill, outline=fill)
+        self.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline=fill)
+
+    def _draw(self):
+        self.delete("all")
+        p = self._pos
+        # Track colour fades grey→green as the knob slides across.
+        self._pill(2, 2, self.W - 2, self.H - 2, _blend(TRACK_OFF, GREEN, p))
+        d, pad = self.H - 8, 4                  # knob diameter, edge padding
+        off_x  = pad
+        on_x   = self.W - pad - d
+        kx     = off_x + (on_x - off_x) * p     # interpolated knob position
+        knob   = _blend("#c9cdd2", WHITE, p)
+        self.create_oval(kx, pad, kx + d, pad + d, fill=knob, outline=knob)
+
+    def _animate_to(self, target):
+        """Step the knob toward target (0 or 1) a few frames for a slide."""
+        if self._anim is not None:
+            self.after_cancel(self._anim)
+            self._anim = None
+
+        def _step():
+            diff = target - self._pos
+            if abs(diff) <= 0.16:
+                self._pos = target
+                self._draw()
+                self._anim = None
+                return
+            self._pos += 0.22 if diff > 0 else -0.22
+            self._draw()
+            self._anim = self.after(12, _step)
+
+        _step()
+
+    def _click(self, _evt):
+        self._on = not self._on
+        self._animate_to(1.0 if self._on else 0.0)
+        if self._command:
+            self._command(self._on)
+
+    def set(self, value, silent=True):
+        value = bool(value)
+        if value == self._on:
+            return
+        self._on = value
+        self._animate_to(1.0 if value else 0.0)
+        if not silent and self._command:
+            self._command(self._on)
+
+    def get(self):
+        return self._on
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -1487,34 +1774,46 @@ class RolePanel:
         self._app  = app
         self._widgets: dict = {}
 
-        left  = tk.Frame(parent, bg=DARK)
-        right = tk.Frame(parent, bg=DARK)
-        left.pack(side="left",  fill="both", expand=True, padx=10, pady=10)
-        right.pack(side="left", fill="both", expand=True, padx=(0, 10), pady=10)
+        wrap = tk.Frame(parent, bg=DARK)
+        wrap.pack(fill="both", expand=True, padx=24, pady=(6, 16))
+        wrap.columnconfigure(0, weight=1, uniform="rp")
+        wrap.columnconfigure(1, weight=1, uniform="rp")
+        wrap.rowconfigure(0, weight=1)
 
-        self._build_side(left,  "picks", "Pick Priority",  GREEN)
-        self._build_side(right, "bans",  "Ban Priority",   RED)
+        self._build_side(wrap, 0, "picks", "Pick Priority", TEAL)
+        self._build_side(wrap, 1, "bans",  "Ban Priority",  RED)
 
-    def _build_side(self, container: tk.Frame, list_key: str,
+    def _build_side(self, parent, col: int, list_key: str,
                     title: str, accent: str):
         role  = self._role
         app   = self._app
 
-        tk.Label(container, text=title, bg=DARK, fg=accent,
-                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        card = HexCard(parent, fill=CARD, border=CARD_BORDER)
+        card.grid(row=0, column=col, sticky="nsew", padx=(0, 6) if col == 0
+                  else (6, 0))
+        container = card.body
+
+        hdr = tk.Frame(container, bg=CARD)
+        hdr.pack(fill="x", padx=14, pady=(12, 0))
+        dia = tk.Canvas(hdr, width=11, height=11, bg=CARD,
+                        highlightthickness=0, bd=0)
+        dia.create_polygon(5, 0, 11, 5, 5, 11, 0, 5, fill=accent, outline=accent)
+        dia.pack(side="left", padx=(0, 8), pady=(3, 0))
+        tk.Label(hdr, text=title.upper(), bg=CARD, fg=accent,
+                 font=FONT_SECTION).pack(side="left")
         tk.Label(container, text="Top = highest priority",
-                 bg=DARK, fg="#555", font=("Segoe UI", 8)).pack(anchor="w")
+                 bg=CARD, fg=FAINT, font=FONT_HINT).pack(anchor="w", padx=14)
 
         lb = tk.Listbox(container, bg=DARKER, fg=WHITE,
-                        selectbackground=GOLD, selectforeground="#000",
-                        relief="flat", height=11, font=("Segoe UI", 10),
-                        activestyle="none")
-        lb.pack(fill="both", expand=True, pady=(4, 2))
+                        selectbackground=accent, selectforeground=WHITE,
+                        relief="flat", height=8, font=FONT_LABEL,
+                        activestyle="none", highlightthickness=0, bd=0)
+        lb.pack(fill="both", expand=True, padx=14, pady=(6, 2))
         self._widgets[f"{list_key}_lb"] = lb
 
         # Reorder / remove
-        btn_row = tk.Frame(container, bg=DARK)
-        btn_row.pack(fill="x")
+        btn_row = tk.Frame(container, bg=CARD)
+        btn_row.pack(fill="x", padx=14)
 
         def move(delta, r=role, k=list_key):
             app.move_item(r, k, delta)
@@ -1522,35 +1821,38 @@ class RolePanel:
         def remove(r=role, k=list_key):
             app.remove_item(r, k)
 
-        tk.Button(btn_row, text="▲", bg=PANEL, fg=TEXT,
-                  activebackground=PANEL, command=lambda: move(-1),
-                  **BTN_STYLE).pack(side="left", padx=2, pady=2)
-        tk.Button(btn_row, text="▼", bg=PANEL, fg=TEXT,
-                  activebackground=PANEL, command=lambda: move(1),
-                  **BTN_STYLE).pack(side="left", padx=2, pady=2)
-        tk.Button(btn_row, text="Remove", bg=PANEL, fg=TEXT,
-                  activebackground=PANEL, command=remove,
-                  **BTN_STYLE).pack(side="left", padx=2, pady=2)
+        tk.Button(btn_row, text="▲", bg=BTN_BG, fg=TEXT, width=3,
+                  activebackground=BTN_HOV, command=lambda: move(-1),
+                  **BTN_STYLE).pack(side="left", padx=(0, 4), pady=2)
+        tk.Button(btn_row, text="▼", bg=BTN_BG, fg=TEXT, width=3,
+                  activebackground=BTN_HOV, command=lambda: move(1),
+                  **BTN_STYLE).pack(side="left", padx=(0, 4), pady=2)
+        tk.Button(btn_row, text="Remove", bg=BTN_BG, fg=TEXT,
+                  activebackground=BTN_HOV, command=remove,
+                  **BTN_STYLE).pack(side="left", pady=2)
 
         # Champion search / add
-        add_row = tk.Frame(container, bg=DARK)
-        add_row.pack(fill="x", pady=(10, 0))
+        add_row = tk.Frame(container, bg=CARD)
+        add_row.pack(fill="x", padx=14, pady=(10, 12))
 
-        tk.Label(add_row, text="Add:", bg=DARK, fg=TEXT,
-                 font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(add_row, text="Add:", bg=CARD, fg=TEXT,
+                 font=FONT_SMALL).pack(side="left")
 
         entry_var = tk.StringVar()
         self._widgets[f"{list_key}_ev"] = entry_var
 
         entry = tk.Entry(add_row, textvariable=entry_var,
-                         bg=PANEL, fg=WHITE, insertbackground=WHITE,
-                         relief="flat", width=18, font=("Segoe UI", 9))
-        entry.pack(side="left", padx=4)
+                         bg=FIELD_BG, fg=WHITE, insertbackground=WHITE,
+                         relief="flat", width=16, font=FONT_SMALL,
+                         highlightthickness=1, highlightbackground=EDGE_GOLD,
+                         highlightcolor=GOLD)
+        entry.pack(side="left", padx=6, ipady=3)
 
         # Autocomplete listbox (shown below entry, hidden when empty)
-        ac_lb = tk.Listbox(container, bg=PANEL, fg=WHITE,
-                           selectbackground=GOLD, selectforeground="#000",
-                           relief="flat", height=5, font=("Segoe UI", 9))
+        ac_lb = tk.Listbox(container, bg=FIELD_BG, fg=WHITE,
+                           selectbackground=accent, selectforeground=WHITE,
+                           relief="flat", height=5, font=FONT_SMALL,
+                           highlightthickness=1, highlightbackground=EDGE_GOLD)
         self._widgets[f"{list_key}_ac"] = ac_lb
 
         # Capture for closures
@@ -1591,7 +1893,7 @@ class RolePanel:
                 return
             for h in hits:
                 _ac.insert("end", "  " + h)
-            _ac.pack(fill="x")
+            _ac.pack(fill="x", padx=14, pady=(0, 8))
 
         def _ac_select(_evt):
             sel = _ac.curselection()
@@ -1602,8 +1904,8 @@ class RolePanel:
         ac_lb.bind("<<ListboxSelect>>", _ac_select)
         entry.bind("<Return>", lambda _: _do_add())
 
-        tk.Button(add_row, text="+", bg=accent, fg=WHITE,
-                  activebackground=accent, command=_do_add,
+        tk.Button(add_row, text="＋", bg=accent, fg=WHITE, width=3,
+                  activebackground=_shade(accent, 1.2), command=_do_add,
                   **BTN_STYLE).pack(side="left")
 
     def get_listbox(self, list_key: str) -> tk.Listbox:
@@ -1980,6 +2282,17 @@ class LCUOverlay:
         fg           = user32.GetForegroundWindow()
         overlay_hwnd = self._win.winfo_id()
         if fg and fg != hwnd and fg != overlay_hwnd:
+            # The overlay tracks the League client only. If one of our OWN
+            # windows (the client tool, its dialogs) is in the foreground,
+            # hide the overlay — it should never show just because the tool
+            # is up. Only the League client's own process keeps it visible.
+            fg_pid = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+            if fg_pid.value == os.getpid():
+                self._win.withdraw()
+                _dbg("refresh: withdraw (client tool window in foreground)")
+                return
+
             lc_rect = ctypes.wintypes.RECT()
             fg_rect = ctypes.wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(lc_rect))
@@ -2221,8 +2534,8 @@ class App(tk.Tk):
         super().__init__()
         self.title(f"{APP_NAME}   v{APP_VERSION}")
         self.configure(bg=DARK)
-        self.geometry("560x480")
-        self.minsize(520, 430)
+        self.geometry("940x690")
+        self.minsize(900, 630)
         self.resizable(True, True)
 
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -2238,6 +2551,13 @@ class App(tk.Tk):
         self._delay_vars:  dict = {}
         self._bool_vars:   dict = {}
         self._connected    = False
+
+        # Dashboard state
+        self._auto_switches: dict = {}   # key → ToggleSwitch
+        self._nav_rows:      dict = {}   # page-name → (row, accent, label)
+        self._pages:         dict = {}   # page-name → content frame
+        self._running     = False
+        self._start_time  = None         # monotonic when automation started
 
         self._build_ui()
 
@@ -2285,80 +2605,210 @@ class App(tk.Tk):
     def _build_ui(self):
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("TNotebook",     background=DARK,  borderwidth=0)
-        style.configure("TNotebook.Tab", background=PANEL, foreground=TEXT,
-                        padding=[12, 5])
-        style.map("TNotebook.Tab",
-                  background=[("selected", GOLD)],
-                  foreground=[("selected", "#000")])
         style.configure("TFrame", background=DARK)
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=6, pady=6)
+        # Top header bar (logo + connection status)
+        self._build_header()
 
-        # Main tab
-        main_frame = ttk.Frame(nb)
-        nb.add(main_frame, text="  Main  ")
-        self._build_main(main_frame)
+        # Body: left sidebar navigation + stacked content pages
+        body = tk.Frame(self, bg=DARK)
+        body.pack(fill="both", expand=True)
 
-        # Champions tab — all roles in one, switched by a selector bar
-        champ_frame = ttk.Frame(nb)
-        nb.add(champ_frame, text="  Champions  ")
-        self._build_champions(champ_frame)
+        sidebar = tk.Frame(body, bg=SIDEBAR, width=196)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
 
-        # Settings tab
-        sett_frame = ttk.Frame(nb)
-        nb.add(sett_frame, text="  Settings  ")
-        self._build_settings(sett_frame)
+        # Thin gold rule separating sidebar from content
+        tk.Frame(body, bg=EDGE_GOLD, width=1).pack(side="left", fill="y")
 
-        # Log tab
-        log_frame = ttk.Frame(nb)
-        nb.add(log_frame, text="  Log  ")
-        self._build_log(log_frame)
+        content = tk.Frame(body, bg=DARK)
+        content.pack(side="left", fill="both", expand=True)
+        content.rowconfigure(0, weight=1)
+        content.columnconfigure(0, weight=1)
+
+        # Build each page into its own frame, all stacked in cell (0,0).
+        pages = [
+            ("Dashboard", self._build_dashboard),
+            ("Champions", self._build_champions),
+            ("Logs",      self._build_log),
+            ("Settings",  self._build_settings),
+        ]
+        for name, builder in pages:
+            frame = tk.Frame(content, bg=DARK)
+            frame.grid(row=0, column=0, sticky="nsew")
+            self._pages[name] = frame
+            builder(frame)
+
+        # Sidebar nav — Settings pinned to the bottom, like the mockup.
+        self._nav_button(sidebar, "Dashboard")
+        self._nav_button(sidebar, "Champions")
+        self._nav_button(sidebar, "Logs")
+        tk.Frame(sidebar, bg=EDGE_GOLD, height=1).pack(
+            fill="x", padx=18, pady=(14, 14))
+        self._nav_button(sidebar, "Settings")
+
+        self._show_page("Dashboard")
+
+    def _build_header(self):
+        hdr = tk.Frame(self, bg=HEADER, height=68)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+
+        # Hextech emblem: nested diamonds with a teal gem core + corner ticks.
+        logo = tk.Canvas(hdr, width=56, height=56, bg=HEADER,
+                         highlightthickness=0, bd=0)
+        logo.pack(side="left", padx=(22, 12), pady=6)
+        cx, cy = 28, 28
+        logo.create_polygon(cx, 4, 52, cy, cx, 52, 4, cy,
+                            outline=GOLD, fill="", width=2)
+        logo.create_polygon(cx, 12, 44, cy, cx, 44, 12, cy,
+                            outline=EDGE_GOLD, fill="", width=1)
+        logo.create_polygon(cx, 20, 36, cy, cx, 36, 20, cy,
+                            outline=GOLD, fill=TEAL)
+        # tiny gold ticks at the four outer points
+        for (x, y) in ((cx, 4), (52, cy), (cx, 52), (4, cy)):
+            logo.create_oval(x - 1, y - 1, x + 1, y + 1, fill=BRIGHT_GOLD,
+                             outline=BRIGHT_GOLD)
+
+        tk.Label(hdr, text="LOL CLIENT TOOL", bg=HEADER, fg=TEXT_BRIGHT,
+                 font=("Segoe UI", 16, "bold")).pack(side="left")
+        tk.Label(hdr, text=f"v{APP_VERSION}", bg=HEADER, fg=GOLD,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(8, 0), pady=(6, 0))
+
+        # Right side: three status readouts, all the same size & style.
+        # Order (right→left): Client · Relay · Ping.
+        self._lbl_conn = tk.Label(hdr, text="● Client: waiting",
+                                  bg=HEADER, fg=MUTED, font=FONT_STATUS)
+        self._lbl_conn.pack(side="right", padx=(0, 24))
+        self._lbl_relay = tk.Label(hdr, text="● Relay: not set",
+                                   bg=HEADER, fg=MUTED, font=FONT_STATUS)
+        self._lbl_relay.pack(side="right", padx=(0, 18))
+        self._lbl_ping = tk.Label(hdr, text="● Ping: —", bg=HEADER, fg=MUTED,
+                                  font=FONT_STATUS)
+        self._lbl_ping.pack(side="right", padx=(0, 18))
+
+        # Gold double-rule beneath the header (bright over dim).
+        tk.Frame(self, bg=GOLD,      height=1).pack(fill="x")
+        tk.Frame(self, bg=EDGE_GOLD, height=1).pack(fill="x")
+
+    def _nav_button(self, sidebar, name):
+        row = tk.Frame(sidebar, bg=SIDEBAR, height=52)
+        row.pack(fill="x")
+        row.pack_propagate(False)
+        accent = tk.Frame(row, bg=SIDEBAR, width=3)
+        accent.pack(side="left", fill="y")
+        lbl = tk.Label(row, text=name, bg=SIDEBAR, fg=MUTED,
+                       font=("Segoe UI", 12), anchor="w")
+        lbl.pack(side="left", fill="both", expand=True, padx=(21, 0))
+        self._nav_rows[name] = (row, accent, lbl)
+
+        def _enter(_e):
+            if self._active_page != name:
+                row.config(bg=NAV_ACTIVE); lbl.config(bg=NAV_ACTIVE, fg=TEXT)
+        def _leave(_e):
+            if self._active_page != name:
+                row.config(bg=SIDEBAR); lbl.config(bg=SIDEBAR, fg=MUTED)
+        for w in (row, lbl, accent):
+            w.bind("<Button-1>", lambda _e, n=name: self._show_page(n))
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
+
+    _active_page = None
+
+    def _show_page(self, name):
+        self._active_page = name
+        for n, (row, accent, lbl) in self._nav_rows.items():
+            on = (n == name)
+            row.config(bg=NAV_ACTIVE if on else SIDEBAR)
+            accent.config(bg=GOLD if on else SIDEBAR)
+            lbl.config(bg=NAV_ACTIVE if on else SIDEBAR,
+                       fg=GOLD if on else MUTED,
+                       font=("Segoe UI", 12, "bold") if on
+                            else ("Segoe UI", 12))
+        self._pages[name].tkraise()
 
     def _build_champions(self, parent):
-        # Role selector bar — the highlighted button marks the active role.
-        sel = tk.Frame(parent, bg=DARKER)
-        sel.pack(fill="x", padx=8, pady=(8, 0))
-        tk.Label(sel, text="Role:", bg=DARKER, fg=GOLD,
-                 font=("Segoe UI", 10, "bold")).pack(side="left", padx=(10, 8), pady=8)
+        # ── Inline ornamented header: diamond + CHAMPIONS + rule + op.gg ───────
+        head = tk.Frame(parent, bg=DARK)
+        head.pack(fill="x", padx=30, pady=(20, 14))
+        tk.Button(head, text="⭳  op.gg Auto-fill", bg=BTN_BG, fg=GOLD,
+                  activebackground=BTN_HOV, activeforeground=GOLD, relief="flat",
+                  cursor="hand2", padx=14, pady=5, font=FONT_BTN,
+                  command=self._open_opgg_dialog).pack(side="right", padx=(14, 0))
+        dia = tk.Canvas(head, width=12, height=12, bg=DARK,
+                        highlightthickness=0, bd=0)
+        dia.create_polygon(6, 0, 12, 6, 6, 12, 0, 6, fill=GOLD, outline=GOLD)
+        dia.pack(side="left", padx=(0, 9), pady=(3, 0))
+        tk.Label(head, text="CHAMPIONS", bg=DARK, fg=GOLD,
+                 font=FONT_SECTION).pack(side="left")
+        tk.Frame(head, bg=EDGE_GOLD, height=1).pack(
+            side="left", fill="x", expand=True, padx=(14, 14))
 
-        # op.gg auto-fill — upper-right of the pick/ban tab
-        tk.Button(sel, text="op.gg Auto-fill", bg=PANEL, fg=GOLD,
-                  activebackground=PANEL, relief="flat", cursor="hand2",
-                  padx=12, pady=4, font=("Segoe UI", 9),
-                  command=self._open_opgg_dialog).pack(side="right", padx=(0, 10), pady=6)
+        # ── Role tabs — the highlighted tab marks the active role. ─────────────
+        sel = tk.Frame(parent, bg=DARK)
+        sel.pack(fill="x", padx=30, pady=(0, 14))
+        tk.Label(sel, text="EDITING ROLE", bg=DARK, fg=FAINT,
+                 font=FONT_HINT).pack(side="left", padx=(0, 12), pady=(4, 0))
 
-        # Permaban — always banned first, regardless of role.
-        pb = tk.Frame(parent, bg=DARK)
-        pb.pack(fill="x", padx=12, pady=(6, 0))
-        tk.Label(pb, text="Permaban (any role):", bg=DARK, fg=RED,
-                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        # ── Permaban panel — same card language as the pick/ban lists. ─────────
+        pb_card = HexCard(parent, fill=CARD, border=CARD_BORDER, autofit=True)
+        pb_card.pack(fill="x", padx=30, pady=(0, 4))
+        pbb = pb_card.body
+
+        pb_hdr = tk.Frame(pbb, bg=CARD)
+        pb_hdr.pack(fill="x", padx=16, pady=(12, 0))
+        pdia = tk.Canvas(pb_hdr, width=11, height=11, bg=CARD,
+                         highlightthickness=0, bd=0)
+        pdia.create_polygon(5, 0, 11, 5, 5, 11, 0, 5, fill=RED, outline=RED)
+        pdia.pack(side="left", padx=(0, 8), pady=(3, 0))
+        tk.Label(pb_hdr, text="PERMABAN", bg=CARD, fg=RED,
+                 font=FONT_SECTION).pack(side="left")
+        tk.Label(pb_hdr, text="banned first every game · any role", bg=CARD,
+                 fg=FAINT, font=FONT_HINT).pack(side="left", padx=(10, 0),
+                                                pady=(4, 0))
+
+        # One grid for both rows so columns align and gaps stay even.
+        pg = tk.Frame(pbb, bg=CARD)
+        pg.pack(fill="x", padx=16, pady=(10, 12))
+        pg.columnconfigure(1, weight=1)
+
         self._perma_var = tk.StringVar()
-        pe = tk.Entry(pb, textvariable=self._perma_var, width=16, bg=PANEL,
-                      fg=WHITE, relief="flat", insertbackground=WHITE,
-                      font=("Segoe UI", 9))
-        pe.pack(side="left", padx=4)
+        tk.Label(pg, text="Add:", bg=CARD, fg=TEXT,
+                 font=FONT_SMALL).grid(row=0, column=0, sticky="w", pady=(2, 0))
+        pe = tk.Entry(pg, textvariable=self._perma_var, bg=FIELD_BG, fg=WHITE,
+                      relief="flat", insertbackground=WHITE, font=FONT_SMALL,
+                      highlightthickness=1, highlightbackground=EDGE_GOLD,
+                      highlightcolor=GOLD)
+        pe.grid(row=0, column=1, sticky="we", padx=8, ipady=4)
         pe.bind("<Return>", lambda *_: self._perma_enter())
-        tk.Button(pb, text="Add", bg=PANEL, fg=TEXT, activebackground=PANEL,
-                  command=self._add_permaban, **BTN_STYLE).pack(side="left", padx=2)
-        tk.Button(pb, text="Remove", bg=PANEL, fg=TEXT, activebackground=PANEL,
-                  command=self._remove_permaban, **BTN_STYLE).pack(side="left", padx=2)
-        self._perma_lb = tk.Listbox(pb, height=1, width=26, bg=DARKER, fg=WHITE,
-                                    selectbackground=RED, selectforeground=WHITE,
-                                    relief="flat", font=("Segoe UI", 9),
-                                    activestyle="none")
-        self._perma_lb.pack(side="left", fill="x", expand=True, padx=6)
+        tk.Button(pg, text="＋ Add", bg=BTN_BG, fg=GOLD, width=8,
+                  activebackground=BTN_HOV, activeforeground=GOLD,
+                  relief="flat", cursor="hand2", font=FONT_BTN,
+                  command=self._add_permaban).grid(row=0, column=2, sticky="we")
 
-        # Live autocomplete dropdown for the permaban entry (hidden until typing).
-        ac_holder = tk.Frame(parent, bg=DARK)
-        ac_holder.pack(fill="x", padx=12)
-        self._perma_ac = tk.Listbox(ac_holder, bg=PANEL, fg=WHITE,
+        # Live autocomplete dropdown — grid row 1, shown only while typing.
+        self._perma_ac = tk.Listbox(pg, bg=FIELD_BG, fg=WHITE,
                                     selectbackground=RED, selectforeground=WHITE,
-                                    relief="flat", height=5, font=("Segoe UI", 9))
+                                    relief="flat", height=5, font=FONT_SMALL,
+                                    highlightthickness=1, highlightbackground=EDGE_GOLD)
         self._perma_var.trace_add("write", self._perma_ac_update)
         self._perma_ac.bind("<<ListboxSelect>>", self._perma_ac_select)
 
+        tk.Label(pg, text="Current:", bg=CARD, fg=TEXT,
+                 font=FONT_SMALL).grid(row=2, column=0, sticky="nw", pady=(12, 0))
+        self._perma_lb = tk.Listbox(pg, height=2, bg=FIELD_BG, fg=WHITE,
+                                    selectbackground=RED, selectforeground=WHITE,
+                                    relief="flat", font=FONT_SMALL,
+                                    activestyle="none", highlightthickness=1,
+                                    highlightbackground=EDGE_GOLD)
+        self._perma_lb.grid(row=2, column=1, sticky="nwe", padx=8, pady=(12, 0))
+        tk.Button(pg, text="Remove", bg=BTN_BG, fg=TEXT,
+                  activebackground=BTN_HOV, activeforeground=WHITE,
+                  relief="flat", cursor="hand2", font=FONT_BTN,
+                  command=self._remove_permaban).grid(
+            row=2, column=2, sticky="nwe", pady=(12, 0))
+
+        # ── Per-role pick / ban lists ──────────────────────────────────────────
         holder = tk.Frame(parent, bg=DARK)
         holder.pack(fill="both", expand=True)
 
@@ -2375,108 +2825,111 @@ class App(tk.Tk):
             self._role_frames[role].pack(fill="both", expand=True)
             for r, b in self._role_btns.items():
                 active = (r == role)
-                b.config(bg=(GOLD if active else PANEL),
-                         fg=("#000" if active else TEXT))
+                b.config(bg=(GOLD if active else BTN_BG),
+                         fg=(DARK if active else TEXT))
 
         for role in ROLES:
-            b = tk.Button(sel, text=ROLE_LABEL[role], bg=PANEL, fg=TEXT,
-                          activebackground=GOLD, relief="flat", cursor="hand2",
-                          padx=14, pady=4, font=("Segoe UI", 10, "bold"),
+            b = tk.Button(sel, text=ROLE_LABEL[role], bg=BTN_BG, fg=TEXT,
+                          activebackground=_shade(GOLD, 1.05), relief="flat",
+                          cursor="hand2", padx=18, pady=6, font=FONT_BTN,
                           command=lambda r=role: show_role(r))
-            b.pack(side="left", padx=3, pady=6)
+            b.pack(side="left", padx=(0, 6))
             self._role_btns[role] = b
 
         show_role(ROLES[0])   # default to Top
 
-    def _build_main(self, parent):
-        # Header
-        hdr = tk.Frame(parent, bg=DARKER)
-        hdr.pack(fill="x", padx=8, pady=(8, 0))
-        tk.Label(hdr, text="⚔  LOL Client Tool", bg=DARKER, fg=GOLD,
-                 font=("Segoe UI", 13, "bold")).pack(side="left", padx=10, pady=8)
-        tk.Label(hdr, text=f"v{APP_VERSION}", bg=DARKER, fg="#888888",
-                 font=("Segoe UI", 9)).pack(side="left", pady=8)
-        self._lbl_conn = tk.Label(hdr, text="● Waiting for client…",
-                                  bg=DARKER, fg="#888888", font=("Segoe UI", 9))
-        self._lbl_conn.pack(side="right", padx=12)
-        self._lbl_relay = tk.Label(hdr, text="● Relay: not set",
-                                   bg=DARKER, fg="#888888", font=("Segoe UI", 9))
-        self._lbl_relay.pack(side="right", padx=(12, 0))
+    # ── Dashboard helpers ──────────────────────────────────────────────────────
+    def _section_header(self, parent, text, padx=0, pady=(0, 12)):
+        """LoL-style header: gold diamond + gold uppercase label + gold rule."""
+        row = tk.Frame(parent, bg=DARK)
+        row.pack(fill="x", padx=padx, pady=pady)
+        dia = tk.Canvas(row, width=12, height=12, bg=DARK,
+                        highlightthickness=0, bd=0)
+        dia.create_polygon(6, 0, 12, 6, 6, 12, 0, 6, fill=GOLD, outline=GOLD)
+        dia.pack(side="left", padx=(0, 9), pady=(3, 0))
+        tk.Label(row, text=text.upper(), bg=DARK, fg=GOLD,
+                 font=FONT_SECTION).pack(side="left")
+        tk.Frame(row, bg=EDGE_GOLD, height=1).pack(
+            side="left", fill="x", expand=True, padx=(14, 0))
+        return row
 
-        # Action buttons
-        btns = tk.Frame(parent, bg=DARK)
-        btns.pack(fill="x", padx=12, pady=(10, 4))
-
-        self._btn_start = tk.Button(btns, text="▶  Start",
-                                    bg=GREEN, fg=WHITE, activebackground=GREEN,
-                                    padx=10, state="disabled",
-                                    command=self._start, **BTN_STYLE)
-        self._btn_start.pack(side="left", padx=(0, 6))
-
-        self._btn_stop = tk.Button(btns, text="■  Stop",
-                                   bg=RED, fg=WHITE, activebackground=RED,
-                                   padx=10, state="disabled",
-                                   command=self._stop, **BTN_STYLE)
-        self._btn_stop.pack(side="left", padx=(0, 6))
-
-        tk.Button(btns, text="🎲  ULTIMATE BRAVERY",
-                  bg="#7b2fbf", fg=WHITE, activebackground="#7b2fbf",
-                  padx=10, command=self._ultimate_bravery,
-                  **BTN_STYLE).pack(side="left", padx=(0, 6))
-
-
-        # Automation toggle buttons fill the remaining space
+    def _build_dashboard(self, parent):
         self._party_ready = False
-        mid = tk.Frame(parent, bg=DARK)
-        mid.pack(fill="both", expand=True, padx=12, pady=(10, 0))
-        mid.columnconfigure(0, weight=1)
-        mid.columnconfigure(1, weight=1)
-        for _r in range(3):
-            mid.rowconfigure(_r, weight=1)
+        self._run_state   = "disabled"
+        pad = tk.Frame(parent, bg=DARK)
+        pad.pack(fill="both", expand=True, padx=30, pady=(20, 16))
 
-        self._auto_btns: dict = {}
+        # ── Control bar: single angular hextech Start/Stop button ──────────────
+        ctrl = tk.Frame(pad, bg=DARK)
+        ctrl.pack(fill="x", pady=(0, 18))
+        self._run_btn = HexButton(ctrl, command=self._on_run_click,
+                                  width=220, height=46, bg=DARK)
+        self._run_btn.pack(side="left")
+
+        # ── ACTIVE AUTOMATIONS — angular cards with pill toggles ───────────────
+        self._section_header(pad, "Active Automations")
+        grid = tk.Frame(pad, bg=DARK)
+        grid.pack(fill="both", expand=True)
+        grid.columnconfigure(0, weight=1, uniform="cards")
+        grid.columnconfigure(1, weight=1, uniform="cards")
+        for r in range(3):
+            grid.rowconfigure(r, weight=1, uniform="rows")
+
         _auto_items = [
-            ("Auto Accept",       "autoAccept"),
-            ("Auto Pick",         "autoPick"),
-            ("Auto Pre-Pick",     "autoPrePick"),
-            ("Auto Ban",          "autoBan"),
-            ("Auto Runes/Spells", "autoRunes"),
-            ("Accept Invites",    "autoAcceptInvites"),
+            ("Auto Accept",       "autoAccept",        "Accept found matches"),
+            ("Auto Pick",         "autoPick",          "Lock in your pick"),
+            ("Auto Pre-Pick",     "autoPrePick",       "Hover your intended pick"),
+            ("Auto Ban",          "autoBan",           "Ban from priority list"),
+            ("Auto Runes/Spells", "autoRunes",         "Apply runes & summoners"),
+            ("Accept Invites",    "autoAcceptInvites", "From friends"),
         ]
-        for (label, key), (row, col) in zip(
-            _auto_items, [(0,0),(0,1),(1,0),(1,1),(2,0),(2,1)]
-        ):
-            active  = bool(self.cfg.get(key, DEFAULT_CONFIG.get(key, True)))
-            colspan = 1
-            btn = tk.Button(mid, text=label, relief="flat", cursor="hand2",
-                            font=("Segoe UI", 11, "bold"),
-                            command=lambda k=key: self._toggle_auto(k))
-            self._apply_auto_btn_color(btn, active)
-            btn.grid(row=row, column=col, columnspan=colspan,
-                     sticky="nsew", padx=4, pady=4)
-            self._auto_btns[key] = btn
+        for i, (label, key, desc) in enumerate(_auto_items):
+            row, col = divmod(i, 2)
+            active = bool(self.cfg.get(key, DEFAULT_CONFIG.get(key, True)))
+            card = HexCard(grid, fill=CARD, border=CARD_BORDER, height=92)
+            card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
 
-        self._lbl_ping = tk.Label(parent, text="Ping: —", bg=DARK, fg="#888888",
-                                  font=("Segoe UI", 9, "bold"))
-        self._lbl_ping.pack(pady=(2, 6))
+            # Vertically-centred content so cards stay balanced as they grow.
+            inner = tk.Frame(card.body, bg=CARD)
+            inner.pack(expand=True, fill="x", padx=18)
+            top = tk.Frame(inner, bg=CARD)
+            top.pack(fill="x")
+            tk.Label(top, text=label, bg=CARD, fg=TEXT_BRIGHT,
+                     font=FONT_TITLE).pack(side="left")
+            sw = ToggleSwitch(top, initial=active, bg=CARD,
+                              command=lambda v, k=key: self._on_auto_switch(k, v))
+            sw.pack(side="right")
+            self._auto_switches[key] = sw
+
+            tk.Label(inner, text=desc, bg=CARD, fg=MUTED,
+                     font=FONT_LABEL).pack(anchor="w", pady=(5, 0))
+
+        self._set_run_state("disabled")
 
     def _build_log(self, parent):
+        wrap = tk.Frame(parent, bg=DARK)
+        wrap.pack(fill="both", expand=True, padx=30, pady=(20, 16))
+        self._section_header(wrap, "Logs")
+        # Gold-outlined console panel for consistency with the cards.
+        border = tk.Frame(wrap, bg=CARD_BORDER)
+        border.pack(fill="both", expand=True)
         self._log_box = scrolledtext.ScrolledText(
-            parent, height=10, width=72,
-            bg=DARKER, fg="#aaaaaa",
-            font=("Consolas", 9), relief="flat",
-            state="disabled", wrap="word")
-        self._log_box.pack(fill="both", expand=True, padx=8, pady=8)
+            border, height=10, width=72,
+            bg=CARD, fg="#aab0b8",
+            font=FONT_MONO, relief="flat", bd=0,
+            state="disabled", wrap="word",
+            insertbackground=WHITE, padx=10, pady=8)
+        self._log_box.pack(fill="both", expand=True, padx=1, pady=1)
 
     def _build_settings(self, parent):
-        # Save button anchored to the lower-right of the tab.
+        # Save bar pinned to the bottom, above a gold rule.
         savebar = tk.Frame(parent, bg=DARK)
-        savebar.pack(side="bottom", fill="x", padx=16, pady=(0, 12))
-        tk.Button(savebar, text="💾  Save Config",
-                  bg=GOLD, fg="#000", activebackground="#caa53e",
-                  relief="flat", cursor="hand2", padx=14, pady=4,
-                  font=("Segoe UI", 10, "bold"),
-                  command=self._save).pack(side="right")
+        savebar.pack(side="bottom", fill="x", padx=24, pady=(8, 12))
+        tk.Button(savebar, text="Save Config",
+                  bg=GOLD, fg=DARK, activebackground=_shade(GOLD, 1.1),
+                  relief="flat", cursor="hand2", padx=20, pady=6,
+                  font=FONT_BTN, command=self._save).pack(side="right")
+        tk.Frame(parent, bg=EDGE_GOLD, height=1).pack(side="bottom", fill="x")
 
         # Scrollable body so settings stay reachable in a small window.
         canvas = tk.Canvas(parent, bg=DARK, highlightthickness=0)
@@ -2495,45 +2948,61 @@ class App(tk.Tk):
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _wheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-        # Helper — thin separator line between sections.
-        def _sep():
-            tk.Frame(body, bg="#2e3338", height=1).pack(fill="x", padx=20, pady=(16, 0))
+        # Helper — ornamented header + chamfered card; returns the CARD-bg body.
+        def _section(title, first=False):
+            self._section_header(body, title, padx=24,
+                                 pady=((16 if first else 18), 8))
+            card = HexCard(body, fill=CARD, border=CARD_BORDER, autofit=True)
+            card.pack(fill="x", padx=24)
+            inner = tk.Frame(card.body, bg=CARD)
+            inner.pack(fill="both", expand=True, padx=16, pady=14)
+            return inner
 
-        # Helper — section header + container frame.
-        def _section(title):
-            frm = tk.Frame(body, bg=DARK)
-            frm.pack(fill="x", padx=20, pady=(16, 0))
-            tk.Label(frm, text=title, bg=DARK, fg=GOLD,
-                     font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
-            return frm
+        # Helper — checkbox on a card surface.
+        def _check(parent, text, var, cmd):
+            return tk.Checkbutton(
+                parent, text=text, variable=var, bg=CARD, fg=TEXT,
+                activebackground=CARD, activeforeground=TEXT, selectcolor=PANEL,
+                font=FONT_SMALL, anchor="w", command=cmd)
 
         # Helper — labelled row (label left, widget right).
         def _row(parent, label_text):
-            r = tk.Frame(parent, bg=DARK)
-            r.pack(anchor="w", padx=4, pady=(4, 0))
-            tk.Label(r, text=label_text, bg=DARK, fg=TEXT,
-                     font=("Segoe UI", 9)).pack(side="left")
+            r = tk.Frame(parent, bg=CARD)
+            r.pack(anchor="w", pady=(8, 0))
+            tk.Label(r, text=label_text, bg=CARD, fg=TEXT,
+                     font=FONT_SMALL).pack(side="left")
             return r
 
         # Helper — hint text below a control.
         def _hint(parent, text):
-            tk.Label(parent, text=text, bg=DARK, fg="#555",
-                     font=("Segoe UI", 8)).pack(anchor="w", padx=4, pady=(2, 0))
+            tk.Label(parent, text=text, bg=CARD, fg=FAINT,
+                     font=FONT_HINT).pack(anchor="w", pady=(5, 0))
+
+        # Helper — recessed entry field (clearly visible on a card).
+        def _entry(parent, var, width):
+            return tk.Entry(parent, textvariable=var, width=width, bg=FIELD_BG,
+                            fg=WHITE, relief="flat", insertbackground=WHITE,
+                            font=FONT_SMALL, highlightthickness=1,
+                            highlightbackground=EDGE_GOLD, highlightcolor=GOLD)
+
+        # Helper — secondary button (visible on the card surface).
+        def _sbtn(parent, text, cmd):
+            return tk.Button(parent, text=text, bg=BTN_BG, fg=TEXT,
+                             activebackground=BTN_HOV, relief="flat",
+                             cursor="hand2", padx=12, pady=4, font=FONT_BTN,
+                             command=cmd)
 
         # ── Overlay ───────────────────────────────────────────────────────────
-        s = _section("Overlay")
+        s = _section("Overlay", first=True)
 
         self._overlay_enabled_var = tk.BooleanVar(
             value=bool(self.cfg.get("overlayEnabled", True)))
-        tk.Checkbutton(s, text="Show overlay on League client",
-                       variable=self._overlay_enabled_var,
-                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
-                       selectcolor=PANEL, font=("Segoe UI", 9),
-                       command=lambda: (
-                           self.cfg.__setitem__(
-                               "overlayEnabled", self._overlay_enabled_var.get()),
-                           save_config(self.cfg),
-                       )).pack(anchor="w", padx=4, pady=1)
+        _check(s, "Show overlay on League client", self._overlay_enabled_var,
+               lambda: (
+                   self.cfg.__setitem__(
+                       "overlayEnabled", self._overlay_enabled_var.get()),
+                   save_config(self.cfg),
+               )).pack(anchor="w")
 
         # Keybind capture widget.
         kb_row = _row(s, "Toggle keybind:")
@@ -2542,13 +3011,13 @@ class App(tk.Tk):
         self._kb_btn = tk.Button(
             kb_row,
             text=f"  {_overlay_combo_label(raw_key)}  ",
-            bg=PANEL, fg=WHITE, relief="flat",
-            font=("Segoe UI", 9, "bold"), padx=8, pady=2, cursor="hand2")
+            bg=BTN_BG, fg=WHITE, activebackground=BTN_HOV, relief="flat",
+            font=FONT_BTN, padx=8, pady=2, cursor="hand2")
         self._kb_btn.pack(side="left", padx=(8, 0))
 
         def _start_kb_capture():
             self.focus_set()   # pull focus away from any text entry
-            self._kb_btn.config(text="  Press a key…  ", fg="#888888", state="disabled")
+            self._kb_btn.config(text="  Press a key…  ", fg=MUTED, state="disabled")
             _tid = [None]
 
             def _commit(combo):
@@ -2608,7 +3077,7 @@ class App(tk.Tk):
                           "  Home  ·  End  ·  Insert  ·  Delete  ·  PgUp  ·  PgDn\n\n"
                           "Hold Ctrl, Alt, or Shift for combos (e.g. Ctrl+K)\n"
                           "Press Esc to clear the keybind",
-                     bg="#2a2f35", fg=TEXT, font=("Segoe UI", 9),
+                     bg=TIP_BG, fg=TEXT, font=FONT_SMALL,
                      padx=10, pady=8, justify="left",
                      relief="solid", borderwidth=1).pack()
             _kbt[0] = w
@@ -2619,30 +3088,23 @@ class App(tk.Tk):
         self._kb_btn.bind("<Enter>", _kbt_show)
         self._kb_btn.bind("<Leave>", _kbt_hide)
 
-        tk.Button(s, text="Reset overlay position", bg=PANEL, fg=TEXT, relief="flat",
-                  font=("Segoe UI", 9), padx=8, pady=2, cursor="hand2",
-                  command=self._reset_overlay_pos).pack(anchor="w", padx=4, pady=(8, 0))
+        _sbtn(s, "Reset overlay position", self._reset_overlay_pos).pack(
+            anchor="w", pady=(10, 0))
 
         # ── Party Ready-Up ────────────────────────────────────────────────────
-        _sep()
         s = _section("Party Ready-Up")
 
         self._ready_up_var = tk.BooleanVar(
             value=bool(self.cfg.get("readyUpEnabled", True)))
-        tk.Checkbutton(s, text="Enabled",
-                       variable=self._ready_up_var,
-                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
-                       selectcolor=PANEL, font=("Segoe UI", 9),
-                       command=self._on_ready_up_toggle).pack(
-            anchor="w", padx=4, pady=1)
+        _check(s, "Enabled", self._ready_up_var,
+               self._on_ready_up_toggle).pack(anchor="w")
 
         relay_row = _row(s, "Relay URL:")
         self._relay_var = tk.StringVar(value=str(self.cfg.get("relayUrl", "") or ""))
         self._relay_var.trace_add(
             "write",
             lambda *a: self.cfg.__setitem__("relayUrl", self._relay_var.get().strip()))
-        relay_entry = tk.Entry(relay_row, textvariable=self._relay_var, width=36,
-                               bg=PANEL, fg=WHITE, relief="flat", insertbackground=WHITE)
+        relay_entry = _entry(relay_row, self._relay_var, 36)
         relay_entry.pack(side="left", padx=(8, 0))
 
         def _persist_relay(*_):
@@ -2654,24 +3116,18 @@ class App(tk.Tk):
         _hint(s, "e.g. http://your-server-ip:8777  (same for everyone in the party)")
 
         # ── Auto-Accept Invites ───────────────────────────────────────────────
-        _sep()
         s = _section("Auto-Accept Invites")
 
         self._invite_var = tk.BooleanVar(
             value=bool(self.cfg.get("autoAcceptInvites", False)))
-        tk.Checkbutton(s, text="Accept lobby invites from friends",
-                       variable=self._invite_var,
-                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
-                       selectcolor=PANEL, font=("Segoe UI", 9),
-                       command=lambda: self.cfg.__setitem__(
-                           "autoAcceptInvites", self._invite_var.get())).pack(
-            anchor="w", padx=4, pady=1)
+        _check(s, "Accept lobby invites from friends", self._invite_var,
+               lambda: self.cfg.__setitem__(
+                   "autoAcceptInvites", self._invite_var.get())).pack(anchor="w")
 
         wl_row = _row(s, "Friends only:")
         whitelist_str = ", ".join(self.cfg.get("inviteWhitelist", []))
         self._invite_whitelist_var = tk.StringVar(value=whitelist_str)
-        wl_entry = tk.Entry(wl_row, textvariable=self._invite_whitelist_var, width=36,
-                            bg=PANEL, fg=WHITE, relief="flat", insertbackground=WHITE)
+        wl_entry = _entry(wl_row, self._invite_whitelist_var, 36)
         wl_entry.pack(side="left", padx=(8, 0))
 
         def _persist_whitelist(*_):
@@ -2694,7 +3150,7 @@ class App(tk.Tk):
             tk.Label(w,
                      text="Format: SummonerName#TagLine\n"
                           "e.g.  CoolPlayer#NA1, FriendName#EUW",
-                     bg="#2a2f35", fg=TEXT, font=("Segoe UI", 8),
+                     bg=TIP_BG, fg=TEXT, font=FONT_HINT,
                      padx=8, pady=5, justify="left",
                      relief="solid", borderwidth=1).pack()
             _tip[0] = w
@@ -2706,11 +3162,10 @@ class App(tk.Tk):
         wl_entry.bind("<Leave>", _tip_hide)
 
         # ── Timings ───────────────────────────────────────────────────────────
-        _sep()
         s = _section("Timings  (seconds)")
 
-        g = tk.Frame(s, bg=DARK)
-        g.pack(anchor="nw", padx=4)
+        g = tk.Frame(s, bg=CARD)
+        g.pack(anchor="nw")
         for i, (label, key, note, max_val) in enumerate([
             ("Accept delay:",   "acceptDelay",
              "Wait before auto-accepting a found match",               60),
@@ -2721,8 +3176,8 @@ class App(tk.Tk):
             ("Ban delay:",      "banDelay",
              "Wait after your ban turn starts before banning",          8),
         ]):
-            tk.Label(g, text=label, bg=DARK, fg=TEXT,
-                     font=("Segoe UI", 9)).grid(row=i, column=0, sticky="w", pady=4)
+            tk.Label(g, text=label, bg=CARD, fg=TEXT,
+                     font=FONT_SMALL).grid(row=i, column=0, sticky="w", pady=4)
             var = tk.DoubleVar(value=round(int(self.cfg.get(key, 1000)) / 1000, 1))
             self._delay_vars[key] = var
 
@@ -2730,21 +3185,21 @@ class App(tk.Tk):
                 self.cfg[k] = int(round(min(v.get(), mx) * 1000))
 
             tk.Spinbox(g, from_=0, to=max_val, increment=0.5, textvariable=var,
-                       width=8, bg=PANEL, fg=WHITE, relief="flat", format="%.1f",
-                       command=_on_change).grid(row=i, column=1, padx=(12, 16), sticky="w")
-            tk.Label(g, text=note, bg=DARK, fg="#555",
-                     font=("Segoe UI", 8)).grid(row=i, column=2, sticky="w")
+                       width=8, bg=FIELD_BG, fg=WHITE, relief="flat", format="%.1f",
+                       buttonbackground=BTN_BG, insertbackground=WHITE,
+                       highlightthickness=1, highlightbackground=EDGE_GOLD,
+                       command=_on_change).grid(row=i, column=1, padx=(12, 16),
+                                                sticky="w")
+            tk.Label(g, text=note, bg=CARD, fg=FAINT,
+                     font=FONT_HINT).grid(row=i, column=2, sticky="w")
 
         # ── Stream Deck API ───────────────────────────────────────────────────
-        _sep()
         s = _section("Stream Deck API")
 
         api_row = _row(s, "Port:")
         self._api_port_var = tk.StringVar(
             value=str(self.cfg.get("localApiPort", 8778)))
-        api_port_entry = tk.Entry(api_row, textvariable=self._api_port_var, width=8,
-                                  bg=PANEL, fg=WHITE, relief="flat",
-                                  insertbackground=WHITE)
+        api_port_entry = _entry(api_row, self._api_port_var, 8)
         api_port_entry.pack(side="left", padx=(8, 0))
 
         def _persist_api_port(*_):
@@ -2762,46 +3217,36 @@ class App(tk.Tk):
                   f"  ·  /accept  ·  /status  ·  0 = disabled"))
 
         # ── Startup ───────────────────────────────────────────────────────────
-        _sep()
         s = _section("Startup")
 
         self._startup_var = tk.BooleanVar(value=self._startup_enabled())
-        tk.Checkbutton(
-            s, text="Launch at Windows startup (minimised to tray)",
-            variable=self._startup_var, bg=DARK, fg=TEXT, anchor="w",
-            activebackground=DARK, selectcolor=PANEL, font=("Segoe UI", 9),
-            command=lambda: self._set_startup(self._startup_var.get())
-        ).pack(anchor="w", padx=4, pady=1)
+        _check(s, "Launch at Windows startup (minimised to tray)",
+               self._startup_var,
+               lambda: self._set_startup(self._startup_var.get())).pack(anchor="w")
         _hint(s, "Runs quietly in the tray and auto-connects when League opens")
 
         # ── Updates ───────────────────────────────────────────────────────────
-        _sep()
         s = _section("Updates")
 
-        upd_row = tk.Frame(s, bg=DARK)
-        upd_row.pack(anchor="w", padx=4)
-        tk.Button(upd_row, text="Check for Updates", bg=PANEL, fg=WHITE,
-                  relief="flat", font=("Segoe UI", 9), padx=12, pady=4,
-                  command=self._manual_update_check).pack(side="left")
+        upd_row = tk.Frame(s, bg=CARD)
+        upd_row.pack(anchor="w")
+        _sbtn(upd_row, "Check for Updates",
+              self._manual_update_check).pack(side="left")
         tk.Label(upd_row, text=f"Current version:  v{APP_VERSION}",
-                 bg=DARK, fg="#555",
-                 font=("Segoe UI", 8)).pack(side="left", padx=(12, 0))
+                 bg=CARD, fg=FAINT,
+                 font=FONT_HINT).pack(side="left", padx=(12, 0))
 
-        # ── Audio ─────────────────────────────────────────────────────────────────
-        _sep()
+        # ── Audio ─────────────────────────────────────────────────────────────
         s = _section("Audio")
 
         self._neeko_sound_var = tk.BooleanVar(
             value=bool(self.cfg.get("neekoSoundEnabled", True)))
-        tk.Checkbutton(s, text="Neeko's friendly ready up reminder",
-                       variable=self._neeko_sound_var,
-                       bg=DARK, fg=TEXT, activebackground=DARK, activeforeground=TEXT,
-                       selectcolor=PANEL, font=("Segoe UI", 9),
-                       command=lambda: (
-                           self.cfg.__setitem__("neekoSoundEnabled",
-                                                self._neeko_sound_var.get()),
-                           save_config(self.cfg),
-                       )).pack(anchor="w", padx=4, pady=1)
+        _check(s, "Neeko's friendly ready up reminder", self._neeko_sound_var,
+               lambda: (
+                   self.cfg.__setitem__("neekoSoundEnabled",
+                                        self._neeko_sound_var.get()),
+                   save_config(self.cfg),
+               )).pack(anchor="w")
         _hint(s, "Plays after 30 s when all other tool users in your party are ready")
 
         vol_row = _row(s, "Volume:")
@@ -2809,41 +3254,27 @@ class App(tk.Tk):
             value=int(self.cfg.get("neekoSoundVolume", 80)))
         pct_str = tk.StringVar(value=f"{self._neeko_vol_var.get()}%")
 
-        def _on_vol_change(v):
-            val = int(float(v))
+        def _on_vol_change(val):
+            self._neeko_vol_var.set(val)
             pct_str.set(f"{val}%")
             self.cfg["neekoSoundVolume"] = val
             save_config(self.cfg)
 
-        tk.Scale(vol_row, from_=0, to=100, orient="horizontal",
-                 variable=self._neeko_vol_var, length=160,
-                 bg=DARK, fg=TEXT, highlightthickness=0, sliderrelief="flat",
-                 troughcolor=PANEL, activebackground=GOLD, showvalue=False,
-                 command=_on_vol_change).pack(side="left", padx=(8, 0))
-        tk.Label(vol_row, textvariable=pct_str, bg=DARK, fg=TEXT,
-                 font=("Segoe UI", 9), width=4, anchor="w").pack(
+        HexSlider(vol_row, value=self._neeko_vol_var.get(),
+                  command=_on_vol_change, bg=CARD).pack(side="left", padx=(8, 0))
+        tk.Label(vol_row, textvariable=pct_str, bg=CARD, fg=TEXT,
+                 font=FONT_SMALL, width=4, anchor="w").pack(
             side="left", padx=(6, 0))
-        tk.Button(vol_row, text="🔊", bg=PANEL, fg=TEXT,
+        tk.Button(vol_row, text="🔊", bg=BTN_BG, fg=TEXT,
                   relief="flat", cursor="hand2", padx=6, pady=1,
-                  font=("Segoe UI", 10),
+                  activebackground=BTN_HOV, font=FONT_LABEL,
                   command=lambda: _play_sound(
                       READY_SOUND,
                       max(0, min(100, self._neeko_vol_var.get())) / 100.0,
                   )).pack(side="left", padx=(8, 0))
 
-        # ── ToS Warning ───────────────────────────────────────────────────────
-        warn = tk.Frame(body, bg="#2a1a1a", padx=12, pady=10)
-        warn.pack(fill="x", padx=20, pady=(24, 16))
-        tk.Label(warn, text="⚠  Terms of Service Warning", bg="#2a1a1a",
-                 fg=RED, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        tk.Label(warn,
-                 text=(
-                     "Third-party tools that automate client actions may violate\n"
-                     "Riot Games' Terms of Service.  Account restrictions or bans\n"
-                     "are possible.  Use at your own risk."
-                 ),
-                 bg="#2a1a1a", fg="#cc6666",
-                 font=("Segoe UI", 9), justify="left").pack(anchor="w", pady=(4, 0))
+        # Bottom breathing room so the last card isn't flush with the save bar.
+        tk.Frame(body, bg=DARK, height=18).pack(fill="x")
 
     # ── Auto-connect watcher ──────────────────────────────────────────────────
     def _ping_host(self):
@@ -2863,9 +3294,14 @@ class App(tk.Tk):
             pass
         return host
 
+    def _set_ping(self, text, fg):
+        lbl = getattr(self, "_lbl_ping", None)
+        if lbl:
+            lbl.config(text=text, fg=fg)
+
     def _watch_ping(self):
         """Background thread: real ICMP ping to the regional Riot host, averaged
-        over a few samples and smoothed, shown colour-coded under Ready Up."""
+        over a few samples and smoothed, shown colour-coded in the header."""
         ema = None  # exponential moving average for a steady readout
         self._ping_val  = None
         self._ping_hist = []   # [(monotonic, ms_or_None)]  rolling 60 s
@@ -2877,8 +3313,7 @@ class App(tk.Tk):
                 ema = None
                 self._ping_val = None
                 self._ping_hist.append((now, None))
-                self.after(0, lambda: self._lbl_ping.config(
-                    text="Ping: —", fg="#888888"))
+                self.after(0, lambda: self._set_ping("● Ping: —", MUTED))
             else:
                 ema = ms if ema is None else (0.8 * ema + 0.2 * ms)
                 val = max(1, int(round(ema)))   # never show the impossible 0
@@ -2886,8 +3321,7 @@ class App(tk.Tk):
                 raw = max(1, int(round(ms)))    # raw single-probe for graph
                 self._ping_hist.append((now, raw))
                 fg  = GREEN if val < 60 else (GOLD if val < 120 else RED)
-                self.after(0, lambda v=val, c=fg: self._lbl_ping.config(
-                    text=f"Ping: {v} ms", fg=c))
+                self.after(0, lambda v=val, c=fg: self._set_ping(f"● Ping: {v} ms", c))
             # Prune to last 60 s
             cutoff = now - 60
             self._ping_hist = [(t, v) for t, v in self._ping_hist if t >= cutoff]
@@ -2918,14 +3352,14 @@ class App(tk.Tk):
             if not self.cfg.get("readyUpEnabled", True):
                 self._relay_connected = False
                 self.after(0, lambda: self._lbl_relay.config(
-                    text="● Relay: disabled", fg="#888888"))
+                    text="● Relay: disabled", fg=MUTED))
                 time.sleep(5)
                 continue
             url = (self.cfg.get("relayUrl") or "").strip().rstrip("/")
             if not url:
                 self._relay_connected = False
                 self.after(0, lambda: self._lbl_relay.config(
-                    text="● Relay: not set", fg="#888888"))
+                    text="● Relay: not set", fg=MUTED))
             else:
                 ok = False
                 try:
@@ -2935,10 +3369,10 @@ class App(tk.Tk):
                 self._relay_connected = ok
                 if ok:
                     self.after(0, lambda: self._lbl_relay.config(
-                        text="● Relay connected", fg=GREEN))
+                        text="● Relay: connected", fg=GREEN))
                 else:
                     self.after(0, lambda: self._lbl_relay.config(
-                        text="● Relay offline", fg=RED))
+                        text="● Relay: offline", fg=RED))
             time.sleep(5)
 
     def _watch_for_client(self):
@@ -2964,30 +3398,53 @@ class App(tk.Tk):
             time.sleep(POLL)
 
     # ── Controls ──────────────────────────────────────────────────────────────
+    def _set_run_state(self, state):
+        """Drive the single hextech Start/Stop button.
+        states: 'disabled' (no client) · 'idle' (connected, stopped) · 'running'."""
+        self._run_state = state
+        if not getattr(self, "_run_btn", None):
+            return
+        if state == "disabled":
+            self._run_btn.set_look("▶  START", DARK, EDGE_GOLD, FAINT, False)
+        elif state == "idle":
+            self._run_btn.set_look("▶  START", GOLD, GOLD, DARK, True)
+        else:  # running
+            self._run_btn.set_look("■  STOP", DARK, GOLD, GOLD, True)
+
+    def _on_run_click(self):
+        if self._run_state == "running":
+            self._stop()
+        elif self._run_state == "idle":
+            self._start()
+
     def _on_connected(self):
-        self._lbl_conn.config(text="● Connected", fg=GREEN)
+        self._lbl_conn.config(text="● Client: connected", fg=GREEN)
         self.log("League client detected — connected automatically.")
         # Auto-start automation so it's already running by the time champ
         # select begins — no need to click Start manually.
         self._start()
 
     def _on_disconnected(self):
-        self._lbl_conn.config(text="● Waiting for client…", fg="#888888")
-        self._btn_start.config(state="disabled")
-        self._btn_stop.config(state="disabled")
+        self._lbl_conn.config(text="● Client: waiting", fg=MUTED)
+        self._running    = False
+        self._start_time = None
+        self._set_run_state("disabled")
         self._engine.stop()
         self.log("League client closed. Waiting for it to reopen…")
 
     def _start(self):
         self._engine.start()
-        self._btn_start.config(state="disabled")
-        self._btn_stop.config(state="normal")
+        self._running = True
+        if not self._start_time:
+            self._start_time = time.monotonic()
+        self._set_run_state("running")
         self.log("Automation started.")
 
     def _stop(self):
         self._engine.stop()
-        self._btn_stop.config(state="disabled")
-        self._btn_start.config(state="normal")
+        self._running    = False
+        self._start_time = None
+        self._set_run_state("idle")
         self.log("Automation stopped.")
 
     # ── Launch at Windows startup (per-user, no admin) ─────────────────────────
@@ -3079,24 +3536,23 @@ class App(tk.Tk):
                 self._overlay.set_phase(phase)
         self.after(0, _do)
 
-    @staticmethod
-    def _apply_auto_btn_color(btn, active: bool):
-        if active:
-            btn.config(bg=GREEN, fg=WHITE,
-                       activebackground="#1f8f4e", activeforeground=WHITE)
-        else:
-            btn.config(bg=RED, fg=WHITE,
-                       activebackground="#6e1414", activeforeground=WHITE)
+    def _on_auto_switch(self, key: str, value: bool):
+        """Called when a dashboard ToggleSwitch is clicked."""
+        self.cfg[key] = bool(value)
+        save_config(self.cfg)
+        # Keep Settings panel checkbox in sync if it exists.
+        if key == "autoAcceptInvites" and hasattr(self, "_invite_var"):
+            self._invite_var.set(bool(value))
 
     def _toggle_auto(self, key: str):
+        """Flip an automation programmatically (external trigger / hotkey)."""
         default = DEFAULT_CONFIG.get(key, True)
-        active = not bool(self.cfg.get(key, default))
+        active  = not bool(self.cfg.get(key, default))
         self.cfg[key] = active
         save_config(self.cfg)
-        btn = self._auto_btns.get(key)
-        if btn:
-            self._apply_auto_btn_color(btn, active)
-        # Keep Settings panel checkbox in sync if it exists.
+        sw = self._auto_switches.get(key)
+        if sw:
+            sw.set(active)   # reflect on the dashboard toggle (silent)
         if key == "autoAcceptInvites" and hasattr(self, "_invite_var"):
             self._invite_var.set(active)
 
@@ -3349,15 +3805,15 @@ class App(tk.Tk):
         q = self._perma_var.get().lower().strip()
         self._perma_ac.delete(0, "end")
         if not q:
-            self._perma_ac.pack_forget()
+            self._perma_ac.grid_remove()
             return
         hits = [n for n in self.ddragon.all_display_names() if q in n.lower()][:6]
         if not hits:
-            self._perma_ac.pack_forget()
+            self._perma_ac.grid_remove()
             return
         for h in hits:
             self._perma_ac.insert("end", "  " + h)
-        self._perma_ac.pack(fill="x")
+        self._perma_ac.grid(row=1, column=1, sticky="we", padx=8, pady=(4, 0))
 
     def _perma_ac_select(self, _evt):
         sel = self._perma_ac.curselection()
@@ -3387,7 +3843,7 @@ class App(tk.Tk):
             self.log(f"Permaban added: {self.ddragon.name(cid)}")
         self._perma_var.set("")
         if hasattr(self, "_perma_ac"):
-            self._perma_ac.pack_forget()
+            self._perma_ac.grid_remove()
 
     def _remove_permaban(self):
         sel = self._perma_lb.curselection()
