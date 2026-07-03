@@ -84,7 +84,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.9.7"
+APP_VERSION = "1.9.8"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -2106,11 +2106,15 @@ class LCUOverlay:
         self._btn           = btn
         self._btn_label     = ""
         self._btn_style     = "find"
+        self._btn_prev_style = "find"
         self._btn_hover     = False
         self._btn_small     = False
+        self._btn_shown     = None   # 4-tuple of colours currently rendered
+        self._btn_anim      = None   # pending after() id for the colour morph
         self._ct_state      = None   # "clickable" | "passthrough" | "hidden"
         self._ct_lmb_was    = False
         self._ct_hide_until = 0.0
+        self._click_grace   = 0.0    # suppress self-foreground hide right after a click
         self._tick()
         self._ct_poll()
 
@@ -2164,6 +2168,10 @@ class LCUOverlay:
     # ── Click-through / auto-hide management ─────────────────────────────────
     _GWL_EXSTYLE       = -20
     _WS_EX_TRANSPARENT = 0x00000020
+    # WS_EX_NOACTIVATE: the overlay receives mouse clicks but never becomes the
+    # foreground window, so clicking Ready Up can't steal focus from League and
+    # spuriously trip the "our own window is in front → hide" rule in _refresh.
+    _WS_EX_NOACTIVATE  = 0x08000000
 
     def _ct_update(self, state: str):
         """Apply one of three states to the overlay window:
@@ -2176,20 +2184,22 @@ class LCUOverlay:
         self._ct_state = state
         user32 = ctypes.windll.user32
         hwnd   = self._win.winfo_id()
-        style  = user32.GetWindowLongW(hwnd, self._GWL_EXSTYLE)
+        base   = user32.GetWindowLongW(hwnd, self._GWL_EXSTYLE) | self._WS_EX_NOACTIVATE
         if state == "clickable":
-            user32.SetWindowLongW(hwnd, self._GWL_EXSTYLE,
-                                  style & ~self._WS_EX_TRANSPARENT)
-            self._win.wm_attributes("-alpha", 1.0)
+            new_style, alpha = base & ~self._WS_EX_TRANSPARENT, 1.0
         elif state == "passthrough":
-            user32.SetWindowLongW(hwnd, self._GWL_EXSTYLE,
-                                  style | self._WS_EX_TRANSPARENT)
-            self._win.wm_attributes("-alpha", 1.0)
-            self._btn_set_hover(False)
+            new_style, alpha = base | self._WS_EX_TRANSPARENT, 1.0
         else:  # hidden
-            user32.SetWindowLongW(hwnd, self._GWL_EXSTYLE,
-                                  style | self._WS_EX_TRANSPARENT)
-            self._win.wm_attributes("-alpha", 0.0)
+            new_style, alpha = base | self._WS_EX_TRANSPARENT, 0.0
+        user32.SetWindowLongW(hwnd, self._GWL_EXSTYLE, new_style)
+        # Commit the ex-style change. WS_EX_NOACTIVATE is cached until the frame
+        # is recalculated, so without SWP_FRAMECHANGED the overlay would still
+        # steal foreground on the first click. The window is frameless, so this
+        # has no visible cost.
+        _SWP = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020  # NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, _SWP)
+        self._win.wm_attributes("-alpha", alpha)
+        if state != "clickable":
             self._btn_set_hover(False)
 
     # Proportional region of the LCU window that contains the role-select button
@@ -2281,18 +2291,32 @@ class LCUOverlay:
         user32       = ctypes.windll.user32
         fg           = user32.GetForegroundWindow()
         overlay_hwnd = self._win.winfo_id()
-        if fg and fg != hwnd and fg != overlay_hwnd:
-            # The overlay tracks the League client only. If one of our OWN
-            # windows (the client tool, its dialogs) is in the foreground,
-            # hide the overlay — it should never show just because the tool
-            # is up. Only the League client's own process keeps it visible.
+
+        # Tk wraps the overlay Toplevel, so GetForegroundWindow() returns the
+        # wrapper HWND while winfo_id() returns the inner child — they differ.
+        # Compare top-level roots so the overlay's OWN window (which becomes
+        # foreground when you click Ready Up) is never mistaken for the main
+        # tool window and never triggers a hide.
+        _GA_ROOT = 2
+        user32.GetAncestor.restype  = ctypes.c_void_p
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        overlay_root = user32.GetAncestor(overlay_hwnd, _GA_ROOT)
+        fg_root      = user32.GetAncestor(fg, _GA_ROOT) if fg else None
+        is_overlay   = (overlay_root is not None and fg_root == overlay_root)
+
+        if (fg and fg != hwnd and not is_overlay
+                and time.monotonic() >= self._click_grace):
+            # A window that isn't League and isn't our overlay is in front.
+            # If it belongs to our process it's the main tool window → hide
+            # (the overlay shouldn't show just because the dashboard is up).
             fg_pid = ctypes.wintypes.DWORD()
             user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
             if fg_pid.value == os.getpid():
                 self._win.withdraw()
-                _dbg("refresh: withdraw (client tool window in foreground)")
+                _dbg("refresh: withdraw (main tool window in foreground)")
                 return
 
+            # Otherwise hide only when another app's window covers League's centre.
             lc_rect = ctypes.wintypes.RECT()
             fg_rect = ctypes.wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(lc_rect))
@@ -2396,6 +2420,9 @@ class LCUOverlay:
             return
         if self._btn_small:
             return
+        # Clicking briefly disturbs focus/z-order; give it time to settle back
+        # on League before the refresh loop is allowed to hide the overlay again.
+        self._click_grace = time.monotonic() + 2.0
         lcu:  "LCU" = self._app._lcu
         phase = self._phase
         hwnd  = self._find_lcu()
@@ -2493,13 +2520,46 @@ class LCUOverlay:
         self._draw_lol_btn()
 
     def _draw_lol_btn(self):
+        target = (self._BTN_HOVER if self._btn_hover else self._BTN_THEMES).get(
+            self._btn_style, self._BTN_THEMES["find"])
+
+        # Animate the colour sweep when toggling between the red "not ready"
+        # and green "ready" states (the text/numbers update immediately).
+        prev = self._btn_prev_style
+        self._btn_prev_style = self._btn_style
+        toggling = ({prev, self._btn_style} == {"ready", "notready"})
+
+        if toggling and not self._btn_small and self._btn_shown is not None:
+            self._animate_btn(self._btn_shown, target)
+        else:
+            if self._btn_anim is not None:
+                self._app.after_cancel(self._btn_anim)
+                self._btn_anim = None
+            self._render_btn(target)
+
+    def _animate_btn(self, c_from, c_to, steps=6):
+        if self._btn_anim is not None:
+            self._app.after_cancel(self._btn_anim)
+            self._btn_anim = None
+
+        def _step(i):
+            t   = i / steps
+            cur = tuple(_blend(c_from[k], c_to[k], t) for k in range(4))
+            self._render_btn(cur)
+            if i < steps:
+                self._btn_anim = self._app.after(26, lambda: _step(i + 1))
+            else:
+                self._btn_anim = None
+                self._render_btn(c_to)
+
+        _step(1)
+
+    def _render_btn(self, colors):
+        self._btn_shown = colors
         c = self._btn
         w = int(c["width"])
         h = int(c["height"])
-
-        theme = (self._BTN_HOVER if self._btn_hover else self._BTN_THEMES).get(
-            self._btn_style, self._BTN_THEMES["find"])
-        b_dark, b_hi, fill, fg = theme
+        b_dark, b_hi, fill, fg = colors
         cut     = 5 if self._btn_small else 9
         font_sz = 10 if self._btn_small else 12
 
