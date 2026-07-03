@@ -9,7 +9,7 @@ WARNING: Third-party automation tools may violate Riot Games' Terms of Service
 and could result in account penalties. Use at your own risk.
 """
 
-import sys, os, json, threading, time, random, hashlib, subprocess, re as _re, math as _math
+import sys, os, json, threading, time, hashlib, subprocess, re as _re, math as _math
 import ctypes, ctypes.wintypes
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -84,7 +84,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.9.8"
+APP_VERSION = "1.9.9"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1503,7 +1503,6 @@ FONT_STATUS  = ("Segoe UI", 10)           # header status readouts (uniform)
 
 # Shared surfaces
 TIP_BG  = "#12263a"   # tooltip background (dark navy)
-WARN_BG = "#2a1418"   # ToS warning tint
 
 BTN_STYLE = dict(relief="flat", cursor="hand2", font=FONT_BTN,
                  activeforeground=WHITE)
@@ -2316,18 +2315,26 @@ class LCUOverlay:
                 _dbg("refresh: withdraw (main tool window in foreground)")
                 return
 
-            # Otherwise hide only when another app's window covers League's centre.
-            lc_rect = ctypes.wintypes.RECT()
-            fg_rect = ctypes.wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(lc_rect))
-            user32.GetWindowRect(fg,   ctypes.byref(fg_rect))
-            lc_cx = (lc_rect.left + lc_rect.right)  // 2
-            lc_cy = (lc_rect.top  + lc_rect.bottom) // 2
-            if (fg_rect.left <= lc_cx <= fg_rect.right and
-                    fg_rect.top <= lc_cy <= fg_rect.bottom):
-                self._win.withdraw()
-                _dbg("refresh: withdraw (fg window covering league centre)")
-                return
+            # If the foreground window belongs to the League client's OWN
+            # process, the user is looking at League — even if it's a second
+            # League window that isn't the exact handle _find_lcu() returned.
+            # Never treat that as a covering app (otherwise clicking League can
+            # blink the overlay out for a couple of refresh cycles).
+            league_pid = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(league_pid))
+            if fg_pid.value != league_pid.value:
+                # Otherwise hide only when another app covers League's centre.
+                lc_rect = ctypes.wintypes.RECT()
+                fg_rect = ctypes.wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(lc_rect))
+                user32.GetWindowRect(fg,   ctypes.byref(fg_rect))
+                lc_cx = (lc_rect.left + lc_rect.right)  // 2
+                lc_cy = (lc_rect.top  + lc_rect.bottom) // 2
+                if (fg_rect.left <= lc_cx <= fg_rect.right and
+                        fg_rect.top <= lc_cy <= fg_rect.bottom):
+                    self._win.withdraw()
+                    _dbg("refresh: withdraw (fg window covering league centre)")
+                    return
 
         relay_on   = bool(getattr(self._app, "_relay_connected", False))
         ready_up   = bool(self._app.cfg.get("readyUpEnabled", True))
@@ -2468,13 +2475,11 @@ class LCUOverlay:
     # Button themes: (outer_dark, inner_highlight, fill, text)
     _BTN_THEMES = {
         "find":     ("#463714", "#C8AA6E", "#091428", "#C8AA6E"),
-        "accept":   ("#004A3A", "#0AC8B9", "#091E14", "#FFFFFF"),
         "ready":    ("#145A28", "#1EBF5A", "#091A10", "#FFFFFF"),
         "notready": ("#5A1A10", "#C83232", "#1A0808", "#E88080"),
     }
     _BTN_HOVER = {
         "find":     ("#5A4A1A", "#F0E6D3", "#091428", "#F0E6D3"),
-        "accept":   ("#005A4A", "#4AE8D8", "#091E14", "#FFFFFF"),
         "ready":    ("#1A7A34", "#4AE87A", "#091A10", "#FFFFFF"),
         "notready": ("#7A2010", "#E85050", "#1A0808", "#FFFFFF"),
     }
@@ -2600,6 +2605,11 @@ class App(tk.Tk):
 
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         LOG_FILE.write_text("", encoding="utf-8")  # clear on startup
+        try:                                        # clear the debug log too, so
+            _DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)  # it doesn't grow
+            _DEBUG_LOG.write_text("", encoding="utf-8")           # across sessions
+        except Exception:
+            pass
 
         self.cfg     = load_config()
         self.ddragon = DDragon()
@@ -2609,15 +2619,12 @@ class App(tk.Tk):
 
         self._role_panels: dict = {}   # role → RolePanel
         self._delay_vars:  dict = {}
-        self._bool_vars:   dict = {}
         self._connected    = False
 
         # Dashboard state
         self._auto_switches: dict = {}   # key → ToggleSwitch
         self._nav_rows:      dict = {}   # page-name → (row, accent, label)
         self._pages:         dict = {}   # page-name → content frame
-        self._running     = False
-        self._start_time  = None         # monotonic when automation started
 
         self._build_ui()
 
@@ -3486,24 +3493,17 @@ class App(tk.Tk):
 
     def _on_disconnected(self):
         self._lbl_conn.config(text="● Client: waiting", fg=MUTED)
-        self._running    = False
-        self._start_time = None
         self._set_run_state("disabled")
         self._engine.stop()
         self.log("League client closed. Waiting for it to reopen…")
 
     def _start(self):
         self._engine.start()
-        self._running = True
-        if not self._start_time:
-            self._start_time = time.monotonic()
         self._set_run_state("running")
         self.log("Automation started.")
 
     def _stop(self):
         self._engine.stop()
-        self._running    = False
-        self._start_time = None
         self._set_run_state("idle")
         self.log("Automation stopped.")
 
@@ -3701,81 +3701,9 @@ class App(tk.Tk):
             threading.Thread(target=_disconnect, daemon=True).start()
         self.log(f"Ready Up {'enabled' if enabled else 'disabled'}.")
 
-    def _ultimate_bravery(self):
-        """Roll a random available champion and hover it on our pick action.
-        It's registered as the chosen pick so Auto Pick locks it (and Auto
-        Pre-Pick won't override the roll)."""
-        def _do():
-            try:
-                if not self._connected:
-                    self.log("Ultimate Bravery: connect to the League client first.")
-                    return
-                r = self._lcu.get("/lol-champ-select/v1/session")
-                if r.status_code != 200:
-                    self.log("Ultimate Bravery: only works during champion select.")
-                    return
-                s = r.json()
-                cell = s.get("localPlayerCellId")
-                if cell is None:
-                    return
-                my_cell = str(cell)
-
-                # our current (incomplete) pick action
-                pick_aid = None
-                for grp in s.get("actions", []):
-                    for a in grp:
-                        if (str(a.get("actorCellId", "")) == my_cell
-                                and a.get("type") == "pick"
-                                and not a.get("completed")):
-                            pick_aid = int(a.get("id", -1))
-                if pick_aid is None:
-                    self.log("Ultimate Bravery: no pick available right now.")
-                    return
-
-                # available pool = pickable − bans − already taken, real champs only
-                bans = set()
-                for b in s.get("bans", {}).get("myTeamBans", []):
-                    if int(b): bans.add(int(b))
-                for b in s.get("bans", {}).get("theirTeamBans", []):
-                    if int(b): bans.add(int(b))
-                taken = set()
-                for p in s.get("myTeam", []):
-                    if str(p.get("cellId", "")) != my_cell:
-                        c = int(p.get("championId", 0) or 0)
-                        if c: taken.add(c)
-                for p in s.get("theirTeam", []):
-                    c = int(p.get("championId", 0) or 0)
-                    if c: taken.add(c)
-
-                real = self.ddragon.all_ids()
-                pickable = self._engine._get_pickable_ids()
-                pool = [c for c in pickable
-                        if c in real and c not in bans and c not in taken]
-                if not pool:
-                    self.log("Ultimate Bravery: no available champions to roll.")
-                    return
-
-                champ = random.choice(pool)
-                rr = self._lcu.patch(
-                    f"/lol-champ-select/v1/session/actions/{pick_aid}",
-                    {"championId": champ},
-                )
-                if rr.status_code in (200, 204):
-                    # Treat the roll as the user's pick so the engine respects it.
-                    self._engine._user_pick[pick_aid] = champ
-                    self.log(f"🎲 ULTIMATE BRAVERY rolled: {self.ddragon.name(champ)}!")
-                else:
-                    self.log(f"Ultimate Bravery: hover failed (HTTP {rr.status_code}).")
-            except Exception as e:
-                self.log(f"Ultimate Bravery error: {e}")
-
-        threading.Thread(target=_do, daemon=True).start()
-
     def _save(self):
         for k, v in self._delay_vars.items():
             self.cfg[k] = int(round(v.get() * 1000))   # seconds (UI) → ms (config)
-        for k, v in self._bool_vars.items():
-            self.cfg[k] = v.get()
         if hasattr(self, "_overlay_enabled_var"):
             self.cfg["overlayEnabled"] = self._overlay_enabled_var.get()
         if hasattr(self, "_ready_up_var"):
