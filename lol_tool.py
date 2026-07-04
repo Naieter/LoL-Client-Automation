@@ -84,7 +84,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -3748,7 +3748,101 @@ class App(tk.Tk):
             "rune_primary":        runes.get("primary_rune_names", []),
             "rune_secondary_page": runes.get("secondary_page_name", ""),
             "rune_secondary":      runes.get("secondary_rune_names", []),
+            # Up to 3 distinct spell + rune-page combos (most popular first),
+            # each pushable to the client. op.gg exposes one per tier, so the
+            # variety comes from sampling several rank tiers.
+            "combos": self._fetch_combos(og_name, pos),
         }
+
+    # Rank tiers sampled for combo variety, broadest ("all") first so the most
+    # popular combo is combo #1 and higher-elo variants follow.
+    _COMBO_TIERS = [("all", "All ranks"), ("diamond_plus", "Diamond+"),
+                    ("challenger", "Challenger")]
+
+    def _fetch_one_combo(self, og_name, position, tier):
+        """One (spells + rune page) combo for a champion/role at a rank tier,
+        with the IDs needed to push it to the client, or None."""
+        body = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "lol_get_champion_analysis",
+                "arguments": {
+                    "champion": og_name, "position": position,
+                    "game_mode": "ranked", "tier": tier,
+                    "desired_output_fields": [
+                        "data.runes.primary_page_id", "data.runes.primary_page_name",
+                        "data.runes.primary_rune_ids", "data.runes.primary_rune_names",
+                        "data.runes.secondary_page_id", "data.runes.secondary_page_name",
+                        "data.runes.secondary_rune_ids", "data.runes.secondary_rune_names",
+                        "data.runes.stat_mod_ids", "data.runes.pick_rate",
+                        "data.summoner_spells.ids", "data.summoner_spells.ids_names",
+                    ],
+                },
+            },
+        }
+        try:
+            r = requests.post("https://mcp-api.op.gg/mcp", json=body, timeout=15,
+                              headers={"Accept": "application/json, text/event-stream"})
+            r.raise_for_status()
+            rec = _parse_opgg_record(r.json()["result"]["content"][0]["text"])
+        except Exception as e:
+            _dbg(f"[combo] {tier} fetch failed: {e}")
+            return None
+        if not rec or "data" not in rec:
+            return None
+        rn = (rec["data"] or {}).get("runes") or {}
+        sp = (rec["data"] or {}).get("summoner_spells") or {}
+        prim = [int(x) for x in (rn.get("primary_rune_ids") or [])]
+        sec  = [int(x) for x in (rn.get("secondary_rune_ids") or [])]
+        shard = [int(x) for x in (rn.get("stat_mod_ids") or [])]
+        sids = [int(x) for x in (sp.get("ids") or [])][:2]
+        if not (prim and sec and len(sids) == 2):
+            return None
+        return {
+            "primary_page_id":     int(rn.get("primary_page_id") or 0),
+            "primary_page_name":   rn.get("primary_page_name", ""),
+            "primary_rune_ids":    prim,
+            "primary_rune_names":  rn.get("primary_rune_names", []),
+            "secondary_page_id":   int(rn.get("secondary_page_id") or 0),
+            "secondary_page_name": rn.get("secondary_page_name", ""),
+            "secondary_rune_ids":  sec,
+            "secondary_rune_names": rn.get("secondary_rune_names", []),
+            "stat_mod_ids":        shard,
+            "spell_ids":           sids,
+            "spell_names":         [_spell_name(s) for s in sids],
+            "pick_rate":           rn.get("pick_rate"),
+        }
+
+    def _fetch_combos(self, og_name, position):
+        """Up to 3 DISTINCT (spells + rune page) combos, most popular first.
+        Samples several rank tiers in parallel, then dedupes."""
+        results = {}
+        def work(tier, label):
+            c = self._fetch_one_combo(og_name, position, tier)
+            if c:
+                c["label"] = label
+                results[tier] = c
+        threads = [threading.Thread(target=work, args=(t, lbl), daemon=True)
+                   for t, lbl in self._COMBO_TIERS]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=18)
+        seen, combos = set(), []
+        for tier, _label in self._COMBO_TIERS:
+            c = results.get(tier)
+            if not c:
+                continue
+            key = (c["primary_page_id"], tuple(c["primary_rune_ids"]),
+                   c["secondary_page_id"], tuple(c["secondary_rune_ids"]),
+                   tuple(c["stat_mod_ids"]), tuple(c["spell_ids"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            combos.append(c)
+            if len(combos) >= 3:
+                break
+        return combos
 
     def _detect_summoner(self):
         """(game_name, tag_line, region) for the signed-in summoner, or None."""
@@ -4232,7 +4326,7 @@ class App(tk.Tk):
                           font=FONT_SMALL, highlightthickness=1,
                           highlightbackground=EDGE_GOLD, highlightcolor=GOLD)
         bentry.pack(side="left", ipady=3)
-        bentry.bind("<Return>", lambda *_: self._load_build())
+        bentry.bind("<Return>", lambda *_: self._build_entry_return())
         tk.Button(ctl, text="Search", bg=BTN_BG, fg=GOLD, activebackground=BTN_HOV,
                   activeforeground=GOLD, relief="flat", cursor="hand2", font=FONT_BTN,
                   padx=12, pady=3, command=self._load_build).pack(side="left", padx=(8, 0))
@@ -4318,6 +4412,37 @@ class App(tk.Tk):
             self._build_ac.place_forget()
             self._load_build()
 
+    def _build_entry_return(self):
+        """Enter in the champion box: if the suggestion list is showing, load the
+        top suggestion; otherwise load whatever was typed."""
+        ac = getattr(self, "_build_ac", None)
+        if ac is not None and ac.winfo_ismapped() and ac.size() > 0:
+            top = ac.get(0).strip()
+            self._build_champ_var.set(top)
+            ac.place_forget()
+            self._load_build(top)
+        else:
+            self._load_build()
+
+    def _assigned_role_pos(self):
+        """The op.gg position for the local player's assigned role in champ
+        select, pulled live from the client, or None if not applicable."""
+        try:
+            if not getattr(self._lcu, "_sess", None):
+                return None
+            r = self._lcu.get("/lol-champ-select/v1/session")
+            if r.status_code != 200:
+                return None
+            s = r.json()
+            cell = s.get("localPlayerCellId")
+            for mbr in s.get("myTeam", []):
+                if mbr.get("cellId") == cell:
+                    assigned = (mbr.get("assignedPosition") or "").lower()
+                    return OPGG_POSITION.get(assigned) or None
+        except Exception:
+            return None
+        return None
+
     def _build_placeholder(self, msg):
         for w in self._build_result.winfo_children():
             w.destroy()
@@ -4345,7 +4470,13 @@ class App(tk.Tk):
             return
         if hasattr(self, "_build_ac"):
             self._build_ac.place_forget()
+        # When importing/loading a build during champ select, reflect the role
+        # the client assigned us on the Position indicator (unless the caller
+        # already supplied a position, e.g. current pick / hover).
+        if position is None:
+            position = self._assigned_role_pos()
         position = position or self._build_pos_var.get()
+        self._set_build_pos(position)   # keep the indicator in sync with the load
         # Sequence token: if a newer request starts before this fetch returns
         # (e.g. the hovered champion changed), the stale result is discarded.
         self._build_req = getattr(self, "_build_req", 0) + 1
@@ -4425,16 +4556,30 @@ class App(tk.Tk):
         if data.get("damage"):
             stat("DAMAGE", data["damage"])
 
-        # ── Runes + spells (full width for the long rune lists) ────────────────
+        # ── Runes + spells: up to 3 popular combos, each applies to the client ─
         rn = card(pad, "Runes & Spells")
-        if data.get("rune_primary"):
-            kv(rn, data.get("rune_primary_page", "Primary"),
-               " · ".join(data["rune_primary"]), TEAL)
-        if data.get("rune_secondary"):
-            kv(rn, data.get("rune_secondary_page", "Secondary"),
-               " · ".join(data["rune_secondary"]), MUTED)
-        if data.get("spells"):
-            kv(rn, "Spells", "  +  ".join(data["spells"]), GOLD)
+        combos = data.get("combos") or []
+        if combos:
+            tk.Label(rn, text="Choose a combo to push its runes & summoner "
+                     "spells to your client:", bg=CARD, fg=MUTED,
+                     font=FONT_SMALL).pack(anchor="w", pady=(0, 2))
+            for combo in combos:
+                self._render_combo_row(rn, combo)
+            self._build_combo_status = tk.Label(
+                rn, text="", bg=CARD, fg=MUTED, font=FONT_SMALL,
+                anchor="w", justify="left", wraplength=560)
+            self._build_combo_status.pack(anchor="w", pady=(4, 0))
+        else:
+            # Fallback: op.gg gave a single set (no combo IDs) — show it read-only.
+            self._build_combo_status = None
+            if data.get("rune_primary"):
+                kv(rn, data.get("rune_primary_page", "Primary"),
+                   " · ".join(data["rune_primary"]), TEAL)
+            if data.get("rune_secondary"):
+                kv(rn, data.get("rune_secondary_page", "Secondary"),
+                   " · ".join(data["rune_secondary"]), MUTED)
+            if data.get("spells"):
+                kv(rn, "Spells", "  +  ".join(data["spells"]), GOLD)
 
         # ── Build + Ability order side by side (use the horizontal space) ──────
         cols = tk.Frame(pad, bg=DARK)
@@ -4479,6 +4624,123 @@ class App(tk.Tk):
                          font=("Segoe UI", 10, "bold")).pack()
                 tk.Label(col, text=str(i + 1), bg=CARD, fg=FAINT,
                          font=("Segoe UI", 7)).pack()
+
+    def _render_combo_row(self, parent, combo):
+        """One selectable spell + rune-page combo with an Apply button."""
+        row = tk.Frame(parent, bg=CARD)
+        row.pack(fill="x", pady=(2, 2))
+
+        tk.Button(row, text="Apply", bg=BTN_BG, fg=GOLD, activebackground=BTN_HOV,
+                  activeforeground=GOLD, relief="flat", cursor="hand2", font=FONT_BTN,
+                  padx=12, pady=4,
+                  command=lambda c=combo: self._apply_combo(c)).pack(
+            side="left", padx=(0, 10))
+
+        info = tk.Frame(row, bg=CARD)
+        info.pack(side="left", fill="x", expand=True)
+
+        # Header line: tier label · pick-rate · summoner spells
+        head = tk.Frame(info, bg=CARD)
+        head.pack(fill="x", anchor="w")
+        tk.Label(head, text=combo.get("label", ""), bg=CARD, fg=GOLD,
+                 font=FONT_BTN).pack(side="left")
+        pr = combo.get("pick_rate")
+        if isinstance(pr, (int, float)):
+            tk.Label(head, text=f"· {round(pr*100)}%", bg=CARD, fg=FAINT,
+                     font=FONT_HINT).pack(side="left", padx=(6, 0))
+        tk.Label(head, text="· " + "  +  ".join(combo.get("spell_names", [])),
+                 bg=CARD, fg=TEXT_BRIGHT, font=FONT_SMALL).pack(side="left", padx=(6, 0))
+
+        # Detail line: keystone + the two rune pages (compact, one line — the
+        # spells in the header plus the keystone are what distinguish combos).
+        prim = (combo.get("primary_rune_names") or [])
+        keystone = prim[0] if prim else ""
+        pages = "  +  ".join(p for p in (combo.get("primary_page_name", ""),
+                                         combo.get("secondary_page_name", "")) if p)
+        detail = tk.Frame(info, bg=CARD)
+        detail.pack(fill="x", anchor="w")
+        if keystone:
+            tk.Label(detail, text=keystone, bg=CARD, fg=TEAL,
+                     font=FONT_SMALL).pack(side="left")
+        if pages:
+            tk.Label(detail, text=("· " if keystone else "") + pages, bg=CARD,
+                     fg=MUTED, font=FONT_SMALL).pack(side="left", padx=(6, 0))
+
+    def _set_combo_status(self, text, color):
+        lbl = getattr(self, "_build_combo_status", None)
+        if lbl is not None:
+            try:
+                if lbl.winfo_exists():
+                    lbl.config(text=text, fg=color)
+            except tk.TclError:
+                pass
+
+    def _apply_combo(self, combo):
+        """Push the chosen combo's runes + summoner spells to the League client."""
+        if not getattr(self._lcu, "_sess", None):
+            self._set_combo_status("Open the League client first to apply this.", RED)
+            return
+        self._set_combo_status("Applying runes & summoner spells…", MUTED)
+        threading.Thread(target=self._apply_combo_worker,
+                         args=(combo,), daemon=True).start()
+
+    def _apply_rune_page(self, name, prim, sub, perks):
+        """Create a rune page and make it current, replacing any prior page we
+        created and freeing a slot if the client is at its page limit."""
+        try:
+            pages = self._lcu.get("/lol-perks/v1/pages").json()
+        except Exception:
+            pages = []
+        for p in pages if isinstance(pages, list) else []:
+            if (str(p.get("name", "")).startswith("op.gg:")
+                    and (p.get("isDeletable") or p.get("isEditable"))):
+                self._lcu.delete(f"/lol-perks/v1/pages/{p.get('id')}")
+        self._engine._make_rune_room()   # frees a slot if still at the limit
+        return self._lcu.post("/lol-perks/v1/pages", {
+            "name":            name,
+            "primaryStyleId":  int(prim),
+            "subStyleId":      int(sub),
+            "selectedPerkIds": [int(x) for x in perks],
+            "current":         True,
+        })
+
+    def _apply_combo_worker(self, combo):
+        champ = (self._build_champ_var.get() or "Build").strip()
+        runes_ok = spells_in_champ_select = False
+        try:
+            perks = (combo.get("primary_rune_ids", [])
+                     + combo.get("secondary_rune_ids", [])
+                     + combo.get("stat_mod_ids", []))
+            if combo.get("primary_page_id") and combo.get("secondary_page_id") \
+                    and len(perks) >= 6:
+                rp = self._apply_rune_page(f"op.gg: {champ}",
+                                           combo["primary_page_id"],
+                                           combo["secondary_page_id"], perks)
+                runes_ok = getattr(rp, "status_code", 0) in (200, 201)
+
+            sids = combo.get("spell_ids", [])
+            spells_status = None
+            if len(sids) == 2:
+                rs = self._lcu.patch("/lol-champ-select/v1/session/my-selection",
+                                     {"spell1Id": int(sids[0]), "spell2Id": int(sids[1])})
+                spells_status = getattr(rs, "status_code", 0)
+                spells_in_champ_select = spells_status in (200, 204)
+        except Exception as e:
+            self.after(0, lambda: self._set_combo_status(f"Apply failed: {e}", RED))
+            return
+
+        if runes_ok and spells_in_champ_select:
+            msg, col = "Applied runes + summoner spells ✓", GREEN
+        elif runes_ok:
+            # Spells only stick during champ select.
+            msg = ("Runes applied ✓  —  summoner spells will apply when you're in "
+                   "champ select.")
+            col = GOLD
+        elif spells_in_champ_select:
+            msg, col = "Summoner spells applied ✓ (runes page couldn't be created).", GOLD
+        else:
+            msg, col = "Couldn't apply — is the League client connected?", RED
+        self.after(0, lambda: self._set_combo_status(msg, col))
 
     def _build_log(self, parent):
         wrap = tk.Frame(parent, bg=DARK)
