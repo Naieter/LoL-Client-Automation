@@ -10,6 +10,7 @@ and could result in account penalties. Use at your own risk.
 """
 
 import sys, os, json, threading, time, hashlib, subprocess, re as _re, math as _math
+import uuid as _uuid
 import ctypes, ctypes.wintypes
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -84,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.14.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -150,7 +151,9 @@ DEFAULT_CONFIG = {
     "autoPick":     True,
     "autoPrePick":  True,
     "autoBan":      True,
-    "autoRunes":    True,
+    "autoRunes":    True,    # import the meta rune page on lock
+    "autoSpells":   True,    # import the meta summoner spells on lock
+    "autoItems":    True,    # import an op.gg item set once the pick is locked
     "pickDelay":    3000,    # lock this many ms before the pick phase ends
     "banDelay":     8000,    # ban this many ms before the ban phase ends
     "prePickDelay": 500,
@@ -730,6 +733,7 @@ class AutoEngine:
         self._pick_rejected: dict = {}   # aid → champs that became banned/taken
         self._ban_hovered:   dict = {}   # aid → championId hovered for ban (two-phase)
         self._runes_key      = None      # (champ_id, role) of last runes import
+        self._items_key      = None      # (champ_id, role) of last item-set import
         self._last_role      = None      # assignedPosition seen last poll (detect swaps)
         self._queue_started     = False  # leader already started queue this lobby
         self._last_ready_status = None   # last "X/Y ready" string logged
@@ -823,6 +827,7 @@ class AutoEngine:
                 self._pick_rejected.clear()
                 self._ban_hovered.clear()
                 self._runes_key      = None
+                self._items_key      = None
                 self._last_role      = None
                 self._last_state_key = None   # force [tick] on first poll
                 self._champ_select_start = time.monotonic()  # for pre-pick delay
@@ -1274,32 +1279,45 @@ class AutoEngine:
                             self._tool_hovers.setdefault(aid, set()).add(champ)
                             self._log(f"Pre-pick hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
 
-        # ── Auto runes + summoner spells — once our champion is locked in ──
+        # ── Post-lock imports — once our champion is locked in ──
+        # Runes, spells and the item set are each toggled independently.
         # Keyed on (champion, role) so a position swap after locking re-imports
-        # the correct meta page for the new role.
-        if cfg.get("autoRunes"):
-            locked = 0
-            for grp in session.get("actions", []):
-                for a in grp:
-                    if (str(a.get("actorCellId", "")) == my_cell
-                            and a.get("type") == "pick"
-                            and a.get("completed")):
-                        locked = int(a.get("championId", 0) or 0)
-            if locked:
-                key = (locked, assigned_role)
-                if key != self._runes_key:
-                    self._runes_key = key
-                    threading.Thread(
-                        target=self._import_runes_spells,
-                        args=(locked, assigned_role),
-                        daemon=True,
-                    ).start()
+        # the correct meta data for the new role.
+        locked = 0
+        for grp in session.get("actions", []):
+            for a in grp:
+                if (str(a.get("actorCellId", "")) == my_cell
+                        and a.get("type") == "pick"
+                        and a.get("completed")):
+                    locked = int(a.get("championId", 0) or 0)
+        if locked:
+            key = (locked, assigned_role)
+            do_runes  = bool(cfg.get("autoRunes"))
+            do_spells = bool(cfg.get("autoSpells"))
+            if (do_runes or do_spells) and key != self._runes_key:
+                self._runes_key = key
+                threading.Thread(
+                    target=self._import_runes_spells,
+                    args=(locked, assigned_role, do_runes, do_spells),
+                    daemon=True,
+                ).start()
+            if cfg.get("autoItems") and key != self._items_key:
+                self._items_key = key
+                threading.Thread(
+                    target=self._import_item_set,
+                    args=(locked, assigned_role),
+                    daemon=True,
+                ).start()
 
-    def _import_runes_spells(self, champ_id: int, position: str):
-        """Import the meta rune page + summoner spells for the locked-in champion.
+    def _import_runes_spells(self, champ_id: int, position: str,
+                             do_runes: bool = True, do_spells: bool = True):
+        """Import the meta rune page and/or summoner spells for the locked-in
+        champion — runes and spells are toggled independently on the dashboard.
         Primary source: op.gg Diamond+ stats for this exact champion and role
         (the most-played page across recent diamond+ games). Falls back to the
         League client's own recommendation if op.gg is unavailable. Worker thread."""
+        if not (do_runes or do_spells):
+            return
         try:
             champ_name = self._dd.opgg_name(champ_id) if self._dd else None
             opgg_pos   = OPGG_POSITION.get((position or "").lower())
@@ -1341,33 +1359,35 @@ class AutoEngine:
                         spells = page.get("summonerSpellIds") or []
 
             # ── Apply runes ──
-            if prim and sub and len(perks) >= 6:
-                self._make_rune_room()
-                rp = self._lcu.post("/lol-perks/v1/pages", {
-                    "name":            f"Auto: {label}",
-                    "primaryStyleId":  int(prim),
-                    "subStyleId":      int(sub),
-                    "selectedPerkIds": [int(x) for x in perks],
-                    "current":         True,
-                })
-                if rp.status_code in (200, 201):
-                    self._log(f"Imported meta runes for {label}.")
+            if do_runes:
+                if prim and sub and len(perks) >= 6:
+                    self._make_rune_room()
+                    rp = self._lcu.post("/lol-perks/v1/pages", {
+                        "name":            f"Auto: {label}",
+                        "primaryStyleId":  int(prim),
+                        "subStyleId":      int(sub),
+                        "selectedPerkIds": [int(x) for x in perks],
+                        "current":         True,
+                    })
+                    if rp.status_code in (200, 201):
+                        self._log(f"Imported meta runes for {label}.")
+                    else:
+                        self._log(f"[runes] page create HTTP {rp.status_code} {rp.text[:120]}")
                 else:
-                    self._log(f"[runes] page create HTTP {rp.status_code} {rp.text[:120]}")
-            else:
-                self._log(f"Runes: no meta data available for {label}.")
+                    self._log(f"Runes: no meta data available for {label}.")
 
             # ── Apply summoner spells (meta if found, else role default) ──
-            if len(spells) < 2:
-                spells = list(ROLE_SPELLS.get((position or "").lower(), (4, 14)))
-            rs = self._lcu.patch(
-                "/lol-champ-select/v1/session/my-selection",
-                {"spell1Id": int(spells[0]), "spell2Id": int(spells[1])},
-            )
-            if rs.status_code in (200, 204):
-                self._log("Imported meta summoner spells.")
-            else:
-                self._log(f"[runes] spells HTTP {rs.status_code} {rs.text[:120]}")
+            if do_spells:
+                if len(spells) < 2:
+                    spells = list(ROLE_SPELLS.get((position or "").lower(), (4, 14)))
+                rs = self._lcu.patch(
+                    "/lol-champ-select/v1/session/my-selection",
+                    {"spell1Id": int(spells[0]), "spell2Id": int(spells[1])},
+                )
+                if rs.status_code in (200, 204):
+                    self._log("Imported meta summoner spells.")
+                else:
+                    self._log(f"[runes] spells HTTP {rs.status_code} {rs.text[:120]}")
         except Exception as e:
             self._log(f"[runes] error: {e}")
 
@@ -1444,6 +1464,123 @@ class AutoEngine:
                 self._lcu.delete(f"/lol-perks/v1/pages/{target.get('id')}")
         except Exception:
             pass
+
+    def _opgg_items(self, champ_name: str, opgg_pos: str):
+        """op.gg Diamond+ item IDs for a champion + role. Returns a dict with
+        {starter, core, boots, situational} id lists, or None."""
+        try:
+            body = {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "lol_get_champion_analysis",
+                    "arguments": {
+                        "champion": champ_name, "position": opgg_pos,
+                        "tier": "diamond_plus", "game_mode": "ranked",
+                        "desired_output_fields": [
+                            "data.starter_items.ids", "data.core_items.ids",
+                            "data.boots.ids", "data.fourth_items[].ids",
+                            "data.fifth_items[].ids", "data.sixth_items[].ids",
+                        ],
+                    },
+                },
+            }
+            r = requests.post("https://mcp-api.op.gg/mcp", json=body, timeout=15,
+                              headers={"Accept": "application/json, text/event-stream"})
+            r.raise_for_status()
+            rec = _parse_opgg_record(r.json()["result"]["content"][0]["text"])
+        except Exception as e:
+            self._log(f"[items] op.gg fetch failed: {e}")
+            return None
+        if not rec or "data" not in rec:
+            return None
+        d = rec["data"]
+
+        def ids(x):
+            return [int(i) for i in (x.get("ids") or [])] if isinstance(x, dict) else []
+
+        # Situational: the top option from each of the 4th/5th/6th item slots.
+        situational: list = []
+        for k in ("fourth_items", "fifth_items", "sixth_items"):
+            arr = d.get(k)
+            if isinstance(arr, list):
+                for opt in arr[:2]:
+                    situational += ids(opt)
+        # dedupe situational, keep order
+        seen, situ = set(), []
+        for i in situational:
+            if i not in seen:
+                seen.add(i); situ.append(i)
+
+        out = {"starter": ids(d.get("starter_items")), "core": ids(d.get("core_items")),
+               "boots": ids(d.get("boots")), "situational": situ}
+        return out if out["core"] else None
+
+    def _import_item_set(self, champ_id: int, position: str):
+        """Build and push an op.gg Diamond+ item set for the locked-in champion
+        to the League client. Worker thread. Replaces our own prior set."""
+        try:
+            champ_name = self._dd.opgg_name(champ_id) if self._dd else None
+            opgg_pos   = OPGG_POSITION.get((position or "").lower())
+            label      = self._dd.name(champ_id) if self._dd else f"#{champ_id}"
+            if not (champ_name and opgg_pos):
+                return
+            items = self._opgg_items(champ_name, opgg_pos)
+            if not items:
+                self._log(f"Items: no Diamond+ item data for {label}.")
+                return
+
+            sid = self._get_summoner_id()
+            if not sid:
+                _dbg("[items] no summoner id"); return
+            r = self._lcu.get(f"/lol-item-sets/v1/item-sets/{sid}/sets")
+            if r.status_code != 200:
+                self._log(f"[items] GET sets HTTP {r.status_code}")
+                return
+            data = r.json()
+            # Drop any item set we created before so they don't pile up.
+            existing = [s for s in (data.get("itemSets") or [])
+                        if not str(s.get("title", "")).startswith("op.gg:")]
+
+            def block(name, id_list):
+                order, counts = [], {}
+                for i in id_list:
+                    i = int(i)
+                    if i not in counts:
+                        order.append(i); counts[i] = 0
+                    counts[i] += 1
+                if not order:
+                    return None
+                return {"type": name,
+                        "items": [{"id": str(i), "count": counts[i]} for i in order]}
+
+            blocks = [b for b in (
+                block("Starting",    items["starter"]),
+                block("Core",        items["core"]),
+                block("Boots",       items["boots"]),
+                block("Situational", items["situational"]),
+            ) if b]
+            if not blocks:
+                return
+
+            new_set = {
+                "title": f"op.gg: {label} ({opgg_pos})",
+                "type": "custom", "map": "any", "mode": "any",
+                "priority": False, "sortrank": 0, "startedFrom": "blank",
+                "associatedChampions": [int(champ_id)],
+                "associatedMaps": [11, 12],
+                "uid": str(_uuid.uuid4()),
+                "blocks": blocks,
+            }
+            data["itemSets"] = [new_set] + existing
+            pr = self._lcu.put(f"/lol-item-sets/v1/item-sets/{sid}/sets", data)
+            if pr.status_code in (200, 201, 204):
+                self._log(f"Imported item set for {label} ({opgg_pos}).")
+            else:
+                self._log(f"[items] PUT sets HTTP {pr.status_code} {pr.text[:150]}")
+                _dbg(f"[items] PUT failed HTTP {pr.status_code} {pr.text[:300]}")
+        except Exception as e:
+            self._log(f"[items] error: {e}")
+            _dbg(f"[items] exception: {e}")
 
     # ── Party ready check ─────────────────────────────────────────────────────
     # Separate copies of the tool coordinate through a relay server the user runs
@@ -4324,37 +4461,63 @@ class App(tk.Tk):
         grid.pack(fill="both", expand=True)
         grid.columnconfigure(0, weight=1, uniform="cards")
         grid.columnconfigure(1, weight=1, uniform="cards")
-        for r in range(3):
+        # Each card is (title, description, toggles). `toggles` is a list of
+        # (sub-label, config key): one entry = a plain card (title + toggle +
+        # description); two entries = a split card with a labelled toggle per row.
+        _auto_items = [
+            ("Auto Accept",        "Accept found matches",
+             [("", "autoAccept")]),
+            ("Auto Pick & Ban",    None,
+             [("Pick", "autoPick"), ("Ban", "autoBan")]),
+            ("Auto Pre-Pick",      "Hover your pre-pick",
+             [("", "autoPrePick")]),
+            ("Auto Runes & Spells", None,
+             [("Runes", "autoRunes"), ("Spells", "autoSpells")]),
+            ("Auto Item Set",      "Import op.gg item set",
+             [("", "autoItems")]),
+            ("Auto Invites",       "Accept friend invites",
+             [("", "autoAcceptInvites")]),
+        ]
+        for r in range((len(_auto_items) + 1) // 2):
             grid.rowconfigure(r, weight=1, uniform="rows")
 
-        _auto_items = [
-            ("Auto Accept",       "autoAccept",        "Accept found matches"),
-            ("Auto Pick",         "autoPick",          "Lock in your pick"),
-            ("Auto Pre-Pick",     "autoPrePick",       "Hover your intended pick"),
-            ("Auto Ban",          "autoBan",           "Ban from priority list"),
-            ("Auto Runes/Spells", "autoRunes",         "Apply runes & summoners"),
-            ("Accept Invites",    "autoAcceptInvites", "From friends"),
-        ]
-        for i, (label, key, desc) in enumerate(_auto_items):
-            row, col = divmod(i, 2)
-            active = bool(self.cfg.get(key, DEFAULT_CONFIG.get(key, True)))
-            card = HexCard(grid, fill=CARD, border=CARD_BORDER, height=92)
-            card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
+        def _toggle(parent, subkey):
+            on = bool(self.cfg.get(subkey, DEFAULT_CONFIG.get(subkey, True)))
+            sw = ToggleSwitch(parent, initial=on, bg=CARD,
+                              command=lambda v, k=subkey: self._on_auto_switch(k, v))
+            self._auto_switches[subkey] = sw
+            return sw
 
+        for i, (title, desc, toggles) in enumerate(_auto_items):
+            row, col = divmod(i, 2)
+            card = HexCard(grid, fill=CARD, border=CARD_BORDER, height=104)
+            card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
             # Vertically-centred content so cards stay balanced as they grow.
             inner = tk.Frame(card.body, bg=CARD)
             inner.pack(expand=True, fill="x", padx=18)
-            top = tk.Frame(inner, bg=CARD)
-            top.pack(fill="x")
-            tk.Label(top, text=label, bg=CARD, fg=TEXT_BRIGHT,
-                     font=FONT_TITLE).pack(side="left")
-            sw = ToggleSwitch(top, initial=active, bg=CARD,
-                              command=lambda v, k=key: self._on_auto_switch(k, v))
-            sw.pack(side="right")
-            self._auto_switches[key] = sw
 
-            tk.Label(inner, text=desc, bg=CARD, fg=MUTED,
-                     font=FONT_LABEL).pack(anchor="w", pady=(5, 0))
+            if len(toggles) == 1:
+                # Plain card: title (left) + toggle (right edge), description below.
+                top = tk.Frame(inner, bg=CARD)
+                top.pack(fill="x")
+                tk.Label(top, text=title, bg=CARD, fg=TEXT_BRIGHT,
+                         font=FONT_TITLE).pack(side="left")
+                _toggle(top, toggles[0][1]).pack(side="right")
+                if desc:
+                    tk.Label(inner, text=desc, bg=CARD, fg=MUTED,
+                             font=FONT_LABEL).pack(anchor="w", pady=(5, 0))
+            else:
+                # Split card: two vertically-stacked toggles, each toggle at the
+                # right edge (aligned with the other cards) with its label right
+                # beside it.
+                tk.Label(inner, text=title, bg=CARD, fg=TEXT_BRIGHT,
+                         font=FONT_TITLE).pack(anchor="w")
+                for sublabel, subkey in toggles:
+                    r_ = tk.Frame(inner, bg=CARD)
+                    r_.pack(fill="x", pady=(6, 0))
+                    _toggle(r_, subkey).pack(side="right")
+                    tk.Label(r_, text=sublabel, bg=CARD, fg=MUTED,
+                             font=FONT_LABEL).pack(side="right", padx=(0, 8))
 
         self._set_run_state("disabled")
 
