@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.14.1"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -4467,11 +4467,11 @@ class App(tk.Tk):
         _auto_items = [
             ("Auto Accept",        "Accept found matches",
              [("", "autoAccept")]),
-            ("Auto Pick & Ban",    None,
+            ("Auto Pick & Ban",    "Pick and ban from your lists",
              [("Pick", "autoPick"), ("Ban", "autoBan")]),
             ("Auto Pre-Pick",      "Hover your pre-pick",
              [("", "autoPrePick")]),
-            ("Auto Runes & Spells", None,
+            ("Auto Runes & Spells", "Import meta on lock-in",
              [("Runes", "autoRunes"), ("Spells", "autoSpells")]),
             ("Auto Item Set",      "Import op.gg item set",
              [("", "autoItems")]),
@@ -4492,9 +4492,10 @@ class App(tk.Tk):
             row, col = divmod(i, 2)
             card = HexCard(grid, fill=CARD, border=CARD_BORDER, height=104)
             card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
-            # Vertically-centred content so cards stay balanced as they grow.
+            # Top-anchored (not centred) so every card's title lines up at the
+            # same height, regardless of how much content sits below it.
             inner = tk.Frame(card.body, bg=CARD)
-            inner.pack(expand=True, fill="x", padx=18)
+            inner.pack(fill="x", padx=18, pady=(18, 0))
 
             if len(toggles) == 1:
                 # Plain card: title (left) + toggle (right edge), description below.
@@ -4507,14 +4508,19 @@ class App(tk.Tk):
                     tk.Label(inner, text=desc, bg=CARD, fg=MUTED,
                              font=FONT_LABEL).pack(anchor="w", pady=(5, 0))
             else:
-                # Split card: two vertically-stacked toggles, each toggle at the
-                # right edge (aligned with the other cards) with its label right
-                # beside it.
-                tk.Label(inner, text=title, bg=CARD, fg=TEXT_BRIGHT,
-                         font=FONT_TITLE).pack(anchor="w")
-                for sublabel, subkey in toggles:
+                # Split card: each labelled toggle shares a row with the card's
+                # left-hand text, so the toggles sit exactly where a plain card's
+                # toggle does — the first on the title row, the second on the
+                # description row.
+                left_rows = [(title, FONT_TITLE, TEXT_BRIGHT),
+                             (desc or "", FONT_LABEL, MUTED)]
+                for idx, (sublabel, subkey) in enumerate(toggles):
                     r_ = tk.Frame(inner, bg=CARD)
-                    r_.pack(fill="x", pady=(6, 0))
+                    r_.pack(fill="x", pady=(0 if idx == 0 else 5, 0))
+                    ltext, lfont, lfg = (left_rows[idx] if idx < len(left_rows)
+                                         else ("", FONT_LABEL, MUTED))
+                    tk.Label(r_, text=ltext, bg=CARD, fg=lfg,
+                             font=lfont).pack(side="left")
                     _toggle(r_, subkey).pack(side="right")
                     tk.Label(r_, text=sublabel, bg=CARD, fg=MUTED,
                              font=FONT_LABEL).pack(side="right", padx=(0, 8))
