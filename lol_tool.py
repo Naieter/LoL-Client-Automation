@@ -84,7 +84,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.10.3"
+APP_VERSION = "1.11.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -104,6 +104,11 @@ ROLE_LABEL = {
 
 MAX_PRIORITY_ITEMS = 5   # pick/ban priority list cap; a cross-list drop that
                          # pushes a list past this bumps its 6th champion
+
+# Champions allowed to appear more than once on a single team. These are never
+# treated as "taken" when an ally already has one, and stay pickable/lockable no
+# matter what — champion -3 is the only such champion.
+DUP_ALLOWED_CHAMPS = frozenset({-3})
 
 # Summoner-spell IDs:  Flash=4 Teleport=12 Smite=11 Ignite=14 Heal=7 Exhaust=3
 # Fallback spell pairs used only when no meta data is available for the champ.
@@ -347,6 +352,123 @@ def _do_update(dl_url: str, log_fn, root):
         log_fn(f"[update] Failed: {e}")
         if tmp.exists():
             tmp.unlink(missing_ok=True)
+
+
+# ── op.gg build data (champion analysis) ────────────────────────────────────────
+# Summoner-spell id → display name (Summoner's Rift relevant set).
+SUMMONER_SPELLS = {
+    1: "Cleanse", 3: "Exhaust", 4: "Flash", 6: "Ghost", 7: "Heal",
+    11: "Smite", 12: "Teleport", 13: "Clarity", 14: "Ignite", 21: "Barrier",
+    32: "Snowball", 39: "Snowball",
+}
+
+def _spell_name(sid):
+    return SUMMONER_SPELLS.get(int(sid), f"Spell {sid}")
+
+def _parse_opgg_record(text: str):
+    """Parse op.gg's MCP 'class-schema + positional record' payload into nested
+    dicts. The header lines ('class Name: f1,f2,...') define each record type's
+    field order; the trailing expression is a nested Name(arg, arg, ...) tree
+    where lists are [..] and scalars are strings/ints/floats. Records map to
+    {field: value} using the schema. Returns the top record dict, or None."""
+    schema = {}
+    for line in text.splitlines():
+        m = _re.match(r'class (\w+):\s*(.+)$', line.strip())
+        if m:
+            schema[m.group(1)] = [f.strip() for f in m.group(2).split(',')]
+    expr = None
+    for line in reversed(text.splitlines()):
+        s = line.strip()
+        if s and not s.startswith('class ') and '(' in s:
+            expr = s
+            break
+    if not expr:
+        return None
+    s, n, i = expr, len(expr), 0
+
+    def ws():
+        nonlocal i
+        while i < n and s[i] in ' \t':
+            i += 1
+
+    def pval():
+        nonlocal i
+        ws()
+        c = s[i]
+        if c == '"':
+            return pstr()
+        if c == '[':
+            return plist()
+        if c.isalpha() or c == '_':
+            j = i
+            while i < n and (s[i].isalnum() or s[i] == '_'):
+                i += 1
+            name = s[j:i]
+            ws()
+            if i < n and s[i] == '(':
+                args = pargs()
+                fields = schema.get(name)
+                if fields and len(fields) == len(args):
+                    return dict(zip(fields, args))
+                return {'_class': name, '_args': args}
+            return {'null': None, 'true': True, 'false': False}.get(name, name)
+        return pnum()
+
+    def pstr():
+        nonlocal i
+        i += 1
+        buf = []
+        while i < n and s[i] != '"':
+            if s[i] == '\\' and i + 1 < n:
+                i += 1
+            buf.append(s[i])
+            i += 1
+        i += 1
+        return ''.join(buf)
+
+    def pnum():
+        nonlocal i
+        j = i
+        while i < n and s[i] in '-+.0123456789eE':
+            i += 1
+        t = s[j:i]
+        try:
+            return int(t) if ('.' not in t and 'e' not in t.lower()) else float(t)
+        except ValueError:
+            return t
+
+    def plist():
+        nonlocal i
+        i += 1
+        out = []
+        ws()
+        while i < n and s[i] != ']':
+            out.append(pval())
+            ws()
+            if i < n and s[i] == ',':
+                i += 1
+                ws()
+        i += 1
+        return out
+
+    def pargs():
+        nonlocal i
+        i += 1
+        out = []
+        ws()
+        while i < n and s[i] != ')':
+            out.append(pval())
+            ws()
+            if i < n and s[i] == ',':
+                i += 1
+                ws()
+        i += 1
+        return out
+
+    try:
+        return pval()
+    except Exception:
+        return None
 
 
 # ── DDragon champion data ─────────────────────────────────────────────────────
@@ -890,14 +1012,16 @@ class AutoEngine:
             self._last_role = assigned_role
 
         # ── champions already taken (removed from the playable pool, like the ref) ──
+        # Duplicate-allowed champions (-3) never count as taken — an ally holding
+        # one doesn't stop us from picking our own.
         taken: set = set()
         for p in session.get("myTeam", []):
             if str(p.get("cellId", "")) != my_cell:
                 cid = int(p.get("championId", 0) or 0)
-                if cid: taken.add(cid)
+                if cid and cid not in DUP_ALLOWED_CHAMPS: taken.add(cid)
         for p in session.get("theirTeam", []):
             cid = int(p.get("championId", 0) or 0)
-            if cid: taken.add(cid)
+            if cid and cid not in DUP_ALLOWED_CHAMPS: taken.add(cid)
 
         # ── resolve role-based priority lists (this tool's own feature) ──
         role_cfg_map = cfg.get("roleChampions", {})
@@ -926,8 +1050,10 @@ class AutoEngine:
 
         # Champions actually selectable this session (Practice Tool → all)
         playable = self._get_pickable_ids()
-        # Reference removes already-taken champions from the playable pool
-        playable_now = playable - taken - bans
+        # Reference removes already-taken champions from the playable pool.
+        # Duplicate-allowed champions (-3) are always playable regardless of the
+        # pickable list, bans, or an ally already having one.
+        playable_now = (playable - taken - bans) | DUP_ALLOWED_CHAMPS
 
         # ── diagnostic: log only on state change ──
         _states = [
@@ -992,9 +1118,10 @@ class AutoEngine:
                             self._log(f"You hovered {name} — that's what will be locked.")
 
                     # If the user's hovered champion got banned or picked by someone
-                    # else, drop it so picks fall back to the priority list.
+                    # else, drop it so picks fall back to the priority list. A
+                    # duplicate-allowed champion (-3) is never dropped — lock it in.
                     ov = self._user_pick.get(aid)
-                    if ov and ov not in playable_now:
+                    if ov and ov not in playable_now and ov not in DUP_ALLOWED_CHAMPS:
                         self._pick_rejected.setdefault(aid, set()).add(ov)
                         self._user_pick.pop(aid, None)
                         name = self._dd.name(ov) if self._dd else f"#{ov}"
@@ -3049,14 +3176,11 @@ class LCUOverlay:
         if (fg and fg != hwnd and not is_overlay
                 and time.monotonic() >= self._click_grace):
             # A window that isn't League and isn't our overlay is in front.
-            # If it belongs to our process it's the main tool window → hide
-            # (the overlay shouldn't show just because the dashboard is up).
+            # The LOL Client Tool's own UI is treated like any other window: it
+            # only hides the overlay if it actually covers League's centre (the
+            # check below), not merely by being focused.
             fg_pid = ctypes.wintypes.DWORD()
             user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
-            if fg_pid.value == os.getpid():
-                self._win.withdraw()
-                _dbg("refresh: withdraw (main tool window in foreground)")
-                return
 
             # If the foreground window belongs to the League client's OWN
             # process, the user is looking at League — even if it's a second
@@ -3404,6 +3528,9 @@ class App(tk.Tk):
         # Live ping to the regional Riot servers, shown under the Ready Up button
         threading.Thread(target=self._watch_ping, daemon=True).start()
 
+        # Auto-load the Builds tab for whatever champion is hovered in champ select
+        threading.Thread(target=self._watch_build_hover, daemon=True).start()
+
         # Check for updates 3 s after startup so the UI is fully loaded first
         self.after(3000, lambda: threading.Thread(
             target=_update_check, args=(self, self.log), daemon=True,
@@ -3462,6 +3589,166 @@ class App(tk.Tk):
             _dbg(f"[opgg] stats worker error: {e}")
         finally:
             self._opgg_fetching = False
+
+    # ── Champion build recommendations (op.gg, diamond+) ───────────────────────
+    @staticmethod
+    def _dedupe(seq, cap=None):
+        out = []
+        for x in seq:
+            if x and x not in out:
+                out.append(x)
+                if cap and len(out) >= cap:
+                    break
+        return out
+
+    def _region_upper(self):
+        try:
+            r = self._lcu.get("/riotclient/region-locale")
+            if r.status_code == 200:
+                return str(r.json().get("webRegion", "NA")).upper()
+        except Exception:
+            pass
+        return "NA"
+
+    def _champ_select_pick(self):
+        """(champion display name, op.gg position) for the local player's
+        current champ-select pick/intent, or None if not in champ select."""
+        try:
+            r = self._lcu.get("/lol-champ-select/v1/session")
+            if r.status_code != 200:
+                return None
+            s = r.json()
+            cell = s.get("localPlayerCellId")
+            cid, assigned = 0, ""
+            for mbr in s.get("myTeam", []):
+                if mbr.get("cellId") == cell:
+                    cid = int(mbr.get("championId") or 0) or \
+                          int(mbr.get("championPickIntent") or 0)
+                    assigned = (mbr.get("assignedPosition") or "").lower()
+                    break
+            if not cid:
+                return None
+            pos = OPGG_POSITION.get(assigned, "")
+            return (self.ddragon.name(cid), pos)
+        except Exception:
+            return None
+
+    def _watch_build_hover(self):
+        """Poll champ select and mirror the locally-hovered champion into the
+        Builds tab — auto-pick pre-hover or a manual hover both count, replacing
+        whatever was searched. Runs on its own daemon thread."""
+        last = None
+        while True:
+            try:
+                pick = self._champ_select_pick()   # (name, pos) or None
+            except Exception:
+                pick = None
+            if pick and pick != last:
+                last = pick
+                self.after(0, lambda p=pick: self._auto_load_build(*p))
+            elif pick is None and last is not None:
+                # Left champ select — let the next hover re-trigger a load.
+                last = None
+            time.sleep(1.0)
+
+    def _auto_load_build(self, name, pos):
+        """Push a champ-select hover into the Builds tab (UI thread)."""
+        if not hasattr(self, "_build_champ_var"):
+            return   # Builds page hasn't been built yet
+        self._build_champ_var.set(name)
+        if hasattr(self, "_build_ac"):
+            self._build_ac.place_forget()
+        if pos:
+            self._set_build_pos(pos)
+        self._load_build(name, pos or self._build_pos_var.get())
+
+    def _fetch_build(self, champ_name, position, tier="diamond_plus"):
+        """Fetch a champion's diamond+ build/skill recommendations from op.gg.
+        Returns a structured dict (see _render_build) or an {'error': msg}."""
+        cid = self.ddragon.find_id_fuzzy(champ_name)
+        if cid is None:
+            return {"error": f"Unknown champion: {champ_name!r}"}
+        og_name = self.ddragon.opgg_name(cid)          # UPPER_SNAKE_CASE
+        pos = (position or "").lower() or "mid"
+        body = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "lol_get_champion_analysis",
+                "arguments": {
+                    "champion": og_name, "position": pos,
+                    "game_mode": "ranked", "tier": tier,
+                    "desired_output_fields": [
+                        "data.summary.average_stats.win_rate",
+                        "data.summary.average_stats.pick_rate",
+                        "data.summary.average_stats.ban_rate",
+                        "data.starter_items.ids_names", "data.core_items.ids_names",
+                        "data.boots.ids_names",
+                        "data.fourth_items[].ids_names",
+                        "data.fifth_items[].ids_names",
+                        "data.sixth_items[].ids_names",
+                        "data.summoner_spells.ids",
+                        "data.skills.order", "data.skill_masteries.ids",
+                        "data.runes.primary_page_name", "data.runes.primary_rune_names",
+                        "data.runes.secondary_page_name", "data.runes.secondary_rune_names",
+                        "data.damage_type",
+                    ],
+                },
+            },
+        }
+        try:
+            r = requests.post("https://mcp-api.op.gg/mcp", json=body, timeout=20,
+                              headers={"Accept": "application/json, text/event-stream"})
+            r.raise_for_status()
+            text = r.json()["result"]["content"][0]["text"]
+        except Exception as e:
+            _dbg(f"[build] fetch failed: {e}")
+            return {"error": "Could not reach op.gg. Check your connection."}
+
+        rec = _parse_opgg_record(text)
+        if not rec or "data" not in rec:
+            return {"error": "op.gg returned no build data for this pick."}
+        d = rec["data"]
+
+        def names(x):
+            return x.get("ids_names", []) if isinstance(x, dict) else (x or [])
+
+        def top_options(arr, k=3):
+            out = []
+            if isinstance(arr, list):
+                for opt in arr:
+                    nm = (opt.get("ids_names") or []) if isinstance(opt, dict) else []
+                    if nm:
+                        out.append(nm[0])
+                    if len(out) >= k:
+                        break
+            return out
+
+        st = (d.get("summary") or {}).get("average_stats") or {}
+        spells = d.get("summoner_spells") or {}
+        spell_ids = spells.get("ids") if isinstance(spells, dict) else []
+        runes = d.get("runes") or {}
+        return {
+            "champion":   self.ddragon.name(cid),
+            "position":   pos,
+            "win_rate":   st.get("win_rate"),
+            "pick_rate":  st.get("pick_rate"),
+            "ban_rate":   st.get("ban_rate"),
+            "damage":     d.get("damage_type"),
+            "spells":     [_spell_name(s) for s in (spell_ids or [])],
+            "starter":    names(d.get("starter_items")),
+            "core":       names(d.get("core_items")),
+            "boots":      names(d.get("boots")),
+            "situational": self._dedupe(
+                top_options(d.get("fourth_items"), 2)
+                + top_options(d.get("fifth_items"), 2)
+                + top_options(d.get("sixth_items"), 2), cap=4),
+            "skill_order": (d.get("skills") or {}).get("order", []),
+            "max_order":   (d.get("skill_masteries") or {}).get("ids", []),
+            "rune_primary_page":   runes.get("primary_page_name", ""),
+            "rune_primary":        runes.get("primary_rune_names", []),
+            "rune_secondary_page": runes.get("secondary_page_name", ""),
+            "rune_secondary":      runes.get("secondary_rune_names", []),
+        }
 
     def _detect_summoner(self):
         """(game_name, tag_line, region) for the signed-in summoner, or None."""
@@ -3645,6 +3932,7 @@ class App(tk.Tk):
         pages = [
             ("Dashboard", self._build_dashboard),
             ("Champions", self._build_champions),
+            ("Builds",    self._build_builds),
             ("Logs",      self._build_log),
             ("Settings",  self._build_settings),
         ]
@@ -3657,6 +3945,7 @@ class App(tk.Tk):
         # Sidebar nav — Settings pinned to the bottom, like the mockup.
         self._nav_button(sidebar, "Dashboard")
         self._nav_button(sidebar, "Champions")
+        self._nav_button(sidebar, "Builds")
         self._nav_button(sidebar, "Logs")
         tk.Frame(sidebar, bg=EDGE_GOLD, height=1).pack(
             fill="x", padx=18, pady=(14, 14))
@@ -3913,6 +4202,283 @@ class App(tk.Tk):
                      font=FONT_LABEL).pack(anchor="w", pady=(5, 0))
 
         self._set_run_state("disabled")
+
+    # ── Builds tab (op.gg champion analysis, diamond+) ──────────────────────────
+    _ABILITY_COLORS = {"Q": TEAL, "W": GREEN, "E": GOLD, "R": RED}
+
+    def _build_builds(self, parent):
+        # Inline ornamented header + "diamond+" note on the right.
+        head = tk.Frame(parent, bg=DARK)
+        head.pack(fill="x", padx=30, pady=(14, 8))
+        tk.Label(head, text="◆  DIAMOND+ · RANKED", bg=DARK, fg=FAINT,
+                 font=FONT_HINT).pack(side="right", padx=(12, 0), pady=(3, 0))
+        dia = tk.Canvas(head, width=12, height=12, bg=DARK,
+                        highlightthickness=0, bd=0)
+        dia.create_polygon(6, 0, 12, 6, 6, 12, 0, 6, fill=GOLD, outline=GOLD)
+        dia.pack(side="left", padx=(0, 9), pady=(3, 0))
+        tk.Label(head, text="BUILDS", bg=DARK, fg=GOLD,
+                 font=FONT_SECTION).pack(side="left")
+        tk.Frame(head, bg=EDGE_GOLD, height=1).pack(
+            side="left", fill="x", expand=True, padx=(14, 14))
+
+        # ── Controls: champion search + position tabs + actions ────────────────
+        ctl = tk.Frame(parent, bg=DARK)
+        ctl.pack(fill="x", padx=30, pady=(0, 8))
+        tk.Label(ctl, text="Champion:", bg=DARK, fg=TEXT,
+                 font=FONT_SMALL).pack(side="left", padx=(0, 6))
+        self._build_champ_var = tk.StringVar()
+        bentry = tk.Entry(ctl, textvariable=self._build_champ_var, width=18,
+                          bg=FIELD_BG, fg=WHITE, relief="flat", insertbackground=WHITE,
+                          font=FONT_SMALL, highlightthickness=1,
+                          highlightbackground=EDGE_GOLD, highlightcolor=GOLD)
+        bentry.pack(side="left", ipady=3)
+        bentry.bind("<Return>", lambda *_: self._load_build())
+        tk.Button(ctl, text="Search", bg=BTN_BG, fg=GOLD, activebackground=BTN_HOV,
+                  activeforeground=GOLD, relief="flat", cursor="hand2", font=FONT_BTN,
+                  padx=12, pady=3, command=self._load_build).pack(side="left", padx=(8, 0))
+        tk.Button(ctl, text="⤓ Current pick", bg=BTN_BG, fg=TEXT,
+                  activebackground=BTN_HOV, activeforeground=WHITE, relief="flat",
+                  cursor="hand2", font=FONT_BTN, padx=12, pady=3,
+                  command=self._load_current_pick).pack(side="left", padx=(8, 0))
+
+        # Position tabs
+        posrow = tk.Frame(parent, bg=DARK)
+        posrow.pack(fill="x", padx=30, pady=(0, 10))
+        tk.Label(posrow, text="POSITION", bg=DARK, fg=FAINT,
+                 font=FONT_HINT).pack(side="left", padx=(0, 12), pady=(4, 0))
+        self._build_pos_var  = tk.StringVar(value="mid")
+        self._build_pos_btns = {}
+        for label, pos in [("Top", "top"), ("Jungle", "jungle"), ("Mid", "mid"),
+                           ("ADC", "adc"), ("Support", "support")]:
+            b = tk.Button(posrow, text=label, bg=BTN_BG, fg=TEXT,
+                          activebackground=_shade(GOLD, 1.05), relief="flat",
+                          cursor="hand2", padx=14, pady=5, font=FONT_BTN,
+                          command=lambda p=pos: self._set_build_pos(p))
+            b.pack(side="left", padx=(0, 6))
+            self._build_pos_btns[pos] = b
+        self._set_build_pos("mid")
+
+        # Autocomplete dropdown — floated over the result area with place() (not
+        # packed) so showing/hiding it never shoves the build cards up or down.
+        self._build_entry = bentry
+        self._build_ac = tk.Listbox(parent, bg=PANEL, fg=WHITE, width=22,
+                                    selectbackground=GOLD, selectforeground=DARK,
+                                    relief="flat", height=6, font=FONT_SMALL,
+                                    highlightthickness=1, highlightbackground=EDGE_GOLD)
+        self._build_champ_var.trace_add("write", self._build_ac_update)
+        self._build_ac.bind("<<ListboxSelect>>", self._build_ac_select)
+
+        # ── Result area (scrollable) ───────────────────────────────────────────
+        canvas = tk.Canvas(parent, bg=DARK, highlightthickness=0)
+        vsb = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self._build_result = tk.Frame(canvas, bg=DARK)
+        win = canvas.create_window((0, 0), window=self._build_result, anchor="nw")
+        self._build_result.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.bind("<Enter>", lambda e: canvas.bind_all(
+            "<MouseWheel>", lambda ev: canvas.yview_scroll(int(-ev.delta / 120), "units")))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        self._build_placeholder("Search a champion above, or load your current "
+                                "champ-select pick.")
+
+    def _set_build_pos(self, pos):
+        self._build_pos_var.set(pos)
+        for p, b in self._build_pos_btns.items():
+            on = (p == pos)
+            b.config(bg=(GOLD if on else BTN_BG), fg=(DARK if on else TEXT))
+
+    def _build_ac_update(self, *_):
+        if not hasattr(self, "_build_ac"):
+            return
+        q = self._build_champ_var.get().lower().strip()
+        self._build_ac.delete(0, "end")
+        if not q:
+            self._build_ac.place_forget()
+            return
+        hits = [n for n in self.ddragon.all_display_names() if q in n.lower()][:6]
+        if not hits:
+            self._build_ac.place_forget()
+            return
+        for h in hits:
+            self._build_ac.insert("end", "  " + h)
+        self._build_ac.configure(height=len(hits))
+        # Float just below the entry, overlaying the results.
+        self._build_ac.place(in_=self._build_entry, x=0, y=2, rely=1.0)
+        tk.Misc.tkraise(self._build_ac)
+
+    def _build_ac_select(self, _evt):
+        sel = self._build_ac.curselection()
+        if sel:
+            self._build_champ_var.set(self._build_ac.get(sel[0]).strip())
+            self._build_ac.place_forget()
+            self._load_build()
+
+    def _build_placeholder(self, msg):
+        for w in self._build_result.winfo_children():
+            w.destroy()
+        tk.Label(self._build_result, text=msg, bg=DARK, fg=FAINT,
+                 font=FONT_LABEL, wraplength=560, justify="left").pack(
+            anchor="w", padx=30, pady=20)
+
+    def _load_current_pick(self):
+        pick = self._champ_select_pick()
+        if not pick:
+            self._build_placeholder("Not in champion select — pick or hover a "
+                                    "champion, or search one above.")
+            return
+        name, pos = pick
+        self._build_champ_var.set(name)
+        if hasattr(self, "_build_ac"):
+            self._build_ac.place_forget()
+        if pos:
+            self._set_build_pos(pos)
+        self._load_build(name, pos or self._build_pos_var.get())
+
+    def _load_build(self, champ=None, position=None):
+        champ = (champ or self._build_champ_var.get()).strip()
+        if not champ:
+            return
+        if hasattr(self, "_build_ac"):
+            self._build_ac.place_forget()
+        position = position or self._build_pos_var.get()
+        # Sequence token: if a newer request starts before this fetch returns
+        # (e.g. the hovered champion changed), the stale result is discarded.
+        self._build_req = getattr(self, "_build_req", 0) + 1
+        seq = self._build_req
+        self._build_placeholder(f"Loading {champ} ({position}) build from op.gg…")
+        threading.Thread(target=self._load_build_worker,
+                         args=(champ, position, seq), daemon=True).start()
+
+    def _load_build_worker(self, champ, position, seq=0):
+        data = self._fetch_build(champ, position)
+        def _apply():
+            if seq == getattr(self, "_build_req", seq):
+                self._render_build(data)
+        self.after(0, _apply)
+
+    def _ability_badges(self, parent, letters, sep):
+        row = tk.Frame(parent, bg=CARD)
+        for i, a in enumerate(letters):
+            if i:
+                tk.Label(row, text=sep, bg=CARD, fg=FAINT,
+                         font=FONT_SMALL).pack(side="left", padx=2)
+            tk.Label(row, text=a, bg=CARD,
+                     fg=self._ABILITY_COLORS.get(a, TEXT),
+                     font=("Segoe UI", 11, "bold")).pack(side="left")
+        return row
+
+    def _render_build(self, data):
+        for w in self._build_result.winfo_children():
+            w.destroy()
+        if not data or data.get("error"):
+            tk.Label(self._build_result,
+                     text=(data or {}).get("error", "No build data."),
+                     bg=DARK, fg=RED, font=FONT_LABEL, wraplength=560,
+                     justify="left").pack(anchor="w", padx=30, pady=20)
+            return
+
+        pad = tk.Frame(self._build_result, bg=DARK)
+        pad.pack(fill="x", padx=30, pady=(4, 12))
+
+        def card(host, title):
+            self._section_header(host, title, pady=(10, 6))
+            c = HexCard(host, fill=CARD, border=CARD_BORDER, autofit=True)
+            c.pack(fill="x")
+            inner = tk.Frame(c.body, bg=CARD)
+            inner.pack(fill="both", expand=True, padx=14, pady=9)
+            return inner
+
+        def kv(parent, label, value, value_fg=TEXT_BRIGHT, wrap=460):
+            r = tk.Frame(parent, bg=CARD)
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=label, bg=CARD, fg=MUTED, font=FONT_SMALL,
+                     width=11, anchor="w").pack(side="left")
+            tk.Label(r, text=value, bg=CARD, fg=value_fg, font=FONT_LABEL,
+                     anchor="w", justify="left", wraplength=wrap).pack(
+                side="left", fill="x", expand=True)
+            return r
+
+        # ── Champion summary (full-width stat strip) ───────────────────────────
+        wr = data.get("win_rate")
+        pr = data.get("pick_rate")
+        br = data.get("ban_rate")
+        summ = card(pad, f"{data['champion']} · {data['position'].upper()}")
+        line = tk.Frame(summ, bg=CARD)
+        line.pack(fill="x")
+        def stat(lbl, val, fg=TEXT_BRIGHT):
+            box = tk.Frame(line, bg=CARD)
+            box.pack(side="left", padx=(0, 24))
+            tk.Label(box, text=lbl, bg=CARD, fg=FAINT, font=FONT_HINT).pack(anchor="w")
+            tk.Label(box, text=val, bg=CARD, fg=fg,
+                     font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        if wr is not None:
+            stat("WIN RATE", f"{round(wr*100)}%", GREEN if wr >= 0.5 else RED)
+        if pr is not None:
+            stat("PICK RATE", f"{round(pr*100, 1)}%")
+        if br is not None:
+            stat("BAN RATE", f"{round(br*100, 1)}%")
+        if data.get("damage"):
+            stat("DAMAGE", data["damage"])
+
+        # ── Runes + spells (full width for the long rune lists) ────────────────
+        rn = card(pad, "Runes & Spells")
+        if data.get("rune_primary"):
+            kv(rn, data.get("rune_primary_page", "Primary"),
+               " · ".join(data["rune_primary"]), TEAL)
+        if data.get("rune_secondary"):
+            kv(rn, data.get("rune_secondary_page", "Secondary"),
+               " · ".join(data["rune_secondary"]), MUTED)
+        if data.get("spells"):
+            kv(rn, "Spells", "  +  ".join(data["spells"]), GOLD)
+
+        # ── Build + Ability order side by side (use the horizontal space) ──────
+        cols = tk.Frame(pad, bg=DARK)
+        cols.pack(fill="x")
+        colA = tk.Frame(cols, bg=DARK)
+        colA.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        colB = tk.Frame(cols, bg=DARK)
+        colB.pack(side="left", fill="both", expand=True)
+
+        it = card(colA, "Build")
+        if data.get("starter"):
+            kv(it, "Starting", ", ".join(data["starter"]), wrap=210)
+        if data.get("core"):
+            kv(it, "Core", "  →  ".join(data["core"]), GOLD, wrap=210)
+        if data.get("boots"):
+            kv(it, "Boots", ", ".join(data["boots"]), wrap=210)
+        if data.get("situational"):
+            kv(it, "Situational", ", ".join(data["situational"]), MUTED, wrap=210)
+
+        sk = card(colB, "Ability Order")
+        order = data.get("skill_order") or []
+        maxo  = data.get("max_order") or []
+        if order:
+            r = tk.Frame(sk, bg=CARD); r.pack(fill="x", pady=1)
+            tk.Label(r, text="Levels 1-3", bg=CARD, fg=MUTED, font=FONT_SMALL,
+                     width=11, anchor="w").pack(side="left")
+            self._ability_badges(r, order[:3], "→").pack(side="left")
+        if maxo:
+            r = tk.Frame(sk, bg=CARD); r.pack(fill="x", pady=1)
+            tk.Label(r, text="Level 4+ max", bg=CARD, fg=MUTED, font=FONT_SMALL,
+                     width=11, anchor="w").pack(side="left")
+            self._ability_badges(r, maxo, ">").pack(side="left")
+        if order:
+            tk.Label(sk, text="Full order", bg=CARD, fg=MUTED, font=FONT_SMALL,
+                     anchor="w").pack(anchor="w", pady=(6, 0))
+            grid = tk.Frame(sk, bg=CARD); grid.pack(anchor="w", pady=(2, 0))
+            for i, a in enumerate(order):
+                col = tk.Frame(grid, bg=CARD)
+                col.grid(row=0, column=i, padx=1)
+                tk.Label(col, text=a, bg=CARD,
+                         fg=self._ABILITY_COLORS.get(a, TEXT),
+                         font=("Segoe UI", 10, "bold")).pack()
+                tk.Label(col, text=str(i + 1), bg=CARD, fg=FAINT,
+                         font=("Segoe UI", 7)).pack()
 
     def _build_log(self, parent):
         wrap = tk.Frame(parent, bg=DARK)
