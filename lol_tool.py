@@ -84,7 +84,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.10.3"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -101,6 +101,9 @@ ROLE_LABEL = {
     "bottom":  "ADC",
     "utility": "Support",
 }
+
+MAX_PRIORITY_ITEMS = 5   # pick/ban priority list cap; a cross-list drop that
+                         # pushes a list past this bumps its 6th champion
 
 # Summoner-spell IDs:  Flash=4 Teleport=12 Smite=11 Ignite=14 Heal=7 Exhaust=3
 # Fallback spell pairs used only when no meta data is available for the champ.
@@ -352,10 +355,14 @@ class DDragon:
         self._id_to_name: dict = {}
         self._name_to_id: dict = {}   # lowercase name → int id
         self._id_to_key:  dict = {}   # int id → internal key (e.g. "MissFortune")
+        self._norm_to_id: dict = {}   # alnum-only name/key → int id (fuzzy match)
+        self._version: str = None
+        self._icon_dir = CONFIG_DIR / "champ_icons"
 
     def load(self):
         try:
             ver  = requests.get(f"{DDRAGON_URL}/api/versions.json", timeout=8).json()[0]
+            self._version = ver
             data = requests.get(
                 f"{DDRAGON_URL}/cdn/{ver}/data/en_US/champion.json", timeout=10
             ).json()["data"]
@@ -365,8 +372,44 @@ class DDragon:
                 self._id_to_name[cid] = name
                 self._name_to_id[name.lower()] = cid
                 self._id_to_key[cid] = champ["id"]   # e.g. "MissFortune", "DrMundo"
+                # Fuzzy index: strip spaces/punctuation so op.gg's varied name
+                # formats ("Miss Fortune", "MissFortune", "Cho'Gath"/"Chogath",
+                # "Dr. Mundo") all resolve to the right id.
+                self._norm_to_id[self._norm(name)]         = cid
+                self._norm_to_id[self._norm(champ["id"])]  = cid
         except Exception as e:
             print(f"[DDragon] {e}")
+
+    @staticmethod
+    def _norm(s: str) -> str:
+        return _re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+    def find_id_fuzzy(self, name: str):
+        """Resolve a champion id from a loosely-formatted name (e.g. op.gg's)."""
+        cid = self.find_id(name)
+        if cid is not None:
+            return cid
+        return self._norm_to_id.get(self._norm(name))
+
+    def icon_file(self, champ_id: int):
+        """Local cached path to a champion's square icon PNG, downloading it
+        once if needed. Returns None if unavailable (no data / no network)."""
+        key = self._id_to_key.get(int(champ_id))
+        if not key or not self._version:
+            return None
+        try:
+            self._icon_dir.mkdir(parents=True, exist_ok=True)
+            path = self._icon_dir / f"{champ_id}.png"
+            if path.exists() and path.stat().st_size > 0:
+                return path
+            url = f"{DDRAGON_URL}/cdn/{self._version}/img/champion/{key}.png"
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                path.write_bytes(r.content)
+                return path
+        except Exception:
+            pass
+        return None
 
     def name(self, champ_id: int) -> str:
         return self._id_to_name.get(int(champ_id), str(champ_id))
@@ -1598,6 +1641,8 @@ TEAL        = "#0ac8b9"   # hextech teal highlight
 FIELD_BG    = "#050a12"   # recessed input fields (clearly visible on cards)
 BTN_BG      = "#1e3350"   # secondary buttons (visible on DARK and CARD)
 BTN_HOV     = "#2a456a"   # secondary button hover
+CHIP_BG     = "#16283f"   # squishy champion tag fill
+CHIP_BADGE  = "#0e1c2e"   # rank-number badge fill inside a chip
 
 # Virtual-key codes for F-keys and navigation keys (overlay hotkey system)
 _OVERLAY_VK = {
@@ -1682,6 +1727,86 @@ def _blend(c1: str, c2: str, t: float) -> str:
         return f"#{r[0]:02x}{r[1]:02x}{r[2]:02x}"
     except Exception:
         return c2 if t >= 0.5 else c1
+
+
+# Tk's Canvas has no anti-aliasing for arcs / ovals / diagonal lines — hand
+# drawn rounded shapes look visibly jagged ("grainy") at widget size. These
+# helpers render each shape once via PIL at 4x scale and downsample with
+# LANCZOS (true anti-aliasing), caching by (size, colours) so repeated draws
+# are free. The module-level caches also keep every PhotoImage referenced,
+# which Tk requires — an un-referenced PhotoImage is silently garbage
+# collected and vanishes from the canvas.
+_SHAPE_CACHE = {}
+_SS = 4   # supersampling factor
+
+def _render_pill_image(w: int, h: int, fill: str, border: str, border_width=1.6):
+    w = max(h, int(round(w)))
+    key = ("pill", w, h, fill, border, round(border_width * 10))
+    if key in _SHAPE_CACHE:
+        return _SHAPE_CACHE[key]
+    photo = None
+    try:
+        from PIL import Image, ImageDraw, ImageTk
+        W, H = w * _SS, h * _SS
+        im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d  = ImageDraw.Draw(im)
+        r  = H // 2
+        d.rounded_rectangle([0, 0, W - 1, H - 1], radius=r, fill=fill)
+        bw = max(1, int(round(border_width * _SS)))
+        if border != fill:
+            d.rounded_rectangle([bw / 2, bw / 2, W - 1 - bw / 2, H - 1 - bw / 2],
+                                radius=max(1, r - bw // 2), outline=border, width=bw)
+        photo = ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
+    except Exception:
+        photo = None
+    _SHAPE_CACHE[key] = photo
+    return photo
+
+def _render_circle_image(diameter: int, fill=None, outline=None, outline_width=1.6):
+    """Anti-aliased circle: optional filled interior and/or outline ring
+    (transparent elsewhere). Returns a PhotoImage, or None if PIL missing."""
+    key = ("circle", diameter, fill, outline, round(outline_width * 10))
+    if key in _SHAPE_CACHE:
+        return _SHAPE_CACHE[key]
+    photo = None
+    try:
+        from PIL import Image, ImageDraw, ImageTk
+        D = diameter * _SS
+        im = Image.new("RGBA", (D, D), (0, 0, 0, 0))
+        d  = ImageDraw.Draw(im)
+        inset = _SS  # keep the stroke off the very edge so it isn't clipped
+        if fill is not None:
+            d.ellipse([inset, inset, D - 1 - inset, D - 1 - inset], fill=fill)
+        if outline is not None:
+            bw = max(1, int(round(outline_width * _SS)))
+            d.ellipse([inset, inset, D - 1 - inset, D - 1 - inset],
+                      outline=outline, width=bw)
+        photo = ImageTk.PhotoImage(im.resize((diameter, diameter), Image.LANCZOS))
+    except Exception:
+        photo = None
+    _SHAPE_CACHE[key] = photo
+    return photo
+
+def _render_diamond_image(size: int, fill: str, outline: str, outline_width=1.4):
+    """Anti-aliased diamond (rotated square) for slider handles / accents."""
+    key = ("diamond", size, fill, outline, round(outline_width * 10))
+    if key in _SHAPE_CACHE:
+        return _SHAPE_CACHE[key]
+    photo = None
+    try:
+        from PIL import Image, ImageDraw, ImageTk
+        S = size * _SS
+        im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        d  = ImageDraw.Draw(im)
+        m  = _SS
+        pts = [(S / 2, m), (S - m, S / 2), (S / 2, S - m), (m, S / 2)]
+        d.polygon(pts, fill=fill, outline=outline,
+                  width=max(1, int(round(outline_width * _SS))))
+        photo = ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
+    except Exception:
+        photo = None
+    _SHAPE_CACHE[key] = photo
+    return photo
 
 
 class HexCard(tk.Canvas):
@@ -1820,10 +1945,16 @@ class HexSlider(tk.Canvas):
         self.create_line(x0, cy, x1, cy, fill=EDGE_GOLD, width=3,
                          capstyle="round")
         self.create_line(x0, cy, hx, cy, fill=GOLD, width=3, capstyle="round")
-        # always-visible gold diamond handle
-        r = 7
-        self.create_polygon(hx, cy - r, hx + r, cy, hx, cy + r, hx - r, cy,
-                            fill=GOLD, outline=BRIGHT_GOLD)
+        # always-visible gold diamond handle (anti-aliased)
+        hs  = 16
+        him = _render_diamond_image(hs, GOLD, BRIGHT_GOLD, outline_width=1.4)
+        if him is not None:
+            self._handle_img = him
+            self.create_image(hx, cy, image=him)
+        else:
+            r = 7
+            self.create_polygon(hx, cy - r, hx + r, cy, hx, cy + r, hx - r, cy,
+                                fill=GOLD, outline=BRIGHT_GOLD)
 
     def _set_from_x(self, e):
         w = self._pxw()
@@ -1861,23 +1992,33 @@ class ToggleSwitch(tk.Canvas):
         self.bind("<Button-1>", self._click)
         self._draw()
 
-    def _pill(self, x0, y0, x1, y1, fill):
-        r = (y1 - y0) / 2
-        self.create_oval(x0, y0, x0 + 2 * r, y1, fill=fill, outline=fill)
-        self.create_oval(x1 - 2 * r, y0, x1, y1, fill=fill, outline=fill)
-        self.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline=fill)
-
     def _draw(self):
         self.delete("all")
         p = self._pos
         # Track colour fades grey→green as the knob slides across.
-        self._pill(2, 2, self.W - 2, self.H - 2, _blend(TRACK_OFF, GREEN, p))
+        track = _blend(TRACK_OFF, GREEN, p)
+        timg  = _render_pill_image(self.W - 4, self.H - 4, track, track)
+        if timg is not None:
+            self._track_img = timg
+            self.create_image(2, 2, anchor="nw", image=timg)
+        else:
+            r = (self.H - 4) / 2
+            self.create_oval(2, 2, 2 + 2 * r, self.H - 2, fill=track, outline=track)
+            self.create_oval(self.W - 2 - 2 * r, 2, self.W - 2, self.H - 2,
+                             fill=track, outline=track)
+            self.create_rectangle(2 + r, 2, self.W - 2 - r, self.H - 2,
+                                  fill=track, outline=track)
         d, pad = self.H - 8, 4                  # knob diameter, edge padding
         off_x  = pad
         on_x   = self.W - pad - d
         kx     = off_x + (on_x - off_x) * p     # interpolated knob position
         knob   = _blend("#c9cdd2", WHITE, p)
-        self.create_oval(kx, pad, kx + d, pad + d, fill=knob, outline=knob)
+        kimg   = _render_circle_image(d, fill=knob)
+        if kimg is not None:
+            self._knob_img = kimg
+            self.create_image(kx + d / 2, self.H / 2, image=kimg)
+        else:
+            self.create_oval(kx, pad, kx + d, pad + d, fill=knob, outline=knob)
 
     def _animate_to(self, target):
         """Step the knob toward target (0 or 1) a few frames for a slide."""
@@ -1917,6 +2058,424 @@ class ToggleSwitch(tk.Canvas):
         return self._on
 
 
+class ChampionChip(tk.Canvas):
+    """A single squishy, pill-shaped champion tag: a circular portrait
+    avatar (with a small rank badge tucked in its corner) + name + a small
+    "×" remove hotspot. Purely a rendering widget — drag/remove interaction
+    is owned and driven entirely by the parent ChampionList."""
+
+    HEIGHT = 34
+    _REMOVE_W = 26   # width of the clickable "×" hit zone, from the right edge
+
+    def __init__(self, parent, key, label, accent, bg=CARD, icon=None, stats=None):
+        super().__init__(parent, height=self.HEIGHT, bg=bg,
+                         highlightthickness=0, bd=0, cursor="fleur")
+        self.key           = key
+        self._label        = label
+        self._accent       = accent
+        self._icon         = icon   # ImageTk.PhotoImage (circular) or None
+        self._stats        = stats  # (games, wins) | "nodata" | None (not fetched)
+        self._rank         = 0
+        self._dragging     = False
+        self._hover_remove = False
+        self._ghost        = False
+        self._cur_y        = 0.0    # animated Y position (owned by ChampionList)
+        self._target_y     = 0.0
+        self.bind("<Configure>", lambda _e: self._draw())
+        self._draw()
+
+    def set_rank(self, n: int):
+        self._rank = n
+        self._draw()
+
+    def set_icon(self, icon):
+        self._icon = icon
+        self._draw()
+
+    def set_dragging(self, on: bool):
+        if on == self._dragging:
+            return
+        self._dragging = on
+        self._draw()
+
+    def set_hover_remove(self, on: bool):
+        if on == self._hover_remove:
+            return
+        self._hover_remove = on
+        self._draw()
+
+    def set_ghost(self, on: bool):
+        self._ghost = on
+        self._draw()
+
+    def hit_remove(self, x: int) -> bool:
+        w = self.winfo_width() or 260
+        return x >= w - self._REMOVE_W
+
+    def _pxw(self):
+        w = self.winfo_width()
+        return w if w > 1 else 260
+
+    def _pill(self, fill, border, width=1):
+        """Draw the pill background+border. Prefers a PIL-supersampled,
+        anti-aliased render (Tk's native arcs/lines have no anti-aliasing
+        and look jagged/"grainy" at this size); falls back to hand-drawn
+        vector shapes only if PIL is unavailable."""
+        w_px, h = self._pxw(), self.HEIGHT
+        img = _render_pill_image(w_px, h, fill, border, border_width=width)
+        if img is not None:
+            self._pill_img = img   # keep a reference — Tk GCs unreferenced PhotoImages
+            self.create_image(0, 0, anchor="nw", image=img)
+        else:
+            self._pill_vector(fill, border, width=max(1, int(round(width))))
+
+    def _pill_vector(self, fill, border, width=1):
+        w, h = self._pxw(), self.HEIGHT
+        r = h / 2
+        self.create_arc(0, 0, h, h, start=90, extent=180, fill=fill, outline=fill)
+        self.create_arc(w - h, 0, w, h, start=-90, extent=180, fill=fill, outline=fill)
+        self.create_rectangle(r, 0, w - r, h, fill=fill, outline=fill)
+        self.create_arc(1, 1, h - 1, h - 1, start=90, extent=180,
+                        style="arc", outline=border, width=width)
+        self.create_arc(w - h + 1, 1, w - 1, h - 1, start=-90, extent=180,
+                        style="arc", outline=border, width=width)
+        self.create_line(r, 1, w - r, 1, fill=border, width=width)
+        self.create_line(r, h - 1, w - r, h - 1, fill=border, width=width)
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self._pxw(), self.HEIGHT
+
+        if self._ghost:
+            # Faint dashed "drop here" placeholder — no content, just a hint
+            # that a chip will land in this slot.
+            fill = _blend(CARD, CHIP_BG, 0.4)
+            self._pill(fill, self._accent, width=1)
+            self.create_text(w / 2, h / 2, text="⌄ drop here ⌄", fill=FAINT,
+                             font=("Segoe UI", 8))
+            return
+
+        fill   = _shade(CHIP_BG, 1.35) if self._dragging else CHIP_BG
+        border = BRIGHT_GOLD if self._dragging else self._accent
+        self._pill(fill, border)
+
+        # Circular portrait — full chip diameter, forming the pill's left cap.
+        d  = self.HEIGHT
+        cx = cy = d / 2
+        if self._icon is not None:
+            self.create_image(cx, cy, image=self._icon)
+        else:
+            av = _render_circle_image(d, fill=CHIP_BADGE)
+            if av is not None:
+                self._avatar_img = av
+                self.create_image(cx, cy, image=av)
+        ring = _render_circle_image(d, outline=border, outline_width=2)
+        if ring is not None:
+            self._ring_img = ring
+            self.create_image(cx, cy, image=ring)
+        elif self._icon is None:
+            self.create_oval(1, 1, d - 1, d - 1, fill=CHIP_BADGE, outline=border)
+
+        # Rank badge tucked in the portrait's bottom-right corner
+        if self._rank:
+            bd = 16
+            bx, by = d - 7, h - 7
+            badge = _render_circle_image(bd, fill=DARKER, outline=border,
+                                         outline_width=1.4)
+            if badge is not None:
+                self._badge_img = badge
+                self.create_image(bx, by, image=badge)
+            else:
+                self.create_oval(bx - bd / 2, by - bd / 2, bx + bd / 2,
+                                 by + bd / 2, fill=DARKER, outline=border)
+            self.create_text(bx, by, text=str(self._rank), fill=TEXT_BRIGHT,
+                             font=("Segoe UI", 8, "bold"))
+
+        # ── op.gg history for this champion, in the chip's right third ────────
+        # (games played + win-rate over the past 6 months, all queues, for the
+        #  summoner signed into the League client). Only drawn when the champion
+        #  actually has recorded games — no games means a blank section, no text.
+        if isinstance(self._stats, tuple):
+            games, wins = self._stats
+            sx = w - self._REMOVE_W - 6           # right edge of the stats block
+            stats_left = w * 0.66                 # right third boundary
+            # faint divider between name and stats
+            self.create_line(stats_left, 7, stats_left, h - 7,
+                             fill=_blend(CARD, border, 0.5))
+            wr = round(100 * wins / games) if games else 0
+            wr_c = GREEN if wr >= 50 else RED
+            self.create_text(sx, h / 2 - 6, text=f"{wr}% WR", fill=wr_c,
+                             font=("Segoe UI", 9, "bold"), anchor="e")
+            self.create_text(sx, h / 2 + 7,
+                             text=f"{games}g · {wins}w", fill=MUTED,
+                             font=("Segoe UI", 8), anchor="e")
+
+        # Champion name
+        self.create_text(d + 8, h / 2, text=self._label, fill=TEXT_BRIGHT,
+                         font=FONT_LABEL, anchor="w")
+
+        # Remove "×"
+        rx = w - self._REMOVE_W / 2 - 2
+        self.create_text(rx, h / 2, text="✕",
+                         fill=RED if self._hover_remove else FAINT,
+                         font=("Segoe UI", 10, "bold"))
+
+
+class ChampionList(tk.Frame):
+    """A vertical stack of squishy ChampionChip tags with physically
+    floating click-and-drag reordering: the dragged chip follows the cursor
+    directly while its siblings smoothly slide out of the way to show where
+    it will land. Supports dragging a chip out to a linked sibling list
+    (see bind_cross) for cross-list moves, e.g. Pick Priority → Ban Priority.
+
+    set_items() takes [(key, label), ...] in priority order (top = highest).
+    on_reorder(new_key_order) fires once, on drop, only if the order changed.
+    on_remove(key) fires when a chip's "×" is clicked."""
+
+    GAP    = 6
+    _TWEEN = 0.35   # fraction of remaining distance closed per animation tick
+
+    def __init__(self, parent, accent, bg=CARD, get_icon=None, get_stats=None,
+                 on_reorder=None, on_remove=None, autosize=False):
+        super().__init__(parent, bg=bg)
+        # Children use place(), so they never drive our own size. By default the
+        # caller packs us fill="both", expand=True and we lay chips out within
+        # that. With autosize=True we instead set our OWN height to fit the
+        # chips (for use inside an autofit card, e.g. the permaban panel).
+        self._accent     = accent
+        self._bg         = bg
+        self._get_icon   = get_icon
+        self._get_stats  = get_stats
+        self._on_reorder = on_reorder
+        self._on_remove  = on_remove
+        self._autosize   = autosize
+        self._on_cross_move    = None
+        self._on_cross_release = None
+        self._chips: list[ChampionChip] = []
+        self._drag          = None   # {"chip","moved","external","grab_dy","order"}
+        self._press_remove  = None   # chip pending a remove-click
+        self._ghost          = None
+        self._ghost_index    = None
+        self._ticker          = None
+
+    # ── Public API used by RolePanel ────────────────────────────────────────
+    def bind_cross(self, on_move, on_release):
+        """on_move(key, label, x_root, y_root) — fires continuously while a
+        chip is being dragged outside this list's own bounds.
+        on_release(key, label, x_root, y_root) — fires once on drop."""
+        self._on_cross_move    = on_move
+        self._on_cross_release = on_release
+
+    def contains_point(self, x_root, y_root) -> bool:
+        x0, y0 = self.winfo_rootx(), self.winfo_rooty()
+        return (x0 <= x_root <= x0 + self.winfo_width() and
+                y0 <= y_root <= y0 + self.winfo_height())
+
+    def local_index_for_y(self, y_root) -> int:
+        local_y = y_root - self.winfo_rooty()
+        for i in range(len(self._chips)):
+            if local_y < i * (ChampionChip.HEIGHT + self.GAP) + ChampionChip.HEIGHT / 2:
+                return i
+        return len(self._chips)
+
+    def show_incoming_ghost(self, y_root):
+        idx = self.local_index_for_y(y_root)
+        if self._ghost is not None and self._ghost_index == idx:
+            return
+        self._ghost_index = idx
+        if self._ghost is None:
+            self._ghost = ChampionChip(self, "__ghost__", "", self._accent, bg=self._bg)
+            self._ghost.set_ghost(True)
+        self._relayout()
+
+    def hide_incoming_ghost(self):
+        if self._ghost is not None:
+            g = self._ghost
+            self._ghost = None
+            self._ghost_index = None
+            g.destroy()
+            self._relayout()
+
+    # ── Populate ─────────────────────────────────────────────────────────────
+    def set_items(self, items):
+        self._stop_ticker()
+        self._drag = None
+        if self._ghost is not None:
+            self._ghost.destroy()
+            self._ghost = None
+        for c in self._chips:
+            c.destroy()
+        self._chips = []
+        for key, label in items:
+            icon  = self._get_icon(key) if self._get_icon else None
+            stats = self._get_stats(key) if self._get_stats else None
+            chip = ChampionChip(self, key, label, self._accent, bg=self._bg,
+                                icon=icon, stats=stats)
+            chip.bind("<ButtonPress-1>",   lambda e, c=chip: self._on_press(c, e))
+            chip.bind("<B1-Motion>",       lambda e, c=chip: self._on_drag(c, e))
+            chip.bind("<ButtonRelease-1>", lambda e, c=chip: self._on_release(c, e))
+            chip.bind("<Motion>",          lambda e, c=chip: self._on_hover(c, e))
+            self._chips.append(chip)
+        self._update_ranks()
+        self._relayout(animate=False)
+        self.update_idletasks()
+
+    def _update_ranks(self):
+        for i, chip in enumerate(self._chips):
+            chip.set_rank(i + 1)
+
+    # ── Layout / animation ──────────────────────────────────────────────────
+    def _total_height(self, n=None):
+        n = len(self._chips) if n is None else n
+        return max(ChampionChip.HEIGHT,
+                   n * (ChampionChip.HEIGHT + self.GAP) - self.GAP) if n else ChampionChip.HEIGHT
+
+    def _relayout(self, animate=True, skip=None):
+        seq = list(self._chips)
+        if self._ghost is not None:
+            seq.insert(min(self._ghost_index, len(seq)), self._ghost)
+        for i, c in enumerate(seq):
+            y = i * (ChampionChip.HEIGHT + self.GAP)
+            c._target_y = y
+            if c is skip:
+                continue
+            if self._drag and self._drag["chip"] is c:
+                continue   # currently floating under direct cursor control
+            if c is self._ghost or not animate:
+                c._cur_y = y
+                c.place(x=0, y=y, relwidth=1.0, height=ChampionChip.HEIGHT)
+        if self._autosize:
+            # Drive our own height so an autofit parent card sizes to the chips.
+            n = len(seq)
+            self.config(height=(n * (ChampionChip.HEIGHT + self.GAP)
+                                if n else 0))
+        if animate:
+            self._start_ticker()
+
+    def _start_ticker(self):
+        if self._ticker is None:
+            self._tick()
+
+    def _stop_ticker(self):
+        if self._ticker is not None:
+            self.after_cancel(self._ticker)
+            self._ticker = None
+
+    def _tick(self):
+        moving = False
+        for c in self._chips:
+            if self._drag and self._drag["chip"] is c:
+                continue
+            if abs(c._target_y - c._cur_y) < 0.5:
+                if c._cur_y != c._target_y:
+                    c._cur_y = c._target_y
+                    c.place(x=0, y=int(c._cur_y), relwidth=1.0, height=ChampionChip.HEIGHT)
+                continue
+            moving = True
+            c._cur_y += (c._target_y - c._cur_y) * self._TWEEN
+            c.place(x=0, y=int(c._cur_y), relwidth=1.0, height=ChampionChip.HEIGHT)
+        self._ticker = self.after(16, self._tick) if (moving or self._drag) else None
+
+    def _reorder_from_float(self, chip, local_y):
+        """While `chip` floats freely at `local_y` (its top-left), recompute
+        self._chips order so the other chips animate to make room around it.
+
+        Deliberately rank-based rather than compared against siblings'
+        current _target_y: those can be transiently stale (e.g. still
+        reflecting last frame's gap-inclusive layout) on the very first
+        motion event of a drag, which produced off-by-one boundary glitches
+        on large/fast jumps. Assuming `others` re-pack back-to-back from
+        slot 0 and asking "which of those slots does the float's top align
+        closest to" is self-consistent regardless of prior layout state."""
+        others = [c for c in self._chips if c is not chip]
+        slot = ChampionChip.HEIGHT + self.GAP
+        insert_at = max(0, min(len(others), round(local_y / slot)))
+        new_order = others[:insert_at] + [chip] + others[insert_at:]
+        if new_order != self._chips:
+            self._chips = new_order
+            self._update_ranks()
+            self._relayout(skip=chip)
+
+    # ── Interaction ──────────────────────────────────────────────────────────
+    def _on_hover(self, chip, event):
+        if self._drag is None:
+            chip.set_hover_remove(chip.hit_remove(event.x))
+
+    def _on_press(self, chip, event):
+        if chip.hit_remove(event.x):
+            self._press_remove = chip
+            return
+        self._drag = {"chip": chip, "moved": False, "external": False,
+                      "grab_dy": event.y, "order": [c.key for c in self._chips]}
+        chip.set_dragging(True)
+        # Canvas shadows BOTH .lift() and .tkraise() with the canvas-item
+        # tag_raise() — call Misc's version directly to actually raise the
+        # widget itself in its parent's stacking order.
+        tk.Misc.tkraise(chip)
+        self._start_ticker()
+
+    def _on_drag(self, chip, event):
+        d = self._drag
+        if not d or d["chip"] is not chip:
+            return
+        d["moved"] = True
+        chip.set_hover_remove(False)
+        xr, yr = event.x_root, event.y_root
+
+        if self.contains_point(xr, yr):
+            if d["external"]:
+                d["external"] = False
+                if self._on_cross_move:
+                    self._on_cross_move(chip.key, chip._label, xr, yr)  # tells RolePanel to hide flying/ghost
+            local_y = yr - self.winfo_rooty() - d["grab_dy"]
+            local_y = max(0, min(local_y, self._total_height() - ChampionChip.HEIGHT))
+            chip._cur_y = chip._target_y = local_y
+            chip.place(x=0, y=int(local_y), relwidth=1.0, height=ChampionChip.HEIGHT)
+            self._reorder_from_float(chip, local_y)
+        else:
+            if not d["external"]:
+                d["external"] = True
+                chip.place_forget()
+                self._relayout(skip=chip)
+            if self._on_cross_move:
+                self._on_cross_move(chip.key, chip._label, xr, yr)
+
+    def _on_release(self, chip, event):
+        if self._press_remove is chip:
+            if chip.hit_remove(event.x) and self._on_remove:
+                self._on_remove(chip.key)
+            self._press_remove = None
+            return
+
+        d = self._drag
+        if not d or d["chip"] is not chip:
+            return
+        was_external = d["external"]
+        xr, yr = event.x_root, event.y_root
+        self._drag = None
+        self._stop_ticker()
+
+        if was_external:
+            if self._on_cross_release:
+                self._on_cross_release(chip.key, chip._label, xr, yr)
+            # A successful cross-list drop rebuilds this list via App's
+            # refresh_list (the chip no longer exists) — a cancelled one
+            # leaves our model untouched, so just restore this chip's view.
+            try:
+                if self.winfo_exists():
+                    self._relayout()
+            except tk.TclError:
+                pass
+            return
+
+        chip.set_dragging(False)
+        new_order = [c.key for c in self._chips]
+        self._relayout()
+        if new_order != d["order"] and self._on_reorder:
+            self._on_reorder(new_order)
+        chip.set_hover_remove(chip.hit_remove(event.x))
+
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 class RolePanel:
     """The pick + ban list editor for a single role."""
@@ -1925,15 +2484,55 @@ class RolePanel:
         self._role = role
         self._app  = app
         self._widgets: dict = {}
+        self._flying = None   # shared "chip crossing between lists" overlay
 
-        wrap = tk.Frame(parent, bg=DARK)
+        self._wrap = wrap = tk.Frame(parent, bg=DARK)
         wrap.pack(fill="both", expand=True, padx=24, pady=(6, 16))
         wrap.columnconfigure(0, weight=1, uniform="rp")
         wrap.columnconfigure(1, weight=1, uniform="rp")
         wrap.rowconfigure(0, weight=1)
 
-        self._build_side(wrap, 0, "picks", "Pick Priority", TEAL)
-        self._build_side(wrap, 1, "bans",  "Ban Priority",  RED)
+        picks = self._build_side(wrap, 0, "picks", "Pick Priority", TEAL)
+        bans  = self._build_side(wrap, 1, "bans",  "Ban Priority",  RED)
+        self._link_cross(picks, bans, "picks", "bans", RED)
+        self._link_cross(bans, picks, "bans", "picks", TEAL)
+
+    # ── Cross-list drag (Pick Priority ↔ Ban Priority) ─────────────────────────
+    def _link_cross(self, src: "ChampionList", dst: "ChampionList",
+                    src_key: str, dst_key: str, dst_accent: str):
+        def on_move(cid, label, xr, yr):
+            if dst.contains_point(xr, yr):
+                self._show_flying(label, dst_accent, xr, yr)
+                dst.show_incoming_ghost(yr)
+            else:
+                self._hide_flying()
+                dst.hide_incoming_ghost()
+
+        def on_release(cid, label, xr, yr):
+            self._hide_flying()
+            dst.hide_incoming_ghost()
+            if dst.contains_point(xr, yr):
+                idx = dst.local_index_for_y(yr)
+                self._app.move_between_lists(self._role, src_key, dst_key, cid, idx)
+
+        src.bind_cross(on_move, on_release)
+
+    def _show_flying(self, label, accent, x_root, y_root):
+        if self._flying is None:
+            self._flying = ChampionChip(self._wrap, "__flying__", label, accent, bg=DARK)
+            self._flying.set_dragging(True)
+        else:
+            self._flying._label  = label
+            self._flying._accent = accent
+        lx = x_root - self._wrap.winfo_rootx() - 100
+        ly = y_root - self._wrap.winfo_rooty() - ChampionChip.HEIGHT // 2
+        self._flying.place(x=lx, y=ly, width=220, height=ChampionChip.HEIGHT)
+        self._flying._draw()
+        tk.Misc.tkraise(self._flying)   # Canvas shadows tkraise() with tag_raise
+
+    def _hide_flying(self):
+        if self._flying is not None:
+            self._flying.place_forget()
 
     def _build_side(self, parent, col: int, list_key: str,
                     title: str, accent: str):
@@ -1956,32 +2555,15 @@ class RolePanel:
         tk.Label(container, text="Top = highest priority",
                  bg=CARD, fg=FAINT, font=FONT_HINT).pack(anchor="w", padx=14)
 
-        lb = tk.Listbox(container, bg=DARKER, fg=WHITE,
-                        selectbackground=accent, selectforeground=WHITE,
-                        relief="flat", height=8, font=FONT_LABEL,
-                        activestyle="none", highlightthickness=0, bd=0)
-        lb.pack(fill="both", expand=True, padx=14, pady=(6, 2))
-        self._widgets[f"{list_key}_lb"] = lb
-
-        # Reorder / remove
-        btn_row = tk.Frame(container, bg=CARD)
-        btn_row.pack(fill="x", padx=14)
-
-        def move(delta, r=role, k=list_key):
-            app.move_item(r, k, delta)
-
-        def remove(r=role, k=list_key):
-            app.remove_item(r, k)
-
-        tk.Button(btn_row, text="▲", bg=BTN_BG, fg=TEXT, width=3,
-                  activebackground=BTN_HOV, command=lambda: move(-1),
-                  **BTN_STYLE).pack(side="left", padx=(0, 4), pady=2)
-        tk.Button(btn_row, text="▼", bg=BTN_BG, fg=TEXT, width=3,
-                  activebackground=BTN_HOV, command=lambda: move(1),
-                  **BTN_STYLE).pack(side="left", padx=(0, 4), pady=2)
-        tk.Button(btn_row, text="Remove", bg=BTN_BG, fg=TEXT,
-                  activebackground=BTN_HOV, command=remove,
-                  **BTN_STYLE).pack(side="left", pady=2)
+        champ_list = ChampionList(
+            container, accent, bg=CARD, get_icon=app.get_champ_icon,
+            # op.gg history is shown on picks only — not bans.
+            get_stats=(app.get_champ_stats if list_key == "picks" else None),
+            on_reorder=lambda order, r=role, k=list_key: app.reorder_items(r, k, order),
+            on_remove=lambda cid, r=role, k=list_key: app.remove_item(r, k, cid),
+        )
+        champ_list.pack(fill="both", expand=True, padx=14, pady=(6, 2))
+        self._widgets[f"{list_key}_lb"] = champ_list
 
         # Champion search / add
         add_row = tk.Frame(container, bg=CARD)
@@ -2008,7 +2590,6 @@ class RolePanel:
         self._widgets[f"{list_key}_ac"] = ac_lb
 
         # Capture for closures
-        _lb       = lb
         _ev       = entry_var
         _ac       = ac_lb
         _role     = role
@@ -2022,13 +2603,20 @@ class RolePanel:
                 return
             lst = app.cfg["roleChampions"][_role][_list_key]
             if cid not in lst:
-                lst.append(cid)
+                lst.insert(0, cid)                       # newest goes to the top
+                bumped = None
+                if len(lst) > MAX_PRIORITY_ITEMS:        # keep only the top 5
+                    bumped = lst.pop(MAX_PRIORITY_ITEMS)
                 save_config(app.cfg)       # persist immediately
                 app.refresh_list(_role, _list_key)
+                app.request_icon_prefetch()
                 app.log(
-                    f"Added {app.ddragon.name(cid)} to "
+                    f"Added {app.ddragon.name(cid)} to the top of "
                     f"{ROLE_LABEL[_role]} {_list_key[:-1]} list"
                 )
+                if bumped is not None:
+                    app.log(f"{ROLE_LABEL[_role]} {_list_key[:-1]} list capped at "
+                            f"{MAX_PRIORITY_ITEMS} — removed {app.ddragon.name(bumped)}.")
             _ev.set("")
             _ac.pack_forget()
 
@@ -2060,7 +2648,9 @@ class RolePanel:
                   activebackground=_shade(accent, 1.2), command=_do_add,
                   **BTN_STYLE).pack(side="left")
 
-    def get_listbox(self, list_key: str) -> tk.Listbox:
+        return champ_list
+
+    def get_champ_list(self, list_key: str) -> ChampionList:
         return self._widgets[f"{list_key}_lb"]
 
 
@@ -2773,6 +3363,11 @@ class App(tk.Tk):
         self._role_panels: dict = {}   # role → RolePanel
         self._delay_vars:  dict = {}
         self._connected    = False
+        self._icon_images:   dict = {}   # champ id → ImageTk.PhotoImage (circular avatar)
+        self._icon_pil_cache: dict = {}  # champ id → PIL.Image, awaiting main-thread materialize
+        self._opgg_stats:    dict = {}   # champ id → (season games, wins) from op.gg
+        self._opgg_fetched   = False     # True once a stats fetch has succeeded
+        self._opgg_fetching  = False     # a fetch worker is currently running
 
         # Dashboard state
         self._auto_switches: dict = {}   # key → ToggleSwitch
@@ -2820,6 +3415,206 @@ class App(tk.Tk):
         self.ddragon.load()
         self.after(0, self._refresh_all)
         self.log(f"Loaded {len(self.ddragon.all_display_names())} champions.")
+        self._prefetch_icons()   # network I/O — safe here, already off the UI thread
+        self.refresh_opgg_stats()   # per-chip op.gg history (needs the client connected)
+
+    def get_champ_stats(self, cid):
+        """op.gg season history for a champion, for the chip's right third.
+        Returns (games, wins) if the summoner has played it, "nodata" if a
+        fetch succeeded but this champ isn't in it, or None if not yet fetched."""
+        if not self._opgg_fetched:
+            return None
+        return self._opgg_stats.get(int(cid), "nodata")
+
+    def refresh_opgg_stats(self, force=False):
+        """Kick off a background fetch of the signed-in summoner's per-champion
+        season history from op.gg. No-op if already loaded (unless force) or a
+        fetch is in flight."""
+        if self._opgg_fetching:
+            return
+        if self._opgg_fetched and not force:
+            return
+        self._opgg_fetching = True
+        threading.Thread(target=self._opgg_stats_worker, daemon=True).start()
+
+    def _opgg_stats_worker(self):
+        try:
+            if not self.ddragon.all_ids():
+                return   # champ data not loaded yet — _load_champs will retry
+            summ = self._detect_summoner()
+            if not summ:
+                return   # client not connected yet — _on_connected will retry
+            game_name, tag_line, region = summ
+            stats = self._opgg_champ_stats(game_name, tag_line, region)
+            if stats is None:
+                return
+            id_map = {}
+            for name, gw in stats.items():
+                cid = self.ddragon.find_id_fuzzy(name)
+                if cid is not None:
+                    id_map[cid] = gw
+            self._opgg_stats  = id_map
+            self._opgg_fetched = True
+            self.after(0, self._refresh_all)
+            self.log(f"op.gg history loaded for {game_name}#{tag_line} — "
+                     f"{len(id_map)} champions (all queues, past 6 months).")
+        except Exception as e:
+            _dbg(f"[opgg] stats worker error: {e}")
+        finally:
+            self._opgg_fetching = False
+
+    def _detect_summoner(self):
+        """(game_name, tag_line, region) for the signed-in summoner, or None."""
+        lcu = self._lcu
+        try:
+            if not lcu._sess:
+                return None
+            r = lcu.get("/lol-summoner/v1/current-summoner")
+            if r.status_code != 200:
+                return None
+            d = r.json()
+            game_name = d.get("gameName") or d.get("displayName", "")
+            tag_line  = d.get("tagLine", "")
+            if not game_name:
+                return None
+            region = "na"
+            try:
+                rr = lcu.get("/riotclient/region-locale")
+                if rr.status_code == 200:
+                    region = rr.json().get("webRegion", "NA").lower()
+            except Exception:
+                pass
+            return (game_name, tag_line, region)
+        except Exception:
+            return None
+
+    def _opgg_champ_stats(self, game_name, tag_line, region):
+        """All-queue (ranked AND unranked) per-champion history for the user
+        over roughly the past 6 months, aggregated from op.gg match history.
+        Returns {op.gg champion name: (games, wins)} or None on failure.
+
+        NOTE: op.gg's MCP caps match history at 20 games with no pagination
+        (verified — cursor/page args are ignored), so this covers up to the
+        20 most recent games that fall inside the 6-month window."""
+        from datetime import datetime, timezone, timedelta
+        body = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "lol_list_summoner_matches",
+                "arguments": {
+                    "game_name": game_name, "tag_line": tag_line,
+                    "region": region.upper(), "limit": 20,
+                    "desired_output_fields": [
+                        "data.game_history[].created_at",
+                        "data.game_history[].game_type",
+                        "data.game_history[].participants[].champion_name",
+                        "data.game_history[].participants[].stats.result",
+                    ],
+                },
+            },
+        }
+        try:
+            r = requests.post(
+                "https://mcp-api.op.gg/mcp", json=body, timeout=20,
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+            r.raise_for_status()
+            text = r.json()["result"]["content"][0]["text"]
+        except Exception as e:
+            _dbg(f"[opgg] match history fetch failed: {e}")
+            return None
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=182)
+        agg: dict = {}   # champ name -> [games, wins]
+        # Each game: GameHistory("<created_at>","<game_type>",[Participant("<champ>",Stats("<result>"),...)],"id")
+        pat = _re.compile(
+            r'GameHistory\("([^"]+)","([^"]*)",\[Participant\("([^"]+)",'
+            r'Stats\("([^"]*)"\)'
+        )
+        for mo in pat.finditer(text):
+            created, _gtype, champ, result = mo.groups()
+            try:
+                when = datetime.fromisoformat(created)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                if when < cutoff:
+                    continue   # older than 6 months
+            except Exception:
+                pass   # unparseable date — count it rather than drop it
+            res = result.upper()
+            if res == "UNKNOWN":
+                continue   # remake / no result — not a real game
+            gw = agg.setdefault(champ, [0, 0])
+            gw[0] += 1
+            if res == "WIN":
+                gw[1] += 1
+        return {name: (g, w) for name, (g, w) in agg.items() if g > 0}
+
+    # ── Champion portrait icons (for the squishy pick/ban chips) ───────────────
+    def request_icon_prefetch(self):
+        """Fetch+cache icons for any champion currently on a list that isn't
+        cached yet. Safe to call often — it's a cheap no-op once everything
+        referenced is already cached."""
+        threading.Thread(target=self._prefetch_icons, daemon=True).start()
+
+    def _prefetch_icons(self):
+        ids = set()
+        for role in ROLES:
+            for key in ("picks", "bans"):
+                ids.update(int(c) for c in self.cfg["roleChampions"][role][key])
+        ids.update(int(c) for c in self.cfg.get("permaBans", []))
+        got_new = False
+        for cid in ids:
+            if cid in self._icon_images or cid in self._icon_pil_cache:
+                continue
+            pil_img = self._load_circular_icon(cid)
+            if pil_img is not None:
+                self._icon_pil_cache[cid] = pil_img
+                got_new = True
+        if got_new:
+            self.after(0, self._materialize_icons)
+
+    def _load_circular_icon(self, cid, size=None):
+        """Off-main-thread: download/cache the raw icon then mask it into a
+        circular RGBA PIL image sized to the chip's diameter, with an
+        anti-aliased (supersampled) circular edge. None on failure."""
+        try:
+            from PIL import Image, ImageDraw
+            if size is None:
+                size = ChampionChip.HEIGHT
+            path = self.ddragon.icon_file(cid)
+            if not path:
+                return None
+            im = Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
+            ss = 4
+            mask = Image.new("L", (size * ss, size * ss), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, size * ss - 1, size * ss - 1), fill=255)
+            mask = mask.resize((size, size), Image.LANCZOS)   # smooth circle edge
+            im.putalpha(mask)
+            return im
+        except Exception:
+            return None
+
+    def _materialize_icons(self):
+        """Main thread only: PhotoImage objects must be created on the Tk
+        thread. Turns any pending PIL images into real PhotoImages, then
+        refreshes the champion lists so the new icons actually show up."""
+        try:
+            from PIL import ImageTk
+        except Exception:
+            self._icon_pil_cache.clear()
+            return
+        for cid, pil_img in list(self._icon_pil_cache.items()):
+            if cid not in self._icon_images:
+                try:
+                    self._icon_images[cid] = ImageTk.PhotoImage(pil_img)
+                except Exception:
+                    pass
+        self._icon_pil_cache.clear()
+        self._refresh_all()
+
+    def get_champ_icon(self, cid):
+        return self._icon_images.get(int(cid))
 
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -2987,9 +3782,9 @@ class App(tk.Tk):
                  fg=FAINT, font=FONT_HINT).pack(side="left", padx=(10, 0),
                                                 pady=(4, 0))
 
-        # One grid for both rows so columns align and gaps stay even.
+        # Add row: entry + button, with the autocomplete dropdown below it.
         pg = tk.Frame(pbb, bg=CARD)
-        pg.pack(fill="x", padx=16, pady=(10, 12))
+        pg.pack(fill="x", padx=16, pady=(10, 0))
         pg.columnconfigure(1, weight=1)
 
         self._perma_var = tk.StringVar()
@@ -3014,19 +3809,12 @@ class App(tk.Tk):
         self._perma_var.trace_add("write", self._perma_ac_update)
         self._perma_ac.bind("<<ListboxSelect>>", self._perma_ac_select)
 
-        tk.Label(pg, text="Current:", bg=CARD, fg=TEXT,
-                 font=FONT_SMALL).grid(row=2, column=0, sticky="nw", pady=(12, 0))
-        self._perma_lb = tk.Listbox(pg, height=2, bg=FIELD_BG, fg=WHITE,
-                                    selectbackground=RED, selectforeground=WHITE,
-                                    relief="flat", font=FONT_SMALL,
-                                    activestyle="none", highlightthickness=1,
-                                    highlightbackground=EDGE_GOLD)
-        self._perma_lb.grid(row=2, column=1, sticky="nwe", padx=8, pady=(12, 0))
-        tk.Button(pg, text="Remove", bg=BTN_BG, fg=TEXT,
-                  activebackground=BTN_HOV, activeforeground=WHITE,
-                  relief="flat", cursor="hand2", font=FONT_BTN,
-                  command=self._remove_permaban).grid(
-            row=2, column=2, sticky="nwe", pady=(12, 0))
+        # Current permabans as squishy champion chips (portraits + drag-reorder
+        # + per-chip × remove) — same interface as the pick/ban lists, no stats.
+        self._perma_list = ChampionList(
+            pbb, RED, bg=CARD, get_icon=self.get_champ_icon, autosize=True,
+            on_reorder=self._reorder_permabans, on_remove=self._remove_permaban)
+        self._perma_list.pack(fill="x", padx=16, pady=(8, 12))
 
         # ── Per-role pick / ban lists ──────────────────────────────────────────
         holder = tk.Frame(parent, bg=DARK)
@@ -3666,6 +4454,7 @@ class App(tk.Tk):
         # Auto-start automation so it's already running by the time champ
         # select begins — no need to click Start manually.
         self._start()
+        self.refresh_opgg_stats()   # now that a summoner is available
 
     def _on_disconnected(self):
         self._lbl_conn.config(text="● Client: waiting", fg=MUTED)
@@ -3962,10 +4751,10 @@ class App(tk.Tk):
         panel = self._role_panels.get(role)
         if panel is None:
             return
-        lb = panel.get_listbox(key)
-        lb.delete(0, "end")
-        for cid in self.cfg["roleChampions"][role][key]:
-            lb.insert("end", f"  {self.ddragon.name(int(cid))}")
+        champ_list = panel.get_champ_list(key)
+        items = [(int(cid), self.ddragon.name(int(cid)))
+                 for cid in self.cfg["roleChampions"][role][key]]
+        champ_list.set_items(items)
 
     def _refresh_all(self):
         for role in ROLES:
@@ -3975,11 +4764,11 @@ class App(tk.Tk):
 
     # ── Permaban (global, always banned first) ─────────────────────────────────
     def _refresh_permabans(self):
-        if not hasattr(self, "_perma_lb"):
+        if not hasattr(self, "_perma_list"):
             return
-        self._perma_lb.delete(0, "end")
-        for cid in self.cfg.get("permaBans", []):
-            self._perma_lb.insert("end", f" {self.ddragon.name(int(cid))}")
+        items = [(int(cid), self.ddragon.name(int(cid)))
+                 for cid in self.cfg.get("permaBans", [])]
+        self._perma_list.set_items(items)
 
     def _perma_ac_update(self, *_):
         if not hasattr(self, "_perma_ac"):
@@ -4022,52 +4811,69 @@ class App(tk.Tk):
             lst.append(cid)
             save_config(self.cfg)
             self._refresh_permabans()
+            self.request_icon_prefetch()      # load the new chip's portrait
             self.log(f"Permaban added: {self.ddragon.name(cid)}")
         self._perma_var.set("")
         if hasattr(self, "_perma_ac"):
             self._perma_ac.grid_remove()
 
-    def _remove_permaban(self):
-        sel = self._perma_lb.curselection()
-        if not sel:
-            return
+    def _remove_permaban(self, cid):
+        """Called by a permaban chip's × remove hotspot."""
+        cid = int(cid)
         lst = self.cfg.get("permaBans", [])
-        idx = sel[0]
-        if 0 <= idx < len(lst):
-            removed = self.ddragon.name(int(lst[idx]))
-            lst.pop(idx)
+        if cid in lst:
+            removed = self.ddragon.name(cid)
+            lst.remove(cid)
             save_config(self.cfg)
             self._refresh_permabans()
             self.log(f"Permaban removed: {removed}")
 
-    def move_item(self, role: str, key: str, delta: int):
-        panel = self._role_panels.get(role)
-        if panel is None:
-            return
-        lb  = panel.get_listbox(key)
-        sel = lb.curselection()
-        if not sel:
-            return
-        idx = sel[0]
-        lst = self.cfg["roleChampions"][role][key]
-        new = idx + delta
-        if 0 <= new < len(lst):
-            lst[idx], lst[new] = lst[new], lst[idx]
-            save_config(self.cfg)          # persist the new order immediately
-            self.refresh_list(role, key)
-            lb.selection_set(new)
+    def _reorder_permabans(self, order):
+        """Called when permaban chips are drag-reordered."""
+        self.cfg["permaBans"] = [int(c) for c in order]
+        save_config(self.cfg)
+        self.log("Reordered permaban priority.")
 
-    def remove_item(self, role: str, key: str):
-        panel = self._role_panels.get(role)
-        if panel is None:
-            return
-        lb  = panel.get_listbox(key)
-        sel = lb.curselection()
-        if not sel:
-            return
-        self.cfg["roleChampions"][role][key].pop(sel[0])
-        save_config(self.cfg)              # persist the removal immediately
-        self.refresh_list(role, key)
+    def reorder_items(self, role: str, key: str, new_order: list):
+        """Called by ChampionList once a drag-and-drop reorder is dropped."""
+        self.cfg["roleChampions"][role][key] = [int(cid) for cid in new_order]
+        save_config(self.cfg)              # persist the new order immediately
+        self.log(f"Reordered {ROLE_LABEL[role]} {key[:-1]} priority.")
+
+    def remove_item(self, role: str, key: str, cid: int):
+        lst = self.cfg["roleChampions"][role][key]
+        if cid in lst:
+            name = self.ddragon.name(cid)
+            lst.remove(cid)
+            save_config(self.cfg)          # persist the removal immediately
+            self.refresh_list(role, key)
+            self.log(f"Removed {name} from {ROLE_LABEL[role]} {key[:-1]} list")
+
+    def move_between_lists(self, role: str, from_key: str, to_key: str,
+                           cid: int, insert_index: int):
+        """Called by RolePanel when a chip is dragged from one priority list
+        (picks/bans) to the other within the same role. Caps the destination
+        at MAX_PRIORITY_ITEMS — if the drop pushes it past that, the 6th
+        champion (whoever now sits at that position) is bumped off."""
+        cid = int(cid)
+        src = self.cfg["roleChampions"][role][from_key]
+        dst = self.cfg["roleChampions"][role][to_key]
+        if cid in src:
+            src.remove(cid)
+        if cid in dst:
+            dst.remove(cid)   # shouldn't happen, but avoid a duplicate
+        dst.insert(max(0, min(insert_index, len(dst))), cid)
+        bumped = None
+        if len(dst) > MAX_PRIORITY_ITEMS:
+            bumped = dst.pop(MAX_PRIORITY_ITEMS)
+        save_config(self.cfg)
+        self.refresh_list(role, from_key)
+        self.refresh_list(role, to_key)
+        self.log(f"Moved {self.ddragon.name(cid)} from {ROLE_LABEL[role]} "
+                 f"{from_key[:-1]} to {to_key[:-1]} list")
+        if bumped is not None:
+            self.log(f"{ROLE_LABEL[role]} {to_key[:-1]} list capped at "
+                     f"{MAX_PRIORITY_ITEMS} — removed {self.ddragon.name(bumped)}.")
 
     # ── op.gg Auto-fill ───────────────────────────────────────────────────────
     def _open_opgg_dialog(self):
@@ -4313,6 +5119,7 @@ class App(tk.Tk):
 
         self._refresh_all()
         save_config(self.cfg)
+        self.request_icon_prefetch()
         roles_str = ", ".join(ROLE_LABEL[r] for r in changed) or "none"
         self.log(f"op.gg auto-fill complete. Picks updated: {roles_str}.")
         if do_bans:
