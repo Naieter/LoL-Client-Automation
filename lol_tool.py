@@ -84,7 +84,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -365,6 +365,14 @@ SUMMONER_SPELLS = {
 def _spell_name(sid):
     return SUMMONER_SPELLS.get(int(sid), f"Spell {sid}")
 
+# Summoner-spell id → DDragon icon image name (…/img/spell/<name>.png).
+SPELL_IMG = {
+    1:  "SummonerBoost",    3:  "SummonerExhaust",  4:  "SummonerFlash",
+    6:  "SummonerHaste",    7:  "SummonerHeal",     11: "SummonerSmite",
+    12: "SummonerTeleport", 13: "SummonerMana",     14: "SummonerDot",
+    21: "SummonerBarrier",  32: "SummonerSnowball", 39: "SummonerSnowball",
+}
+
 def _parse_opgg_record(text: str):
     """Parse op.gg's MCP 'class-schema + positional record' payload into nested
     dicts. The header lines ('class Name: f1,f2,...') define each record type's
@@ -525,6 +533,26 @@ class DDragon:
             if path.exists() and path.stat().st_size > 0:
                 return path
             url = f"{DDRAGON_URL}/cdn/{self._version}/img/champion/{key}.png"
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                path.write_bytes(r.content)
+                return path
+        except Exception:
+            pass
+        return None
+
+    def spell_icon_file(self, spell_id: int):
+        """Local cached path to a summoner spell's icon PNG, downloading it once
+        if needed. Returns None if unavailable (unknown spell / no network)."""
+        img = SPELL_IMG.get(int(spell_id))
+        if not img or not self._version:
+            return None
+        try:
+            self._icon_dir.mkdir(parents=True, exist_ok=True)
+            path = self._icon_dir / f"spell_{int(spell_id)}.png"
+            if path.exists() and path.stat().st_size > 0:
+                return path
+            url = f"{DDRAGON_URL}/cdn/{self._version}/img/spell/{img}.png"
             r = requests.get(url, timeout=8)
             if r.status_code == 200:
                 path.write_bytes(r.content)
@@ -701,7 +729,6 @@ class AutoEngine:
         self._user_pick:     dict = {}   # aid → championId the USER manually hovered
         self._pick_rejected: dict = {}   # aid → champs that became banned/taken
         self._ban_hovered:   dict = {}   # aid → championId hovered for ban (two-phase)
-        self._ally_ban_hover: dict = {}  # cell_id → (championId, monotonic_time) ally hovering for ban
         self._runes_key      = None      # (champ_id, role) of last runes import
         self._last_role      = None      # assignedPosition seen last poll (detect swaps)
         self._queue_started     = False  # leader already started queue this lobby
@@ -795,7 +822,6 @@ class AutoEngine:
                 self._user_pick.clear()
                 self._pick_rejected.clear()
                 self._ban_hovered.clear()
-                self._ally_ban_hover.clear()
                 self._runes_key      = None
                 self._last_role      = None
                 self._last_state_key = None   # force [tick] on first poll
@@ -1067,28 +1093,20 @@ class AutoEngine:
             self._log(f"[tick] {_states}  bans={sorted(bans)}  t={time_left}ms inf={is_infinite}")
             self._last_state_key = _key
 
-        # ── track ally ban hovers so we can skip our target if they've had it for 2 s ──
-        _now = time.monotonic()
+        # ── champions an ally is CURRENTLY hovering for a ban ──────────────────
+        # If an ally is hovering our intended ban champion at any time (no delay),
+        # we move our ban to the next champion on the priority list — no point
+        # double-banning, and they may be banning it for us.
+        ally_banning: set = set()
         for _grp in session.get("actions", []):
             for _act in _grp:
                 if str(_act.get("actorCellId", "")) == my_cell:
                     continue
-                if _act.get("type") != "ban" or not _act.get("isInProgress") or _act.get("completed"):
-                    continue
-                _actor = str(_act.get("actorCellId", ""))
-                _cid   = int(_act.get("championId", 0) or 0)
-                if _cid:
-                    prev = self._ally_ban_hover.get(_actor)
-                    if not prev or prev[0] != _cid:
-                        self._ally_ban_hover[_actor] = (_cid, _now)
-                else:
-                    self._ally_ban_hover.pop(_actor, None)
-
-        # Champions an ally has been hovering for 2+ seconds — treat as taken for bans.
-        ally_banning: set = {
-            cid for (_cid, _t) in self._ally_ban_hover.values()
-            for cid in [_cid] if _now - _t >= 2.0
-        }
+                if (_act.get("type") == "ban" and _act.get("isInProgress")
+                        and not _act.get("completed")):
+                    _cid = int(_act.get("championId", 0) or 0)
+                    if _cid:
+                        ally_banning.add(_cid)
 
         # ── action loop (mirrors reference foreach actions → foreach team) ──
         for action_group in session.get("actions", []):
@@ -1168,37 +1186,76 @@ class AutoEngine:
                         and in_progress
                         and not completed
                         and aid not in self._done_actions):
+                    # The ban-turn timer starts once and is NEVER reset on a
+                    # target switch, so switching away from an ally's champion can
+                    # never postpone the lock (that bug banned nothing).
                     if aid not in self._action_start:
                         self._action_start[aid] = time.monotonic()
-                    # Permabans are never blocked by pick_intents — only by bans already placed.
-                    # Ally_banning skips any champion an ally has been hovering for 2+ s.
-                    perma_set = {int(c) for c in cfg.get("permaBans", [])}
-                    champ = self._best(ban_prio, bans | (pick_intents - perma_set) | ally_banning, set(range(1_000_000)))
-                    # If we were already hovering a champion that an ally just claimed, log and reset.
-                    prev_hover = self._ban_hovered.get(aid)
-                    if prev_hover and prev_hover in ally_banning and prev_hover != champ:
-                        self._log(f"Ally hovering #{prev_hover} for ban — switching to #{champ}.")
-                        self._ban_hovered[aid] = None
+                    # Never target a champion a teammate intends to pick
+                    # (championPickIntent) or is hovering for a ban: the client
+                    # REJECTS banning a teammate's intended pick with HTTP 400, so
+                    # even permabans must yield — we fall through to the next
+                    # priority instead of retrying a ban that can never lock.
+                    unavail = bans | pick_intents | ally_banning
+
+                    # Keep our current hover if it's still valid — don't oscillate
+                    # back to a higher priority an ally merely moved off of. Only
+                    # retarget when the current pick is taken or an ally is on it.
+                    current = self._ban_hovered.get(aid)
+                    if current and current not in unavail:
+                        champ = current
+                    else:
+                        champ = self._best(ban_prio, unavail, set(range(1_000_000)))
+                        if current and current != champ and current in ally_banning:
+                            pname = self._dd.name(current) if self._dd else f"#{current}"
+                            cname = (self._dd.name(champ) if self._dd else f"#{champ}") \
+                                    if champ else "the next option"
+                            self._log(f"Ally hovering {pname} for ban — switching to {cname}.")
+
+                    cur     = int(action.get("championId", 0) or 0)
+                    elapsed = (time.monotonic() - self._action_start[aid]) * 1000
+                    # Lock once the ban delay has passed, or force it through if
+                    # the ban timer is nearly up so we never miss the ban.
+                    ready  = elapsed >= min(cfg.get("banDelay", 8000), 8000)
+                    ending = (not is_infinite) and 0 < time_left <= 4000
+                    # ── Debug dump: exact state driving the ban decision ──
+                    _raw_bans = [
+                        (str(a.get("actorCellId")), int(a.get("championId", 0) or 0),
+                         bool(a.get("isInProgress")), bool(a.get("completed")))
+                        for g in session.get("actions", []) for a in g
+                        if a.get("type") == "ban"
+                    ]
+                    _dbg(f"[ban] aid={aid} champ={champ} current={current} "
+                         f"cur(session)={cur} hovered={self._ban_hovered.get(aid)} "
+                         f"elapsed={int(elapsed)}ms banDelay={min(cfg.get('banDelay', 8000), 8000)} "
+                         f"ready={ready} ending={ending} time_left={time_left} inf={is_infinite}")
+                    _dbg(f"[ban]   ban_prio={ban_prio} bans={sorted(bans)} "
+                         f"pick_intents={sorted(pick_intents)} ally_banning={sorted(ally_banning)} "
+                         f"unavail={sorted(unavail)}")
+                    _dbg(f"[ban]   raw ban actions (cell,champ,inprog,done)={_raw_bans}")
+                    _dbg("[ban]   myTeam (cell,champ,pickIntent,pos)=" + str([
+                        (mb.get("cellId"), int(mb.get("championId", 0) or 0),
+                         int(mb.get("championPickIntent", 0) or 0),
+                         mb.get("assignedPosition", ""))
+                        for mb in session.get("myTeam", [])
+                    ]))
                     if not champ:
+                        _dbg("[ban]   -> NO VALID CHAMP (nothing to ban)")
                         self._log(f"No valid ban for {ROLE_LABEL.get(role_key, role_key)}. Add champions to the ban list!")
-                    elif self._ban_hovered.get(aid) != champ:
-                        # Phase 1 — hover the ban target (no completion yet)
+                    elif cur != champ or self._ban_hovered.get(aid) != champ:
+                        # Phase 1 — (re)hover the target; timer is not reset.
+                        _dbg(f"[ban]   -> HOVER {champ} (cur={cur} hovered={self._ban_hovered.get(aid)})")
                         if self._commit_action(action, champ, complete=False):
                             self._ban_hovered[aid] = champ
-                            self._action_start[aid] = time.monotonic()  # start delay after hover
                             self._log(f"[debug] Ban hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
-                    elif (time.monotonic() - self._action_start[aid]) * 1000 >= min(cfg.get("banDelay", 8000), 8000):
-                        # Phase 2 — champion is hovered, lock it the SAME way the pick
-                        # locks: atomic PATCH completed:true (the pick proves this works
-                        # once the champion is already hovered).
-                        cur = int(action.get("championId", 0) or 0)
-                        if cur != champ:
-                            # hover didn't stick yet — re-hover and wait another cycle
-                            self._ban_hovered[aid] = None
-                            continue
+                    elif ready or ending:
+                        # Phase 2 — champion is hovered and stuck; lock it in.
+                        _dbg(f"[ban]   -> LOCK {champ} (ready={ready} ending={ending})")
                         if self._commit_action(action, champ, complete=True):
                             self._log(f"Banned champion #{champ}")
                             self._done_actions.add(aid)
+                    else:
+                        _dbg(f"[ban]   -> WAIT (hovered {champ}, {int(elapsed)}/{min(cfg.get('banDelay', 8000), 8000)}ms)")
 
                 # ── PRE-PICK ── hover our intended champion before our turn (after
                 # the pre-pick delay), unless the user has already hovered one.
@@ -1584,6 +1641,9 @@ class AutoEngine:
             "type":         action.get("type", "string"),
         }
         r = self._lcu.patch(f"/lol-champ-select/v1/session/actions/{aid}", body)
+        _dbg(f"[commit] type={action.get('type')} aid={aid} champ={champ} "
+             f"complete={complete} -> HTTP {r.status_code}"
+             + ("" if r.status_code in (200, 204) else f" body={r.text[:300]}"))
         if r.status_code not in (200, 204):
             self._log(f"[{action.get('type')}] PATCH HTTP {r.status_code} body={r.text[:150]}")
             return False
@@ -3489,6 +3549,7 @@ class App(tk.Tk):
         self._connected    = False
         self._icon_images:   dict = {}   # champ id → ImageTk.PhotoImage (circular avatar)
         self._icon_pil_cache: dict = {}  # champ id → PIL.Image, awaiting main-thread materialize
+        self._spell_icons:   dict = {}   # (spell id, size) → ImageTk.PhotoImage
         self._opgg_stats:    dict = {}   # champ id → (season games, wins) from op.gg
         self._opgg_fetched   = False     # True once a stats fetch has succeeded
         self._opgg_fetching  = False     # a fetch worker is currently running
@@ -4487,10 +4548,34 @@ class App(tk.Tk):
 
     def _load_build_worker(self, champ, position, seq=0):
         data = self._fetch_build(champ, position)
+        # Warm the summoner-spell icon disk cache off the main thread so the
+        # render can build PhotoImages from local files without any network.
+        for combo in (data or {}).get("combos", []):
+            for sid in combo.get("spell_ids", []):
+                self.ddragon.spell_icon_file(sid)
         def _apply():
             if seq == getattr(self, "_build_req", seq):
                 self._render_build(data)
         self.after(0, _apply)
+
+    def _spell_photo(self, sid, size=22):
+        """A cached Tk PhotoImage for a summoner spell icon, or None. Reads the
+        already-cached PNG (warmed by _load_build_worker); must run on the main
+        thread because PhotoImage creation is Tk-thread-only."""
+        key = (int(sid), size)
+        if key in self._spell_icons:
+            return self._spell_icons[key]
+        try:
+            from PIL import Image, ImageTk
+            path = self.ddragon.spell_icon_file(sid)
+            if not path:
+                return None
+            im = Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(im)
+            self._spell_icons[key] = photo
+            return photo
+        except Exception:
+            return None
 
     def _ability_badges(self, parent, letters, sep):
         row = tk.Frame(parent, bg=CARD)
@@ -4636,10 +4721,23 @@ class App(tk.Tk):
                   command=lambda c=combo: self._apply_combo(c)).pack(
             side="left", padx=(0, 10))
 
+        # Summoner-spell icons to the right of the build (fall back to names).
+        spells = tk.Frame(row, bg=CARD)
+        spells.pack(side="right", padx=(8, 2))
+        for sid in combo.get("spell_ids", []):
+            photo = self._spell_photo(sid)
+            if photo is not None:
+                sl = tk.Label(spells, image=photo, bg=CARD, bd=0)
+                sl.image = photo   # keep a reference so Tk won't GC it
+                sl.pack(side="left", padx=1)
+            else:
+                tk.Label(spells, text=_spell_name(sid), bg=CARD, fg=TEXT_BRIGHT,
+                         font=FONT_SMALL).pack(side="left", padx=2)
+
         info = tk.Frame(row, bg=CARD)
         info.pack(side="left", fill="x", expand=True)
 
-        # Header line: tier label · pick-rate · summoner spells
+        # Header line: tier label · pick-rate (spells shown as icons at right)
         head = tk.Frame(info, bg=CARD)
         head.pack(fill="x", anchor="w")
         tk.Label(head, text=combo.get("label", ""), bg=CARD, fg=GOLD,
@@ -4648,8 +4746,6 @@ class App(tk.Tk):
         if isinstance(pr, (int, float)):
             tk.Label(head, text=f"· {round(pr*100)}%", bg=CARD, fg=FAINT,
                      font=FONT_HINT).pack(side="left", padx=(6, 0))
-        tk.Label(head, text="· " + "  +  ".join(combo.get("spell_names", [])),
-                 bg=CARD, fg=TEXT_BRIGHT, font=FONT_SMALL).pack(side="left", padx=(6, 0))
 
         # Detail line: keystone + the two rune pages (compact, one line — the
         # spells in the header plus the keystone are what distinguish combos).
@@ -4746,6 +4842,15 @@ class App(tk.Tk):
         wrap = tk.Frame(parent, bg=DARK)
         wrap.pack(fill="both", expand=True, padx=30, pady=(20, 16))
         self._section_header(wrap, "Logs")
+        # Row with a shortcut to the detailed debug log file on disk.
+        tools = tk.Frame(wrap, bg=DARK)
+        tools.pack(fill="x", pady=(0, 6))
+        tk.Label(tools, text="Detailed diagnostics are written to debug.log.",
+                 bg=DARK, fg=MUTED, font=FONT_SMALL).pack(side="left")
+        tk.Button(tools, text="Open Debug Log", bg=BTN_BG, fg=GOLD,
+                  activebackground=BTN_HOV, activeforeground=GOLD, relief="flat",
+                  cursor="hand2", font=FONT_BTN, padx=12, pady=3,
+                  command=self._open_debug_log).pack(side="right")
         # Gold-outlined console panel for consistency with the cards.
         border = tk.Frame(wrap, bg=CARD_BORDER)
         border.pack(fill="both", expand=True)
@@ -4756,6 +4861,17 @@ class App(tk.Tk):
             state="disabled", wrap="word",
             insertbackground=WHITE, padx=10, pady=8)
         self._log_box.pack(fill="both", expand=True, padx=1, pady=1)
+
+    def _open_debug_log(self):
+        """Open the on-disk debug.log in the default text viewer."""
+        try:
+            _DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+            if not _DEBUG_LOG.exists():
+                _DEBUG_LOG.write_text("", encoding="utf-8")
+            os.startfile(str(_DEBUG_LOG))   # noqa: Windows-only, matches this app
+            self.log(f"Opened debug log: {_DEBUG_LOG}")
+        except Exception as e:
+            self.log(f"Couldn't open debug log ({_DEBUG_LOG}): {e}")
 
     def _build_settings(self, parent):
         # Save bar pinned to the bottom, above a gold rule.
