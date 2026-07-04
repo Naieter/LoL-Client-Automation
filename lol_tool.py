@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.14.1"
+APP_VERSION = "1.15.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -166,6 +166,7 @@ DEFAULT_CONFIG = {
     "localApiPort": 0,      # Stream Deck REST API port (0 = disabled by default)
     "autoAcceptInvites": False, # auto-accept lobby invites from friends
     "inviteWhitelist":   [],    # restrict to these summoner names; empty = all friends
+    "riotClientPath": r"C:\Riot Games\Riot Client\RiotClientServices.exe",  # for launch-league
     "permaBans":    [],      # champion ids always banned first, regardless of role
     "roleChampions": {role: {"picks": [], "bans": []} for role in ROLES},
 }
@@ -4448,12 +4449,17 @@ class App(tk.Tk):
         pad = tk.Frame(parent, bg=DARK)
         pad.pack(fill="both", expand=True, padx=30, pady=(20, 16))
 
-        # ── Control bar: single angular hextech Start/Stop button ──────────────
+        # ── Control bar: Start/Stop + one-click "Launch League" ────────────────
         ctrl = tk.Frame(pad, bg=DARK)
         ctrl.pack(fill="x", pady=(0, 18))
         self._run_btn = HexButton(ctrl, command=self._on_run_click,
                                   width=220, height=46, bg=DARK)
         self._run_btn.pack(side="left")
+        # Launches League straight from the Riot Client, skipping its game menu.
+        self._launch_btn = HexButton(ctrl, command=self._launch_league,
+                                     width=220, height=46, bg=DARK)
+        self._launch_btn.set_look(*self._LAUNCH_LOOK)
+        self._launch_btn.pack(side="left", padx=(12, 0))
 
         # ── ACTIVE AUTOMATIONS — angular cards with pill toggles ───────────────
         self._section_header(pad, "Active Automations")
@@ -5360,6 +5366,24 @@ class App(tk.Tk):
         _hint(s, (f"GET http://127.0.0.1:{_api_port_now}/ready-up"
                   f"  ·  /accept  ·  /status  ·  0 = disabled"))
 
+        # ── Launch League (Riot Client) ───────────────────────────────────────
+        s = _section("Launch League")
+
+        rc_row = _row(s, "Riot Client:")
+        self._riot_path_var = tk.StringVar(
+            value=str(self.cfg.get("riotClientPath",
+                                   DEFAULT_CONFIG["riotClientPath"])))
+        rc_entry = _entry(rc_row, self._riot_path_var, 46)
+        rc_entry.pack(side="left", padx=(8, 0))
+
+        def _persist_riot_path(*_):
+            self.cfg["riotClientPath"] = self._riot_path_var.get().strip()
+            save_config(self.cfg)
+        rc_entry.bind("<FocusOut>", _persist_riot_path)
+        rc_entry.bind("<Return>",   _persist_riot_path)
+        _hint(s, "Path to RiotClientServices.exe — used by the Dashboard's "
+                 "“Launch League” button to open League straight from the Riot Client.")
+
         # ── Startup ───────────────────────────────────────────────────────────
         s = _section("Startup")
 
@@ -5541,6 +5565,96 @@ class App(tk.Tk):
                     self.after(0, self._on_disconnected)
             time.sleep(POLL)
 
+    # ── Launch League directly through the Riot Client ─────────────────────────
+    @staticmethod
+    def _league_running() -> bool:
+        try:
+            for proc in psutil.process_iter(["name"]):
+                if "LeagueClient" in (proc.info.get("name") or ""):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    _LAUNCH_LOOK  = ("⚡  LAUNCH LEAGUE", DARK, EDGE_GOLD, GOLD, True)
+
+    def _launch_league(self):
+        """Launch League of Legends straight from the Riot Client, skipping its
+        game-select menu. Animates the button while League boots; the existing
+        client watcher auto-connects once it comes up (ending the animation)."""
+        if getattr(self, "_launching", False):
+            return
+        self._launching = True
+        self._launch_anim_frame = 0
+        self._animate_launch()
+        # Safety stop if League never appears.
+        self._launch_timeout_job = self.after(
+            75000, lambda: self._stop_launch_anim(
+                log_msg="League is taking a while — check the Riot Client."))
+        threading.Thread(target=self._launch_league_worker, daemon=True).start()
+
+    def _animate_launch(self):
+        """One frame of the 'launching' animation: a pulsing gold glow with
+        animated trailing dots. Re-arms itself until the launch ends."""
+        if not getattr(self, "_launching", False) or not getattr(self, "_launch_btn", None):
+            return
+        f = self._launch_anim_frame
+        dots   = ("." * ((f // 3) % 4)).ljust(3)          # 0..3 dots, fixed width
+        pulse  = 0.5 + 0.5 * _math.sin(f * 0.35)           # 0..1 breathing
+        fill   = _blend(DARK, GOLD, 0.12 * pulse)          # subtle warm glow
+        border = _blend(EDGE_GOLD, BRIGHT_GOLD, pulse)     # pulsing border
+        self._launch_btn.set_look(f"⚡  LAUNCHING {dots}", fill, border, GOLD, True)
+        self._launch_anim_frame += 1
+        self._launch_anim_job = self.after(110, self._animate_launch)
+
+    def _stop_launch_anim(self, success=False, log_msg=None):
+        """Stop the launch animation and restore the button. On success, flash a
+        brief green confirmation first."""
+        was_launching = getattr(self, "_launching", False)
+        self._launching = False
+        for attr in ("_launch_anim_job", "_launch_timeout_job", "_launch_revert_job"):
+            job = getattr(self, attr, None)
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        if log_msg:
+            self.log(log_msg)
+        btn = getattr(self, "_launch_btn", None)
+        if not btn:
+            return
+        if success and was_launching:
+            btn.set_look("✓  LEAGUE READY", DARK, GREEN, GREEN, True)
+            self._launch_revert_job = self.after(
+                1800, lambda: btn.set_look(*self._LAUNCH_LOOK))
+        else:
+            btn.set_look(*self._LAUNCH_LOOK)
+
+    def _launch_league_worker(self):
+        if self._league_running() or getattr(self, "_connected", False):
+            self.after(0, lambda: self._stop_launch_anim(
+                log_msg="League is already running."))
+            return
+        path = self.cfg.get("riotClientPath") or DEFAULT_CONFIG["riotClientPath"]
+        if not os.path.isfile(path):
+            self.after(0, lambda: self._stop_launch_anim(
+                log_msg=f"Riot Client not found at:\n  {path}\nSet the correct path in Settings."))
+            return
+        try:
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) \
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(
+                [path, "--launch-product=league_of_legends", "--launch-patchline=live"],
+                creationflags=flags, close_fds=True)
+            # Keep animating — the client watcher ends it when League connects.
+            self.after(0, lambda: self.log(
+                "Launching League via the Riot Client — it will connect automatically."))
+        except Exception as e:
+            self.after(0, lambda e=e: self._stop_launch_anim(
+                log_msg=f"Couldn't launch League: {e}"))
+
     # ── Controls ──────────────────────────────────────────────────────────────
     def _set_run_state(self, state):
         """Drive the single hextech Start/Stop button.
@@ -5564,6 +5678,9 @@ class App(tk.Tk):
     def _on_connected(self):
         self._lbl_conn.config(text="● Client: connected", fg=GREEN)
         self.log("League client detected — connected automatically.")
+        # If we launched League from the button, end its animation with a flash.
+        if getattr(self, "_launching", False):
+            self._stop_launch_anim(success=True)
         # Auto-start automation so it's already running by the time champ
         # select begins — no need to click Start manually.
         self._start()
