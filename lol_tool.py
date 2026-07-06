@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.16.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1157,27 +1157,44 @@ class AutoEngine:
                         and in_progress
                         and not completed
                         and aid not in self._done_actions):
-                    # The user's hovered champion wins (validity already checked above).
                     override = self._user_pick.get(aid)
+                    cur = int(action.get("championId", 0) or 0)
+                    # A manual pick counts only while it's still playable — a banned
+                    # or taken hover is dropped so we fall back to the priority list.
+                    if override is not None and override not in playable_now:
+                        override = None
                     if aid not in self._action_start:
                         self._action_start[aid] = time.monotonic()
                     if (time.monotonic() - self._action_start[aid]) * 1000 < min(cfg.get("pickDelay", 3000), 29000):
-                        # Still waiting to lock. Keep the intended champion hovered so a
-                        # role swap mid-turn is reflected — but never override a user's hover.
+                        # Pre-hover the intended champion: the user's valid pick, else
+                        # the top still-available champion on the priority list. Re-hover
+                        # whenever the client isn't already showing it — so a banned
+                        # hover is replaced by the next champion on the list.
                         if override is None:
                             champ = self._best(pick_prio, set(), playable_now)
-                            if champ and self._prepicked.get(aid) != champ:
+                            if champ and cur != champ:
                                 if self._commit_action(action, champ, complete=False):
                                     self._prepicked[aid] = champ
                                     self._tool_hovers.setdefault(aid, set()).add(champ)
                         continue
-                    # Lock: the user's hovered champion wins; otherwise the next
-                    # available champion on the priority list.
+                    # Lock: the user's valid hover wins; otherwise the next available
+                    # champion on the priority list (then the fallbacks below).
                     champ = override if override else self._best(pick_prio, set(), playable_now)
+                    src   = "your pick" if override else ROLE_LABEL.get(role_key, role_key)
+                    if not champ:
+                        # Fallbacks so we never fail to lock (avoids a dodge):
+                        #  1) whatever champion is hovered on the pick right now,
+                        #  2) any still-pickable champion.
+                        rej = self._pick_rejected.get(aid, set())
+                        if cur and cur in playable_now and cur not in rej:
+                            champ, src = cur, "current hover"
+                        else:
+                            pool = playable_now - rej - DUP_ALLOWED_CHAMPS
+                            if 0 < len(pool) < 100_000:          # real pickable set
+                                champ, src = min(pool), "fallback"
                     if champ:
                         ok = self._commit_action(action, champ, complete=True)
                         if ok:
-                            src = "your pick" if override else f"{ROLE_LABEL.get(role_key, role_key)}"
                             self._log(f"Locked champion #{champ} ({src})")
                             self._done_actions.add(aid)
                     else:
@@ -1274,7 +1291,8 @@ class AutoEngine:
                         and (time.monotonic() - getattr(self, "_champ_select_start", 0))
                             * 1000 >= cfg.get("prePickDelay", 500)):
                     champ = self._best(pick_prio, set(), playable_now)
-                    if champ and self._prepicked.get(aid) != champ:
+                    cur   = int(action.get("championId", 0) or 0)
+                    if champ and cur != champ:
                         if self._commit_action(action, champ, complete=False):
                             self._prepicked[aid] = champ
                             self._tool_hovers.setdefault(aid, set()).add(champ)
@@ -3837,6 +3855,7 @@ class App(tk.Tk):
         Builds tab — auto-pick pre-hover or a manual hover both count, replacing
         whatever was searched. Runs on its own daemon thread."""
         last = None
+        last_locked = None
         while True:
             try:
                 pick = self._champ_select_pick()   # (name, pos) or None
@@ -3848,7 +3867,126 @@ class App(tk.Tk):
             elif pick is None and last is not None:
                 # Left champ select — let the next hover re-trigger a load.
                 last = None
+            # When our pick locks in, pop the window up on the Builds tab.
+            try:
+                locked = self._my_locked_champion()   # champ name or None
+            except Exception:
+                locked = None
+            if locked and locked != last_locked:
+                last_locked = locked
+                self.after(0, self._restore_to_builds)
+            elif locked is None:
+                last_locked = None
             time.sleep(1.0)
+
+    def _my_locked_champion(self):
+        """Champion name if the local player's pick is locked in (completed), else
+        None — covers both auto-lock and a manual lock."""
+        try:
+            r = self._lcu.get("/lol-champ-select/v1/session")
+            if r.status_code != 200:
+                return None
+            s = r.json()
+            cell = s.get("localPlayerCellId")
+            for grp in s.get("actions", []):
+                for a in grp:
+                    if (str(a.get("actorCellId", "")) == str(cell)
+                            and a.get("type") == "pick" and a.get("completed")):
+                        cid = int(a.get("championId", 0) or 0)
+                        if cid:
+                            return self.ddragon.name(cid)
+        except Exception:
+            return None
+        return None
+
+    def _restore_to_builds(self):
+        """On lock-in, switch to the Builds tab. Only raise the window to the
+        front when it lives on a *different* monitor than the League client /
+        game — otherwise popping up would cover the game the user is watching."""
+        try:
+            if self._tool_on_separate_monitor():
+                self.deiconify()
+                self.state("normal")
+                self.lift()
+                self.attributes("-topmost", True)
+                self.after(400, lambda: self.attributes("-topmost", False))
+                self.focus_force()
+        except Exception:
+            pass
+        try:
+            self._show_page("Builds")
+        except Exception:
+            pass
+
+    def _tool_on_separate_monitor(self):
+        """True only when this window and the League window are on clearly
+        different monitors. Conservative: any uncertainty (single monitor,
+        League window not found, API failure) returns False so we never pop
+        the tool over the game on the same screen."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            u = ctypes.windll.user32
+            MONITOR_NEAREST = 2
+            GA_ROOT = 2
+
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+            class WINDOWPLACEMENT(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_uint), ("flags", ctypes.c_uint),
+                            ("showCmd", ctypes.c_uint), ("ptMinPosition", POINT),
+                            ("ptMaxPosition", POINT), ("rcNormalPosition", RECT)]
+
+            u.MonitorFromWindow.restype = ctypes.c_void_p
+            u.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+            u.MonitorFromPoint.restype = ctypes.c_void_p
+            u.MonitorFromPoint.argtypes = [POINT, wintypes.DWORD]
+            u.GetAncestor.restype = wintypes.HWND
+            u.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+
+            # ── our own top-level; use the restored ("normal") rect so a
+            #    minimized window still reports its real monitor ─────────────
+            hwnd = u.GetAncestor(self.winfo_id(), GA_ROOT)
+            if not hwnd:
+                return False
+            wp = WINDOWPLACEMENT()
+            wp.length = ctypes.sizeof(wp)
+            if not u.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+                return False
+            r = wp.rcNormalPosition
+            center = POINT((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+            tool_mon = u.MonitorFromPoint(center, MONITOR_NEAREST)
+
+            # ── the League client / game window ───────────────────────────
+            found = []
+
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def _cb(h, _lp):
+                if not u.IsWindowVisible(h):
+                    return True
+                n = u.GetWindowTextLengthW(h)
+                if not n:
+                    return True
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u.GetWindowTextW(h, buf, n + 1)
+                if "league of legends" in buf.value.lower():
+                    found.append(h)
+                return True
+
+            u.EnumWindows(_cb, 0)
+            if not found:
+                return False   # can't locate League -> don't pop over it
+            league_mon = u.MonitorFromWindow(found[0], MONITOR_NEAREST)
+
+            return bool(tool_mon and league_mon and tool_mon != league_mon)
+        except Exception:
+            return False
 
     def _auto_load_build(self, name, pos):
         """Push a champ-select hover into the Builds tab (UI thread)."""
@@ -4794,27 +4932,9 @@ class App(tk.Tk):
                 side="left", fill="x", expand=True)
             return r
 
-        # ── Champion summary (full-width stat strip) ───────────────────────────
-        wr = data.get("win_rate")
-        pr = data.get("pick_rate")
-        br = data.get("ban_rate")
-        summ = card(pad, f"{data['champion']} · {data['position'].upper()}")
-        line = tk.Frame(summ, bg=CARD)
-        line.pack(fill="x")
-        def stat(lbl, val, fg=TEXT_BRIGHT):
-            box = tk.Frame(line, bg=CARD)
-            box.pack(side="left", padx=(0, 24))
-            tk.Label(box, text=lbl, bg=CARD, fg=FAINT, font=FONT_HINT).pack(anchor="w")
-            tk.Label(box, text=val, bg=CARD, fg=fg,
-                     font=("Segoe UI", 13, "bold")).pack(anchor="w")
-        if wr is not None:
-            stat("WIN RATE", f"{round(wr*100)}%", GREEN if wr >= 0.5 else RED)
-        if pr is not None:
-            stat("PICK RATE", f"{round(pr*100, 1)}%")
-        if br is not None:
-            stat("BAN RATE", f"{round(br*100, 1)}%")
-        if data.get("damage"):
-            stat("DAMAGE", data["damage"])
+        # ── Champion / role heading ────────────────────────────────────────────
+        self._section_header(pad, f"{data['champion']} · {data['position'].upper()}",
+                             pady=(10, 6))
 
         # ── Runes + spells: up to 3 popular combos, each applies to the client ─
         rn = card(pad, "Runes & Spells")
