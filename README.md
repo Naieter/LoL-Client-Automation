@@ -210,3 +210,9 @@ The tool polls for the League client process using `psutil`, reads the LCU port 
 The ready-up relay is a small in-memory HTTP server. Clients post opaque hashes of summoner IDs — the relay never sees names or IDs. Presence entries expire after 20 seconds if a client stops heartbeating (e.g. tool closed).
 
 All LCU communication is local. Relay traffic stays within your party's network.
+
+---
+
+## License
+
+Licensed for **educational or personal, non-commercial use only**. See [LICENSE](LICENSE) for the full terms.
