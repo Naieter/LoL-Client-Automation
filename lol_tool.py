@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.18.1"
+APP_VERSION = "1.19.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -3808,9 +3808,16 @@ class App(tk.Tk):
         self._opgg_fetched   = False     # True once a stats fetch has succeeded
         self._opgg_fetching  = False     # a fetch worker is currently running
 
+        # Scouting tab state
+        self._scout_roster:   list = []    # [{name, tag, ally, bot}] currently shown
+        self._scout_cache:    dict = {}    # (name, tag) → scout result dict
+        self._scout_fetching: set  = set() # (name, tag) fetches in flight
+        self._scout_source    = ""         # "lobby" / "champ select" / "in game"
+
         # Dashboard state
         self._auto_switches: dict = {}   # key → ToggleSwitch
         self._nav_rows:      dict = {}   # page-name → (row, accent, label)
+        self._nav_suffixes:  dict = {}   # page-name → badge label ("(beta)")
         self._pages:         dict = {}   # page-name → content frame
 
         self._build_ui()
@@ -3845,6 +3852,9 @@ class App(tk.Tk):
 
         # Auto-load the Builds tab for whatever champion is hovered in champ select
         threading.Thread(target=self._watch_build_hover, daemon=True).start()
+
+        # Scouting tab: follow the lobby / game roster and fetch public stats
+        threading.Thread(target=self._watch_scouting, daemon=True).start()
 
         # Check for updates 3 s after startup so the UI is fully loaded first
         self.after(3000, lambda: threading.Thread(
@@ -4366,6 +4376,680 @@ class App(tk.Tk):
                 gw[1] += 1
         return {name: (g, w) for name, (g, w) in agg.items() if g > 0}
 
+    # ── Scouting tab: Porofessor-style tags from public op.gg stats ────────────
+    def _build_scouting(self, parent):
+        pad = tk.Frame(parent, bg=DARK)
+        pad.pack(fill="both", expand=True, padx=30, pady=(20, 16))
+
+        hdr = tk.Frame(pad, bg=DARK)
+        hdr.pack(fill="x")
+        self._section_header(hdr, "Scouting Report", pady=(0, 4))
+        sub = tk.Frame(pad, bg=DARK)
+        sub.pack(fill="x", pady=(0, 12))
+        self._scout_status_var = tk.StringVar(
+            value="Waiting for a lobby — allies appear here, everyone once in game.")
+        tk.Label(sub, textvariable=self._scout_status_var, bg=DARK, fg=MUTED,
+                 font=FONT_SMALL, anchor="w").pack(side="left")
+        tk.Button(sub, text="Refresh", bg=BTN_BG, fg=GOLD, relief="flat",
+                  activebackground=BTN_HOV, activeforeground=GOLD,
+                  cursor="hand2", font=FONT_SMALL, padx=12, pady=2,
+                  command=self._scout_force_refresh).pack(side="right")
+
+        # Scrollable card list
+        wrap = tk.Frame(pad, bg=DARK)
+        wrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(wrap, bg=DARK, highlightthickness=0, bd=0)
+        vsb = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=DARK)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.bind_all("<MouseWheel>", lambda e: (
+            canvas.yview_scroll(int(-e.delta / 120), "units")
+            if self._active_page == "Scouting" else None))
+        self._scout_list = inner
+        self._render_scouting()
+
+    def _scout_force_refresh(self):
+        """Drop the cache and refetch everyone currently on the roster."""
+        self._scout_cache.clear()
+        for p in self._scout_roster:
+            if not p.get("bot"):
+                self._scout_kick_fetch(p["name"], p["tag"])
+        self._render_scouting()
+
+    # ── roster discovery ──────────────────────────────────────────────────────
+    def _watch_scouting(self):
+        """Follow the lobby / champ select / live game and keep the Scouting
+        roster in sync: allies while in lobby or champ select, all ten players
+        once the game is loading/running. Daemon thread."""
+        last_key = None
+        while True:
+            try:
+                phase = ""
+                r = self._lcu.get("/lol-gameflow/v1/gameflow-phase")
+                if r.status_code == 200:
+                    phase = str(r.json())
+                roster, source = self._scout_roster_for_phase(phase)
+                if roster is not None:
+                    key = (source, tuple(sorted((p["name"], p["tag"], p["ally"])
+                                                for p in roster)))
+                    if key != last_key:
+                        last_key = key
+                        self._scout_roster = roster
+                        self._scout_source = source
+                        for p in roster:
+                            if not p.get("bot"):
+                                self._scout_kick_fetch(p["name"], p["tag"])
+                        self.after(0, self._render_scouting)
+            except Exception as e:
+                _dbg(f"[scout] watcher: {e}")
+            time.sleep(3.0)
+
+    def _scout_roster_for_phase(self, phase):
+        """(roster, source) for the current phase, or (None, "") to keep the
+        existing roster (e.g. post-game or disconnected)."""
+        if phase == "Lobby":
+            return self._scout_lobby_roster(), "lobby"
+        if phase == "ChampSelect":
+            return self._scout_champselect_roster(), "champ select"
+        if phase in ("GameStart", "InProgress"):
+            return self._scout_ingame_roster(), "in game"
+        if phase in ("None", "Matchmaking", "ReadyCheck"):
+            return None, ""      # keep whatever is displayed
+        return None, ""
+
+    def _scout_lobby_roster(self):
+        out = []
+        try:
+            r = self._lcu.get("/lol-lobby/v2/lobby")
+            if r.status_code != 200:
+                return []
+            for mbr in r.json().get("members", []):
+                ident = self._scout_member_identity(mbr)
+                if ident:
+                    out.append({"name": ident[0], "tag": ident[1],
+                                "ally": True, "bot": False})
+        except Exception as e:
+            _dbg(f"[scout] lobby roster: {e}")
+        return out
+
+    def _scout_champselect_roster(self):
+        out = []
+        try:
+            r = self._lcu.get("/lol-champ-select/v1/session")
+            if r.status_code != 200:
+                return []
+            for mbr in r.json().get("myTeam", []):
+                sid = int(mbr.get("summonerId", 0) or 0)
+                if not sid:
+                    continue           # bots / hidden
+                ident = self._scout_resolve_summoner(sid)
+                if ident:
+                    out.append({"name": ident[0], "tag": ident[1],
+                                "ally": True, "bot": False})
+        except Exception as e:
+            _dbg(f"[scout] champselect roster: {e}")
+        return out
+
+    def _scout_ingame_roster(self):
+        """All ten players from the live game. Ally/enemy is resolved relative
+        to whichever team contains the signed-in summoner."""
+        out = []
+        try:
+            r = self._lcu.get("/lol-gameflow/v1/session")
+            if r.status_code != 200:
+                return []
+            gd = r.json().get("gameData", {})
+            me = 0
+            try:
+                rr = self._lcu.get("/lol-summoner/v1/current-summoner")
+                if rr.status_code == 200:
+                    me = int(rr.json().get("summonerId", 0) or 0)
+            except Exception:
+                pass
+            teams = [gd.get("teamOne", []) or [], gd.get("teamTwo", []) or []]
+            my_team = 0
+            for ti, team in enumerate(teams):
+                if any(int(p.get("summonerId", 0) or 0) == me for p in team):
+                    my_team = ti
+                    break
+            for ti, team in enumerate(teams):
+                for p in team:
+                    sid = int(p.get("summonerId", 0) or 0)
+                    ally = (ti == my_team)
+                    if not sid:            # bot
+                        bname = p.get("botChampionName") or p.get("summonerName") \
+                                or "Bot"
+                        out.append({"name": str(bname), "tag": "",
+                                    "ally": ally, "bot": True})
+                        continue
+                    ident = self._scout_member_identity(p) \
+                        or self._scout_resolve_summoner(sid)
+                    if ident:
+                        out.append({"name": ident[0], "tag": ident[1],
+                                    "ally": ally, "bot": False})
+        except Exception as e:
+            _dbg(f"[scout] ingame roster: {e}")
+        return out
+
+    @staticmethod
+    def _scout_member_identity(mbr):
+        """(gameName, tagLine) from a lobby/gameData member dict, if present."""
+        g = mbr.get("gameName") or ""
+        t = mbr.get("tagLine") or ""
+        if g:
+            return (str(g), str(t))
+        rid = mbr.get("riotId") or ""
+        if rid and "#" in rid:
+            g, _, t = rid.partition("#")
+            return (g, t)
+        return None
+
+    def _scout_resolve_summoner(self, sid):
+        try:
+            r = self._lcu.get(f"/lol-summoner/v1/summoners/{sid}")
+            if r.status_code == 200:
+                d = r.json()
+                g = d.get("gameName") or d.get("displayName") or ""
+                if g:
+                    return (str(g), str(d.get("tagLine", "") or ""))
+        except Exception:
+            pass
+        return None
+
+    # ── per-player fetch (op.gg public data) ──────────────────────────────────
+    def _scout_kick_fetch(self, name, tag):
+        key = (name, tag)
+        if key in self._scout_cache or key in self._scout_fetching:
+            return
+        self._scout_fetching.add(key)
+        threading.Thread(target=self._scout_fetch_worker, args=(name, tag),
+                         daemon=True).start()
+
+    def _scout_fetch_worker(self, name, tag):
+        key = (name, tag)
+        try:
+            region = "na"
+            summ = self._detect_summoner()
+            if summ:
+                region = summ[2]
+            prof  = self._scout_profile(name, tag, region)
+            games = self._scout_matches(name, tag, region)
+            tags  = self._scout_tags(prof, games)
+            self._scout_cache[key] = {"prof": prof or {}, "games": games or [],
+                                      "tags": tags, "ok": prof is not None}
+        except Exception as e:
+            _dbg(f"[scout] fetch {name}#{tag}: {e}")
+            self._scout_cache[key] = {"prof": {}, "games": [], "tags": [],
+                                      "ok": False}
+        finally:
+            self._scout_fetching.discard(key)
+            self.after(0, self._render_scouting)
+
+    @staticmethod
+    def _opgg_mcp(tool, args, timeout=25):
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": tool, "arguments": args}}
+        r = requests.post("https://mcp-api.op.gg/mcp", json=body, timeout=timeout,
+                          headers={"Accept": "application/json, text/event-stream"})
+        r.raise_for_status()
+        return r.json()["result"]["content"][0]["text"]
+
+    def _scout_profile(self, name, tag, region):
+        """Normalized public profile: level, best ranked queue (tier/lp/W-L +
+        op.gg's streak/veteran/inactive flags) and last-season tier. None on
+        total failure, {} for a valid account with no ranked data."""
+        try:
+            text = self._opgg_mcp("lol_get_summoner_profile",
+                                  {"game_name": name, "tag_line": tag,
+                                   "region": region.upper()})
+            rec = _parse_opgg_record(text)
+            summ = (rec or {}).get("data", {}).get("summoner")
+            if not isinstance(summ, dict):
+                return None
+            out = {"level": int(summ.get("level") or 0)}
+            for ls in (summ.get("league_stats") or []):
+                if not isinstance(ls, dict):
+                    continue
+                qt = str(ls.get("game_type", ""))
+                ti = ls.get("tier_info") or {}
+                tier = (ti.get("tier") if isinstance(ti, dict) else None)
+                if tier and "queue" not in out:
+                    out.update({
+                        "queue":  "Solo" if qt == "SOLORANKED" else
+                                  ("Flex" if qt == "FLEXRANKED" else qt.title()),
+                        "tier":   str(tier),
+                        "division": ti.get("division"),
+                        "lp":     ti.get("lp"),
+                        "wins":   int(ls.get("win") or 0),
+                        "losses": int(ls.get("lose") or 0),
+                        "hot_streak":  bool(ls.get("is_hot_streak")),
+                        "fresh_blood": bool(ls.get("is_fresh_blood")),
+                        "veteran":     bool(ls.get("is_veteran")),
+                        "inactive":    bool(ls.get("is_inactive")),
+                    })
+            # last season's tier (for "unranked but was X" flavour)
+            try:
+                prev = summ.get("previous_season_tiers") or []
+                for pst in reversed(prev):
+                    for re_ in (pst.get("rank_entries") or []):
+                        ri = re_.get("rank_info")
+                        if isinstance(ri, dict) and ri.get("tier"):
+                            out.setdefault("prev_tier", str(ri["tier"]))
+            except Exception:
+                pass
+            # season champion pool (most_champions.champion_stats)
+            try:
+                mc = summ.get("most_champions")
+                blocks = mc if isinstance(mc, list) else \
+                         ([mc] if isinstance(mc, dict) else [])
+                stats = None
+                for b in blocks:
+                    if isinstance(b, dict) and isinstance(b.get("champion_stats"), list):
+                        if stats is None or "RANKED" in str(b.get("game_type", "")).upper():
+                            stats = b["champion_stats"]
+                pool, pentas = [], 0
+                for cs_ in (stats or []):
+                    if not isinstance(cs_, dict):
+                        continue
+                    play = int(cs_.get("play") or 0)
+                    if play <= 0:
+                        continue
+                    nm = None
+                    for v in cs_.values():   # champion display name rides along
+                        if isinstance(v, str) and v and not v.startswith("http"):
+                            nm = v
+                    pool.append({"id": int(cs_.get("id") or 0), "name": nm,
+                                 "play": play, "win": int(cs_.get("win") or 0),
+                                 "lose": int(cs_.get("lose") or 0)})
+                    pentas += int(cs_.get("penta_kill") or 0)
+                pool.sort(key=lambda c: -c["play"])
+                if pool:
+                    out["pool"] = pool[:6]
+                    out["pool_games"] = sum(c["play"] for c in pool)
+                if pentas:
+                    out["pentas"] = pentas
+            except Exception:
+                pass
+            return out
+        except Exception as e:
+            _dbg(f"[scout] profile {name}#{tag}: {e}")
+            return None
+
+    def _scout_matches(self, name, tag, region):
+        """Up to 20 recent games: [{when, champ, pos, result, k, d, a}]."""
+        try:
+            text = self._opgg_mcp("lol_list_summoner_matches", {
+                "game_name": name, "tag_line": tag, "region": region.upper(),
+                "limit": 20,
+                "desired_output_fields": [
+                    "data.game_history[].id",
+                    "data.game_history[].created_at",
+                    "data.game_history[].game_type",
+                    "data.game_history[].game_length_second",
+                    "data.game_history[].participants[].champion_name",
+                    "data.game_history[].participants[].position",
+                    "data.game_history[].participants[].stats.result",
+                    "data.game_history[].participants[].stats.kill",
+                    "data.game_history[].participants[].stats.death",
+                    "data.game_history[].participants[].stats.assist",
+                    "data.game_history[].participants[].stats.minion_kill",
+                    "data.game_history[].participants[].stats.vision_wards_bought_in_game",
+                    "data.game_history[].participants[].stats.largest_multi_kill",
+                    "data.game_history[].participants[].stats.total_damage_dealt_to_champions",
+                ]})
+            rec = _parse_opgg_record(text)
+            hist = (rec or {}).get("data", {}).get("game_history") or []
+            out = []
+            for g in hist:
+                if not isinstance(g, dict):
+                    continue
+                parts = g.get("participants") or []
+                p = parts[0] if parts and isinstance(parts[0], dict) else {}
+                st = p.get("stats") or {}
+                res = str(st.get("result", "") or "").upper()
+                if res == "UNKNOWN":
+                    continue               # remake
+                out.append({
+                    "gid":    str(g.get("id", "") or ""),
+                    "when":   str(g.get("created_at", "") or ""),
+                    "qtype":  str(g.get("game_type", "") or "").upper(),
+                    "dur":    int(g.get("game_length_second") or 0),
+                    "champ":  str(p.get("champion_name", "") or ""),
+                    "pos":    str(p.get("position", "") or ""),
+                    "result": res,
+                    "k": int(st.get("kill") or 0),
+                    "d": int(st.get("death") or 0),
+                    "a": int(st.get("assist") or 0),
+                    "cs":    int(st.get("minion_kill") or 0),
+                    "pinks": int(st.get("vision_wards_bought_in_game") or 0),
+                    "multi": int(st.get("largest_multi_kill") or 0),
+                    "dmg":   int(st.get("total_damage_dealt_to_champions") or 0),
+                })
+            return out
+        except Exception as e:
+            _dbg(f"[scout] matches {name}#{tag}: {e}")
+            return None
+
+    # ── the tag engine ────────────────────────────────────────────────────────
+    @staticmethod
+    def _scout_tags(prof, games):
+        """Porofessor-style tags: [(text, color)]. Pure function of the
+        normalized profile + match list so it's easy to test."""
+        from datetime import datetime, timezone, timedelta
+        tags = []
+        prof  = prof or {}
+        games = list(games or [])
+
+        # ── profile-driven ──
+        wins, losses = int(prof.get("wins") or 0), int(prof.get("losses") or 0)
+        total = wins + losses
+        if prof.get("hot_streak"):
+            tags.append(("🔥 Ranked hot streak", GREEN))
+        if prof.get("inactive"):
+            tags.append(("💤 Rank decay — been away", MUTED))
+        if prof.get("veteran"):
+            tags.append(("🎖 Veteran at this rank", TEAL))
+        elif prof.get("fresh_blood"):
+            tags.append(("🩸 New to this rank", TEAL))
+        if total >= 10:
+            wr = wins / total
+            if wr >= 0.60:
+                tags.append((f"😈 {wr:.0%} ranked WR — smurf energy", GOLD))
+            elif wr <= 0.45:
+                tags.append((f"📉 {wr:.0%} ranked WR", RED))
+        lvl = int(prof.get("level") or 0)
+        if 0 < lvl < 60:
+            tags.append((f"🌱 Level {lvl} account", GOLD))
+        if not prof.get("tier") and prof.get("prev_tier"):
+            tags.append((f"🏅 Last season {str(prof['prev_tier']).title()}", TEAL))
+        # season-long champion habits (most_champions pool)
+        pool = prof.get("pool") or []
+        pg   = int(prof.get("pool_games") or 0)
+        if pool and pg >= 20:
+            top = pool[0]
+            share = top["play"] / max(1, pg)
+            if share >= 0.4:
+                nm = top.get("name") or f"#{top.get('id')}"
+                tags.append((f"🎯 Season one-trick: {nm} ({top['play']} games)", GOLD))
+        if int(prof.get("pentas") or 0) >= 1:
+            n = int(prof["pentas"])
+            tags.append((f"☠️ {n} penta{'s' if n > 1 else ''} this season", GOLD))
+
+        # ── match-history-driven (newest first) ──
+        def _ts(g):
+            try:
+                d = datetime.fromisoformat(g["when"])
+                return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+            except Exception:
+                return datetime.now(timezone.utc)
+        games.sort(key=_ts, reverse=True)
+
+        if games:
+            # current streak
+            streak, res0 = 0, games[0]["result"]
+            for g in games:
+                if g["result"] == res0:
+                    streak += 1
+                else:
+                    break
+            if streak >= 3:
+                tags.append((f"🔥 Won last {streak}", GREEN) if res0 == "WIN"
+                            else (f"🧊 Lost last {streak} — tilted?", RED))
+            # KDA
+            k = sum(g["k"] for g in games)
+            d = sum(g["d"] for g in games)
+            a = sum(g["a"] for g in games)
+            kda = (k + a) / max(1, d)
+            if kda >= 4.0:
+                tags.append((f"🧮 {kda:.1f} KDA — plays it clean", TEAL))
+            elif kda < 1.5:
+                tags.append((f"⚔️ {kda:.1f} KDA — fights everything", RED))
+            # champion habits
+            by_champ: dict = {}
+            for g in games:
+                if g["champ"]:
+                    by_champ[g["champ"]] = by_champ.get(g["champ"], 0) + 1
+            if by_champ:
+                top, cnt = max(by_champ.items(), key=lambda kv: kv[1])
+                if len(games) >= 6 and cnt / len(games) >= 0.5:
+                    tags.append((f"🎯 One-trick: {top}", GOLD))
+                elif len(by_champ) >= 8:
+                    tags.append(("🃏 Champion roulette — plays anything", TEAL))
+            # play volume
+            now = datetime.now(timezone.utc)
+            week = sum(1 for g in games if now - _ts(g) <= timedelta(days=7))
+            if week >= 15:
+                tags.append((f"🎮 {week}+ games this week", TEAL))
+            elif now - _ts(games[0]) >= timedelta(days=14):
+                days = (now - _ts(games[0])).days
+                tags.append((f"🕸 Rusty — first game in {days} days", MUTED))
+            # main position / autofill magnet
+            by_pos: dict = {}
+            for g in games:
+                if g["pos"]:
+                    by_pos[g["pos"]] = by_pos.get(g["pos"], 0) + 1
+            if by_pos:
+                pos, cnt = max(by_pos.items(), key=lambda kv: kv[1])
+                if cnt / len(games) >= 0.6:
+                    tags.append((f"🧭 {pos.upper()} main", MUTED))
+                elif len(by_pos) >= 4:
+                    tags.append(("🎭 Autofill magnet — plays every role", TEAL))
+
+            # ── unusual patterns ──
+            main_pos = max(by_pos.items(), key=lambda kv: kv[1])[0] \
+                if by_pos else ""
+            # queue mix: draft player who actually lives in ARAM
+            aram = sum(1 for g in games if "ARAM" in g.get("qtype", ""))
+            if len(games) >= 8 and aram / len(games) >= 0.5:
+                tags.append((f"🎲 {aram}/{len(games)} recent games are ARAM", TEAL))
+            # farming: cs per minute on real (timed) SR games, non-support
+            timed = [g for g in games if g.get("dur", 0) >= 600
+                     and "ARAM" not in g.get("qtype", "")]
+            if len(timed) >= 5 and main_pos != "SUPPORT":
+                cspm = sum(g.get("cs", 0) for g in timed) / \
+                       max(1.0, sum(g["dur"] for g in timed) / 60.0)
+                if cspm >= 8.0:
+                    tags.append((f"🌾 {cspm:.1f} CS/min farming machine", GOLD))
+                elif cspm <= 4.5:
+                    tags.append((f"🐟 {cspm:.1f} CS/min — allergic to minions", RED))
+            # vision habits (control wards)
+            if len(timed) >= 5:
+                avg_pinks = sum(g.get("pinks", 0) for g in timed) / len(timed)
+                if avg_pinks < 0.4:
+                    tags.append(("🙈 Never buys control wards", RED))
+                elif avg_pinks >= 2.5:
+                    tags.append((f"👁 {avg_pinks:.1f} control wards/game", GREEN))
+            # damage output per minute
+            if len(timed) >= 5 and main_pos != "SUPPORT":
+                dpm = sum(g.get("dmg", 0) for g in timed) / \
+                      max(1.0, sum(g["dur"] for g in timed) / 60.0)
+                if dpm >= 900:
+                    tags.append((f"💥 {dpm:,.0f} damage/min", GOLD))
+                elif dpm <= 350:
+                    tags.append(("🕊 Pacifist — damage MIA", RED))
+            # a recent quadra / penta
+            best_multi = max((g.get("multi", 0) for g in games), default=0)
+            if best_multi >= 5:
+                tags.append(("☠️ Penta in recent games", GOLD))
+            elif best_multi == 4:
+                tags.append(("🔪 Quadra in recent games", TEAL))
+            # binge sessions: consecutive games queued back-to-back
+            times = sorted((_ts(g), g.get("dur", 0)) for g in games)
+            chain = best_chain = 1
+            for (t0, d0), (t1, _d1) in zip(times, times[1:]):
+                gap = (t1 - t0).total_seconds() - d0
+                chain = chain + 1 if gap <= 1800 else 1
+                best_chain = max(best_chain, chain)
+            if best_chain >= 5:
+                tags.append((f"🎢 {best_chain} games back-to-back — binge queuer", TEAL))
+            # night owl: most games start late at night (local time)
+            late = sum(1 for g in games
+                       if _ts(g).astimezone().hour >= 22 or
+                          _ts(g).astimezone().hour < 5)
+            if len(games) >= 8 and late / len(games) >= 0.5:
+                tags.append(("🌙 Night owl — queues after 10pm", MUTED))
+        elif not prof.get("tier"):
+            tags.append(("👻 No public history", MUTED))
+        return tags
+
+    @staticmethod
+    def _scout_duo_tags(roster, cache):
+        """Cross-player pattern: shared recent game ids = premade. Returns
+        {(name, tag): [(tag_text, color), ...]} — enemy premades included,
+        that's exactly the intel you want."""
+        ids = {}
+        for p in roster:
+            if p.get("bot"):
+                continue
+            data = cache.get((p["name"], p["tag"]))
+            if not data:
+                continue
+            gids = {g["gid"] for g in data.get("games", []) if g.get("gid")}
+            if gids:
+                ids[(p["name"], p["tag"])] = gids
+        out: dict = {}
+        keys = list(ids)
+        for i, ka in enumerate(keys):
+            for kb in keys[i + 1:]:
+                shared = len(ids[ka] & ids[kb])
+                if shared >= 3:
+                    out.setdefault(ka, []).append(
+                        (f"🤝 Queues with {kb[0]} — {shared} recent games", TEAL))
+                    out.setdefault(kb, []).append(
+                        (f"🤝 Queues with {ka[0]} — {shared} recent games", TEAL))
+        return out
+
+    # ── rendering ─────────────────────────────────────────────────────────────
+    def _scout_pool_line(self, data):
+        """'Pool:  Ahri 54G 57% · Yone 42G 45% · …' from the season pool, or
+        the recent-20 aggregation when no season data exists."""
+        prof, games = data.get("prof") or {}, data.get("games") or []
+        bits = []
+        for c in (prof.get("pool") or [])[:4]:
+            nm = c.get("name")
+            if not nm and c.get("id"):
+                try:
+                    nm = self.ddragon.name(int(c["id"]))
+                except Exception:
+                    nm = f"#{c['id']}"
+            total = c["play"]
+            wr = c.get("win", 0) / max(1, total)
+            bits.append(f"{nm} {total}G {wr:.0%}")
+        if not bits and games:
+            agg: dict = {}
+            for g in games:
+                if g.get("champ"):
+                    gw = agg.setdefault(g["champ"], [0, 0])
+                    gw[0] += 1
+                    gw[1] += 1 if g["result"] == "WIN" else 0
+            top = sorted(agg.items(), key=lambda kv: -kv[1][0])[:4]
+            bits = [f"{nm} {n}G {w / max(1, n):.0%}" for nm, (n, w) in top]
+        return ("Pool:  " + "  ·  ".join(bits)) if bits else ""
+
+    def _scout_rank_line(self, prof):
+        if not prof:
+            return "no data"
+        if prof.get("tier"):
+            div = prof.get("division")
+            lp  = prof.get("lp")
+            w, l = prof.get("wins", 0), prof.get("losses", 0)
+            bits = [str(prof["tier"]).title()
+                    + (f" {div}" if div not in (None, "", 0) else "")]
+            if lp is not None:
+                bits.append(f"{lp} LP")
+            if w + l:
+                bits.append(f"{w}W {l}L ({w / max(1, w + l):.0%})")
+            q = prof.get("queue", "")
+            return f"{'  ·  '.join(bits)}" + (f"   [{q}]" if q else "")
+        lvl = prof.get("level")
+        return f"Unranked · level {lvl}" if lvl else "Unranked"
+
+    def _render_scouting(self):
+        host = getattr(self, "_scout_list", None)
+        if host is None:
+            return
+        for w in host.winfo_children():
+            w.destroy()
+        roster = self._scout_roster
+        if hasattr(self, "_scout_status_var"):
+            if roster:
+                n_ally = sum(1 for p in roster if p["ally"])
+                src = self._scout_source or "lobby"
+                extra = (f", {len(roster) - n_ally} enemies"
+                         if len(roster) > n_ally else "")
+                self._scout_status_var.set(
+                    f"Scouting {n_ally} allies{extra}  ({src})")
+            else:
+                self._scout_status_var.set(
+                    "Waiting for a lobby — allies appear here, everyone once in game.")
+        if not roster:
+            tk.Label(host, text="Nobody to scout yet.", bg=DARK, fg=FAINT,
+                     font=FONT_SMALL).pack(anchor="w", pady=8)
+            return
+
+        duo = self._scout_duo_tags(roster, self._scout_cache)
+        for p in sorted(roster, key=lambda x: (not x["ally"], x["name"].lower())):
+            border = tk.Frame(host, bg=CARD_BORDER)
+            border.pack(fill="x", pady=(0, 10))
+            card = tk.Frame(border, bg=CARD)
+            card.pack(fill="x", padx=1, pady=1)
+            row = tk.Frame(card, bg=CARD)
+            row.pack(fill="x", padx=14, pady=(10, 2))
+
+            side_txt, side_fg = (("ALLY", GREEN) if p["ally"] else ("ENEMY", RED))
+            tk.Label(row, text=side_txt, bg=CARD, fg=side_fg,
+                     font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 10))
+            disp = p["name"] + (f"  #{p['tag']}" if p["tag"] else "")
+            tk.Label(row, text=disp, bg=CARD, fg=WHITE,
+                     font=("Segoe UI", 11, "bold")).pack(side="left")
+
+            if p.get("bot"):
+                tk.Label(row, text="🤖 Bot — free win", bg=CARD, fg=MUTED,
+                         font=FONT_SMALL).pack(side="right")
+                continue
+
+            data = self._scout_cache.get((p["name"], p["tag"]))
+            if data is None:
+                tk.Label(row, text="fetching…", bg=CARD, fg=FAINT,
+                         font=FONT_SMALL).pack(side="right")
+                continue
+            tk.Label(row, text=self._scout_rank_line(data.get("prof")),
+                     bg=CARD, fg=GOLD if data.get("ok") else FAINT,
+                     font=FONT_SMALL).pack(side="right")
+
+            # champion preferences: season pool first, else the recent 20
+            pool_txt = self._scout_pool_line(data)
+            if pool_txt:
+                tk.Label(card, text=pool_txt, bg=CARD, fg=TEAL,
+                         font=FONT_SMALL, anchor="w").pack(
+                    fill="x", padx=14, pady=(2, 0))
+
+            tags = ((data.get("tags") or []) +
+                    duo.get((p["name"], p["tag"]), []))[:9]
+            if tags:
+                grid = tk.Frame(card, bg=CARD)
+                grid.pack(fill="x", padx=14, pady=(4, 10))
+                for i, (txt, color) in enumerate(tags):
+                    chip = tk.Label(grid, text=txt, bg=DARK, fg=color,
+                                    font=FONT_SMALL, padx=8, pady=2)
+                    chip.grid(row=i // 3, column=i % 3, sticky="w",
+                              padx=(0, 8), pady=2)
+            elif not data.get("ok"):
+                tk.Label(card, text="op.gg lookup failed for this player.",
+                         bg=CARD, fg=FAINT, font=FONT_SMALL,
+                         anchor="w").pack(fill="x", padx=14, pady=(0, 10))
+            else:
+                tk.Label(card, text="Nothing notable — suspiciously normal. 🕵️",
+                         bg=CARD, fg=FAINT, font=FONT_SMALL,
+                         anchor="w").pack(fill="x", padx=14, pady=(0, 10))
+
     # ── Champion portrait icons (for the squishy pick/ban chips) ───────────────
     def request_icon_prefetch(self):
         """Fetch+cache icons for any champion currently on a list that isn't
@@ -4462,6 +5146,7 @@ class App(tk.Tk):
             ("Dashboard", self._build_dashboard),
             ("Champions", self._build_champions),
             ("Builds",    self._build_builds),
+            ("Scouting",  self._build_scouting),
             ("Logs",      self._build_log),
             ("Settings",  self._build_settings),
         ]
@@ -4475,6 +5160,7 @@ class App(tk.Tk):
         self._nav_button(sidebar, "Dashboard")
         self._nav_button(sidebar, "Champions")
         self._nav_button(sidebar, "Builds")
+        self._nav_button(sidebar, "Scouting", suffix="(beta)", suffix_fg=RED)
         self._nav_button(sidebar, "Logs")
         tk.Frame(sidebar, bg=EDGE_GOLD, height=1).pack(
             fill="x", padx=18, pady=(14, 14))
@@ -4524,7 +5210,9 @@ class App(tk.Tk):
         tk.Frame(self, bg=GOLD,      height=1).pack(fill="x")
         tk.Frame(self, bg=EDGE_GOLD, height=1).pack(fill="x")
 
-    def _nav_button(self, sidebar, name):
+    def _nav_button(self, sidebar, name, suffix=None, suffix_fg=None):
+        """Sidebar nav row. `suffix` adds a small fixed-color badge after the
+        page name (e.g. a red "(beta)") that doesn't affect the page key."""
         row = tk.Frame(sidebar, bg=SIDEBAR, height=52)
         row.pack(fill="x")
         row.pack_propagate(False)
@@ -4532,16 +5220,26 @@ class App(tk.Tk):
         accent.pack(side="left", fill="y")
         lbl = tk.Label(row, text=name, bg=SIDEBAR, fg=MUTED,
                        font=("Segoe UI", 12), anchor="w")
-        lbl.pack(side="left", fill="both", expand=True, padx=(21, 0))
+        suf = None
+        if suffix:
+            lbl.pack(side="left", padx=(21, 0))
+            suf = tk.Label(row, text=suffix, bg=SIDEBAR, fg=suffix_fg or RED,
+                           font=("Segoe UI", 9), anchor="w")
+            suf.pack(side="left", padx=(5, 0), pady=(3, 0))
+            self._nav_suffixes[name] = suf
+        else:
+            lbl.pack(side="left", fill="both", expand=True, padx=(21, 0))
         self._nav_rows[name] = (row, accent, lbl)
 
         def _enter(_e):
             if self._active_page != name:
                 row.config(bg=NAV_ACTIVE); lbl.config(bg=NAV_ACTIVE, fg=TEXT)
+                if suf: suf.config(bg=NAV_ACTIVE)
         def _leave(_e):
             if self._active_page != name:
                 row.config(bg=SIDEBAR); lbl.config(bg=SIDEBAR, fg=MUTED)
-        for w in (row, lbl, accent):
+                if suf: suf.config(bg=SIDEBAR)
+        for w in (row, lbl, accent) + ((suf,) if suf else ()):
             w.bind("<Button-1>", lambda _e, n=name: self._show_page(n))
             w.bind("<Enter>", _enter)
             w.bind("<Leave>", _leave)
@@ -4558,6 +5256,9 @@ class App(tk.Tk):
                        fg=GOLD if on else MUTED,
                        font=("Segoe UI", 12, "bold") if on
                             else ("Segoe UI", 12))
+            suf = self._nav_suffixes.get(n)
+            if suf:
+                suf.config(bg=NAV_ACTIVE if on else SIDEBAR)
         self._pages[name].tkraise()
 
     def _build_champions(self, parent):
