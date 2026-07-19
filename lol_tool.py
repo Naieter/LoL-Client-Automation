@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.18.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -732,6 +732,8 @@ class AutoEngine:
         self._user_pick:     dict = {}   # aid → championId the USER manually hovered
         self._pick_rejected: dict = {}   # aid → champs that became banned/taken
         self._ban_hovered:   dict = {}   # aid → championId hovered for ban (two-phase)
+        self._ban_attempt:   dict = {}   # aid → monotonic time of FIRST hover attempt
+        self._lock_sent:     set  = set() # aids we've sent a lock for (log once)
         self._runes_key      = None      # (champ_id, role) of last runes import
         self._items_key      = None      # (champ_id, role) of last item-set import
         self._last_role      = None      # assignedPosition seen last poll (detect swaps)
@@ -783,31 +785,32 @@ class AutoEngine:
         if idle_phase in ("", "None", "Lobby") or rp.status_code != 200:
             self._handle_invites(cfg)
 
-        r   = self._lcu.get("/lol-gameflow/v1/session")
+        r = self._lcu.get("/lol-gameflow/v1/session")
         if r.status_code != 200:
-            # No active session — use idle_phase so the overlay updates correctly.
-            # Without this, phase stays stale as "Lobby" forever after leaving.
-            idle = idle_phase if idle_phase else "None"
-            if idle != self._last_phase:
-                self._log(f"Phase → {idle}")
-                prev_phase       = self._last_phase
-                self._last_phase = idle
-                self._accept_time = None
-                self._accepted    = False
-                if self._on_phase:
-                    self._on_phase(idle)
-                if prev_phase in ("Lobby", "Matchmaking") and idle not in ("Lobby", "Matchmaking", "ReadyCheck"):
-                    self._party_size             = 0
-                    self._present_count          = 0
-                    self._ready_count            = 0
-                    self._size_none_streak       = 0
-                    self._others_ready_notified  = False
-                    self._sound_cancel.set()
-                    self._accepted_invites.clear()
-                    self._invite_seen.clear()
-            return
+            # No active session — fall back to idle_phase so the overlay
+            # updates correctly instead of staying stale as "Lobby" forever.
+            phase = idle_phase if idle_phase else "None"
+        else:
+            phase = r.json().get("phase", "")
 
-        phase = r.json().get("phase", "")
+        # Definitive champ-select probe: BOTH gameflow endpoints have been seen
+        # in the wild reporting 'Lobby' through an entire champ select, which
+        # silently disabled prepick/ban/pick. The champ-select session endpoint
+        # answering 200 IS champ select, no matter what gameflow claims.
+        if phase != "ChampSelect":
+            cs = self._lcu.get("/lol-champ-select/v1/session")
+            if cs.status_code == 200:
+                _dbg(f"[phase] gameflow says {phase!r} but the champ-select "
+                     f"session is live — overriding to ChampSelect")
+                phase = "ChampSelect"
+
+        # Trace the raw phase sources (on change only) so a stuck or lying
+        # endpoint is visible in debug.log instead of silently doing nothing.
+        _pk = f"{rp.status_code}:{idle_phase}|{r.status_code}|{phase}"
+        if _pk != getattr(self, "_last_phase_sources", None):
+            self._last_phase_sources = _pk
+            _dbg(f"[phase] gameflow-phase={rp.status_code}:{idle_phase!r} "
+                 f"session={r.status_code} resolved={phase!r}")
 
         if phase != self._last_phase:
             self._log(f"Phase → {phase}")
@@ -826,6 +829,8 @@ class AutoEngine:
                 self._user_pick.clear()
                 self._pick_rejected.clear()
                 self._ban_hovered.clear()
+                self._ban_attempt.clear()
+                self._lock_sent.clear()
                 self._runes_key      = None
                 self._items_key      = None
                 self._last_role      = None
@@ -1016,6 +1021,12 @@ class AutoEngine:
         _timer      = session.get("timer", {})
         time_left   = int(_timer.get("adjustedTimeLeftInPhase", 0) or 0)   # ms
         is_infinite = bool(_timer.get("isInfinite", False))
+        # Champ-select sub-phase (PLANNING / BAN_PICK / FINALIZATION). During
+        # PLANNING the LCU falsely reports ban actions as isInProgress and
+        # SILENTLY IGNORES every ban write (204 no-op) — proven live: hover
+        # PATCH, minimal PATCH, POST /complete and lock PATCH all no-op until
+        # BAN_PICK actually starts. Ban handling must wait for the real phase.
+        timer_phase = str(_timer.get("phase", "") or "")
 
         # ── locate our own cell ──
         local_cell_id = session.get("localPlayerCellId")
@@ -1093,9 +1104,9 @@ class AutoEngine:
             for a in grp
             if str(a.get("actorCellId", "")) == my_cell
         ]
-        _key = f"{_states}|bans={sorted(bans)}|intent={sorted(pick_intents)}|t={time_left // 2000}"
+        _key = f"{_states}|bans={sorted(bans)}|intent={sorted(pick_intents)}|t={time_left // 2000}|{timer_phase}"
         if _key != getattr(self, "_last_state_key", None):
-            self._log(f"[tick] {_states}  bans={sorted(bans)}  t={time_left}ms inf={is_infinite}")
+            self._log(f"[tick] {_states}  bans={sorted(bans)}  t={time_left}ms inf={is_infinite} sub={timer_phase}")
             self._last_state_key = _key
 
         # ── champions an ally is CURRENTLY hovering for a ban ──────────────────
@@ -1124,6 +1135,13 @@ class AutoEngine:
                 in_progress = bool(action.get("isInProgress", False))
                 completed   = bool(action.get("completed", False))
 
+                # An action only counts as done when the SESSION says so. A 204
+                # from a lock PATCH is no proof — the LCU silently ignores ban
+                # writes during PLANNING — so locks are re-sent every poll until
+                # the session reflects completion, and done is recorded here.
+                if completed:
+                    self._done_actions.add(aid)
+
                 # ── Detect a manual hover by the user on a pick action ──
                 # A championId the TOOL never hovered (and that we haven't already
                 # rejected as unavailable) means the user chose it themselves — that
@@ -1132,10 +1150,25 @@ class AutoEngine:
                 if atype == "pick" and aid not in self._done_actions:
                     cur      = int(action.get("championId", 0) or 0)
                     rejected = self._pick_rejected.get(aid, set())
-                    if (cur
-                            and cur not in self._tool_hovers.get(aid, set())
-                            and cur not in rejected):
-                        if self._user_pick.get(aid) != cur:
+                    ov       = self._user_pick.get(aid)
+                    # The session has caught up with the tool's own current
+                    # hover — older tool hovers can now only reappear through
+                    # the user, so stop treating them as ours. Without this, a
+                    # user switching back to a champion the tool once hovered
+                    # would be ignored forever.
+                    if cur and cur == self._prepicked.get(aid):
+                        self._tool_hovers[aid] = {cur}
+                    if cur and cur not in rejected:
+                        if ov is not None and cur != ov:
+                            # The user moved their hover off their earlier
+                            # choice — always accept the NEW hover, even if
+                            # it's a champion the tool hovered before (the
+                            # tool never re-hovers while an override exists,
+                            # so this change can only be the user's).
+                            self._user_pick[aid] = cur
+                            name = self._dd.name(cur) if self._dd else f"#{cur}"
+                            self._log(f"You changed your hover to {name} — that's what will be locked.")
+                        elif ov is None and cur not in self._tool_hovers.get(aid, set()):
                             self._user_pick[aid] = cur
                             name = self._dd.name(cur) if self._dd else f"#{cur}"
                             self._log(f"You hovered {name} — that's what will be locked.")
@@ -1193,9 +1226,9 @@ class AutoEngine:
                                 champ, src = min(pool), "fallback"
                     if champ:
                         ok = self._commit_action(action, champ, complete=True)
-                        if ok:
+                        if ok and aid not in self._lock_sent:
+                            self._lock_sent.add(aid)
                             self._log(f"Locked champion #{champ} ({src})")
-                            self._done_actions.add(aid)
                     else:
                         self._log(f"No available pick for {ROLE_LABEL.get(role_key, role_key)}. pick_prio={pick_prio}")
 
@@ -1207,12 +1240,8 @@ class AutoEngine:
                         and atype == "ban"
                         and in_progress
                         and not completed
+                        and timer_phase != "PLANNING"
                         and aid not in self._done_actions):
-                    # The ban-turn timer starts once and is NEVER reset on a
-                    # target switch, so switching away from an ally's champion can
-                    # never postpone the lock (that bug banned nothing).
-                    if aid not in self._action_start:
-                        self._action_start[aid] = time.monotonic()
                     # Never target a champion a teammate intends to pick
                     # (championPickIntent) or is hovering for a ban: the client
                     # REJECTS banning a teammate's intended pick with HTTP 400, so
@@ -1234,11 +1263,37 @@ class AutoEngine:
                                     if champ else "the next option"
                             self._log(f"Ally hovering {pname} for ban — switching to {cname}.")
 
-                    cur     = int(action.get("championId", 0) or 0)
-                    elapsed = (time.monotonic() - self._action_start[aid]) * 1000
+                    cur = int(action.get("championId", 0) or 0)
+                    # `isInProgress` can flip true well before the LCU actually
+                    # echoes our hover back in the session (e.g. Practice Tool
+                    # sits on isInProgress for many seconds before the ban turn
+                    # is really live) — starting the delay clock right away burns
+                    # the whole banDelay off-screen, so the eventual lock looks
+                    # instant the moment a visible timer appears. The clock only
+                    # starts once the hover is CONFIRMED (cur == champ).
+                    delay_ms  = min(cfg.get("banDelay", 8000), 8000)
+                    confirmed = bool(champ) and cur == champ and self._ban_hovered.get(aid) == champ
+                    if confirmed:
+                        if aid not in self._action_start:
+                            self._action_start[aid] = time.monotonic()
+                        elapsed = (time.monotonic() - self._action_start[aid]) * 1000
+                    else:
+                        self._action_start.pop(aid, None)
+                        elapsed = 0
+                    # Wall-clock safety net: if the LCU NEVER echoes our hover
+                    # back (seen in the wild: 24 s of accepted-but-ignored hover
+                    # PATCHes with a frozen phase timer), `confirmed` would stay
+                    # False forever and the ban would never fire. Track when the
+                    # ban turn first started and force the lock through once
+                    # banDelay + a grace period has passed without confirmation.
+                    if aid not in self._ban_attempt:
+                        self._ban_attempt[aid] = time.monotonic()
+                    attempt_ms = (time.monotonic() - self._ban_attempt[aid]) * 1000
+                    stuck = (not confirmed) and bool(champ) \
+                        and attempt_ms >= delay_ms + 6000
                     # Lock once the ban delay has passed, or force it through if
                     # the ban timer is nearly up so we never miss the ban.
-                    ready  = elapsed >= min(cfg.get("banDelay", 8000), 8000)
+                    ready  = confirmed and elapsed >= delay_ms
                     ending = (not is_infinite) and 0 < time_left <= 4000
                     # ── Debug dump: exact state driving the ban decision ──
                     _raw_bans = [
@@ -1248,9 +1303,9 @@ class AutoEngine:
                         if a.get("type") == "ban"
                     ]
                     _dbg(f"[ban] aid={aid} champ={champ} current={current} "
-                         f"cur(session)={cur} hovered={self._ban_hovered.get(aid)} "
-                         f"elapsed={int(elapsed)}ms banDelay={min(cfg.get('banDelay', 8000), 8000)} "
-                         f"ready={ready} ending={ending} time_left={time_left} inf={is_infinite}")
+                         f"cur(session)={cur} hovered={self._ban_hovered.get(aid)} confirmed={confirmed} "
+                         f"elapsed={int(elapsed)}ms attempt={int(attempt_ms)}ms banDelay={delay_ms} "
+                         f"ready={ready} ending={ending} stuck={stuck} time_left={time_left} inf={is_infinite}")
                     _dbg(f"[ban]   ban_prio={ban_prio} bans={sorted(bans)} "
                          f"pick_intents={sorted(pick_intents)} ally_banning={sorted(ally_banning)} "
                          f"unavail={sorted(unavail)}")
@@ -1264,20 +1319,26 @@ class AutoEngine:
                     if not champ:
                         _dbg("[ban]   -> NO VALID CHAMP (nothing to ban)")
                         self._log(f"No valid ban for {ROLE_LABEL.get(role_key, role_key)}. Add champions to the ban list!")
-                    elif cur != champ or self._ban_hovered.get(aid) != champ:
-                        # Phase 1 — (re)hover the target; timer is not reset.
+                    elif not confirmed and not ending and not stuck:
+                        # Phase 1 — (re)hover the target; the delay clock hasn't
+                        # started yet since the LCU hasn't confirmed it.
                         _dbg(f"[ban]   -> HOVER {champ} (cur={cur} hovered={self._ban_hovered.get(aid)})")
                         if self._commit_action(action, champ, complete=False):
                             self._ban_hovered[aid] = champ
                             self._log(f"[debug] Ban hover: #{champ}  [{ROLE_LABEL.get(role_key, role_key)}]")
-                    elif ready or ending:
-                        # Phase 2 — champion is hovered and stuck; lock it in.
-                        _dbg(f"[ban]   -> LOCK {champ} (ready={ready} ending={ending})")
-                        if self._commit_action(action, champ, complete=True):
+                    elif ready or ending or stuck:
+                        # Phase 2 — lock it in. `ending` and `stuck` also force
+                        # a lock attempt without a confirmed hover, so a ban is
+                        # never missed if the LCU never echoes it back. The lock
+                        # is re-sent every poll until the session shows the
+                        # action completed — a 204 alone proves nothing.
+                        _dbg(f"[ban]   -> LOCK {champ} (ready={ready} ending={ending} stuck={stuck})")
+                        if self._commit_action(action, champ, complete=True) \
+                                and aid not in self._lock_sent:
+                            self._lock_sent.add(aid)
                             self._log(f"Banned champion #{champ}")
-                            self._done_actions.add(aid)
                     else:
-                        _dbg(f"[ban]   -> WAIT (hovered {champ}, {int(elapsed)}/{min(cfg.get('banDelay', 8000), 8000)}ms)")
+                        _dbg(f"[ban]   -> WAIT (hovered {champ}, {int(elapsed)}/{delay_ms}ms)")
 
                 # ── PRE-PICK ── hover our intended champion before our turn (after
                 # the pre-pick delay), unless the user has already hovered one.
@@ -3689,12 +3750,24 @@ class App(tk.Tk):
         self.resizable(True, True)
 
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        LOG_FILE.write_text("", encoding="utf-8")  # clear on startup
-        try:                                        # clear the debug log too, so
-            _DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)  # it doesn't grow
-            _DEBUG_LOG.write_text("", encoding="utf-8")           # across sessions
-        except Exception:
-            pass
+        # Rotate (never wipe) the logs: keep the two previous sessions as
+        # *.prev.log / *.prev2.log so a bug report can still be diagnosed
+        # after restarts, while total size stays bounded. Tests set
+        # LOLTOOL_NO_LOG_ROTATE so harness runs can't eat real evidence.
+        if not os.environ.get("LOLTOOL_NO_LOG_ROTATE"):
+            for _cur in (LOG_FILE, _DEBUG_LOG):
+                try:
+                    _cur.parent.mkdir(parents=True, exist_ok=True)
+                    _p1 = _cur.with_suffix(".prev.log")
+                    _p2 = _cur.with_suffix(".prev2.log")
+                    if _p1.exists():
+                        _p2.unlink(missing_ok=True)
+                        _p1.rename(_p2)
+                    if _cur.exists():
+                        _cur.rename(_p1)
+                    _cur.write_text("", encoding="utf-8")
+                except Exception:
+                    pass
 
         self.cfg     = load_config()
         self.ddragon = DDragon()
