@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.18.0"
+APP_VERSION = "1.18.1"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1011,11 +1011,20 @@ class AutoEngine:
         for bid in session.get("bans", {}).get("theirTeamBans", []):
             if int(bid): bans.add(int(bid))
 
+        # A teammate's champion can surface in THREE places depending on lobby
+        # type and moment: championPickIntent (declared intent), their pick
+        # action's championId (live hover — collected below once my_cell is
+        # known), or myTeam[].championId (seen in the wild: a human ally's
+        # ban-phase hover appeared ONLY here, with pickIntent=0 — and the tool
+        # banned their Ahri). All three feed the do-not-ban set.
         pick_intents: set = set()
         for p in session.get("myTeam", []):
             intent = int(p.get("championPickIntent", 0) or 0)
             if intent:
                 pick_intents.add(intent)
+            held = int(p.get("championId", 0) or 0)   # live hover or locked pick
+            if held:
+                pick_intents.add(held)
 
         # ── phase timer: how long until the current sub-phase ends ──
         _timer      = session.get("timer", {})
@@ -1033,6 +1042,20 @@ class AutoEngine:
         if local_cell_id is None:
             return
         my_cell = str(local_cell_id)
+
+        # A teammate's LIVE hover is carried on their pick ACTION's championId —
+        # championPickIntent often stops updating once PLANNING ends, so reading
+        # only the intent misses a teammate moving onto our ban target during
+        # the ban phase (the tool would then ban their champion out from under
+        # them). Include every pick action's champion: uncompleted = someone's
+        # current hover, completed = already picked — neither may be banned.
+        # (Our own hover counts too: never ban the champion we intend to pick.)
+        for _grp in session.get("actions", []):
+            for _act in _grp:
+                if _act.get("type") == "pick":
+                    _cid = int(_act.get("championId", 0) or 0)
+                    if _cid:
+                        pick_intents.add(_cid)
 
         assigned_role = ""
         for p in session.get("myTeam", []):
