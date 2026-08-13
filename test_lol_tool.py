@@ -31,13 +31,19 @@ for _name in ("Style","Notebook","Frame","Label"):
 # scrolledtext.ScrolledText
 _st_stub.ScrolledText = MagicMock
 
+# tkinter.font (Font used for text measuring in the Scouting tab)
+_font_stub = _make_tk_module("tkinter.font")
+_font_stub.Font = MagicMock
+
 # Make `from tkinter import ttk, scrolledtext` work
 _tk_stub.ttk         = _ttk_stub
 _tk_stub.scrolledtext = _st_stub
+_tk_stub.font        = _font_stub
 
 sys.modules["tkinter"]             = _tk_stub
 sys.modules["tkinter.ttk"]         = _ttk_stub
 sys.modules["tkinter.scrolledtext"] = _st_stub
+sys.modules["tkinter.font"]        = _font_stub
 
 # ── Stub psutil (no League client in CI) ─────────────────────────────────────
 _psutil = types.ModuleType("psutil")
@@ -69,8 +75,9 @@ class TestConfig(unittest.TestCase):
 
     def test_load_returns_defaults_when_no_file(self):
         cfg = lol_tool.load_config()
-        self.assertFalse(cfg["autoAccept"])
-        self.assertFalse(cfg["autoPick"])
+        # default-on since v1.5.2
+        self.assertTrue(cfg["autoAccept"])
+        self.assertTrue(cfg["autoPick"])
         self.assertIn("top",     cfg["roleChampions"])
         self.assertIn("utility", cfg["roleChampions"])
         for role in lol_tool.ROLES:

@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.19.0"
+APP_VERSION = "1.20.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -3809,10 +3809,11 @@ class App(tk.Tk):
         self._opgg_fetching  = False     # a fetch worker is currently running
 
         # Scouting tab state
-        self._scout_roster:   list = []    # [{name, tag, ally, bot}] currently shown
+        self._scout_roster:   list = []    # [{name, tag, ally, bot, champ}] currently shown
         self._scout_cache:    dict = {}    # (name, tag) → scout result dict
         self._scout_fetching: set  = set() # (name, tag) fetches in flight
         self._scout_source    = ""         # "lobby" / "champ select" / "in game"
+        self._scout_glyphs:   dict = {}    # (glyph, px, color) → PhotoImage | False
 
         # Dashboard state
         self._auto_switches: dict = {}   # key → ToggleSwitch
@@ -4379,20 +4380,20 @@ class App(tk.Tk):
     # ── Scouting tab: Porofessor-style tags from public op.gg stats ────────────
     def _build_scouting(self, parent):
         pad = tk.Frame(parent, bg=DARK)
-        pad.pack(fill="both", expand=True, padx=30, pady=(20, 16))
+        pad.pack(fill="both", expand=True, padx=18, pady=(12, 6))
 
         hdr = tk.Frame(pad, bg=DARK)
         hdr.pack(fill="x")
-        self._section_header(hdr, "Scouting Report", pady=(0, 4))
+        self._section_header(hdr, "Scouting Report", pady=(0, 1))
         sub = tk.Frame(pad, bg=DARK)
-        sub.pack(fill="x", pady=(0, 12))
+        sub.pack(fill="x", pady=(0, 5))
         self._scout_status_var = tk.StringVar(
             value="Waiting for a lobby — allies appear here, everyone once in game.")
         tk.Label(sub, textvariable=self._scout_status_var, bg=DARK, fg=MUTED,
                  font=FONT_SMALL, anchor="w").pack(side="left")
         tk.Button(sub, text="Refresh", bg=BTN_BG, fg=GOLD, relief="flat",
                   activebackground=BTN_HOV, activeforeground=GOLD,
-                  cursor="hand2", font=FONT_SMALL, padx=12, pady=2,
+                  cursor="hand2", font=FONT_SMALL, padx=12, pady=0,
                   command=self._scout_force_refresh).pack(side="right")
 
         # Scrollable card list
@@ -4407,13 +4408,27 @@ class App(tk.Tk):
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.bind("<Configure>", lambda e: (
+            canvas.itemconfigure(win, width=e.width),
+            self._scout_reflow(e.width)))
         canvas.bind_all("<MouseWheel>", lambda e: (
             canvas.yview_scroll(int(-e.delta / 120), "units")
             if self._active_page == "Scouting" else None))
         self._scout_list = inner
         self._render_scouting()
+
+    def _scout_reflow(self, width):
+        """Re-render (debounced) when the list becomes meaningfully wider or
+        narrower, so the tag chips re-wrap to the new width."""
+        if abs(width - getattr(self, "_scout_wrap_w", 0)) < 48:
+            return
+        job = getattr(self, "_scout_reflow_job", None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+        self._scout_reflow_job = self.after(150, self._render_scouting)
 
     def _scout_force_refresh(self):
         """Drop the cache and refetch everyone currently on the roster."""
@@ -4491,11 +4506,21 @@ class App(tk.Tk):
                     continue           # bots / hidden
                 ident = self._scout_resolve_summoner(sid)
                 if ident:
+                    # locked pick, else hover intent — for champ-scoped stats
+                    cid = int(mbr.get("championId") or
+                              mbr.get("championPickIntent") or 0)
                     out.append({"name": ident[0], "tag": ident[1],
-                                "ally": True, "bot": False})
+                                "ally": True, "bot": False,
+                                "champ": self._scout_champ_name(cid)})
         except Exception as e:
             _dbg(f"[scout] champselect roster: {e}")
         return out
+
+    def _scout_champ_name(self, cid):
+        try:
+            return self.ddragon.name(int(cid)) if cid else None
+        except Exception:
+            return None
 
     def _scout_ingame_roster(self):
         """All ten players from the live game. Ally/enemy is resolved relative
@@ -4514,6 +4539,18 @@ class App(tk.Tk):
             except Exception:
                 pass
             teams = [gd.get("teamOne", []) or [], gd.get("teamTwo", []) or []]
+            # who locked what — keyed by every identity field the entries carry
+            sel = {}
+            for s in (gd.get("playerChampionSelections") or []):
+                if not isinstance(s, dict):
+                    continue
+                cid = int(s.get("championId") or 0)
+                if not cid:
+                    continue
+                for k in ("summonerInternalName", "puuid", "summonerId"):
+                    v = s.get(k)
+                    if v:
+                        sel[str(v)] = cid
             my_team = 0
             for ti, team in enumerate(teams):
                 if any(int(p.get("summonerId", 0) or 0) == me for p in team):
@@ -4532,8 +4569,12 @@ class App(tk.Tk):
                     ident = self._scout_member_identity(p) \
                         or self._scout_resolve_summoner(sid)
                     if ident:
+                        cid = next((sel[str(p[k])] for k in
+                                    ("summonerInternalName", "puuid", "summonerId")
+                                    if p.get(k) and str(p[k]) in sel), 0)
                         out.append({"name": ident[0], "tag": ident[1],
-                                    "ally": ally, "bot": False})
+                                    "ally": ally, "bot": False,
+                                    "champ": self._scout_champ_name(cid)})
         except Exception as e:
             _dbg(f"[scout] ingame roster: {e}")
         return out
@@ -4581,13 +4622,14 @@ class App(tk.Tk):
                 region = summ[2]
             prof  = self._scout_profile(name, tag, region)
             games = self._scout_matches(name, tag, region)
-            tags  = self._scout_tags(prof, games)
+            # tags are computed at render time (they depend on the champion
+            # the player is currently locked onto, which changes without a
+            # refetch) — the cache only holds the raw data
             self._scout_cache[key] = {"prof": prof or {}, "games": games or [],
-                                      "tags": tags, "ok": prof is not None}
+                                      "ok": prof is not None}
         except Exception as e:
             _dbg(f"[scout] fetch {name}#{tag}: {e}")
-            self._scout_cache[key] = {"prof": {}, "games": [], "tags": [],
-                                      "ok": False}
+            self._scout_cache[key] = {"prof": {}, "games": [], "ok": False}
         finally:
             self._scout_fetching.discard(key)
             self.after(0, self._render_scouting)
@@ -4739,9 +4781,12 @@ class App(tk.Tk):
 
     # ── the tag engine ────────────────────────────────────────────────────────
     @staticmethod
-    def _scout_tags(prof, games):
+    def _scout_tags(prof, games, champ=None):
         """Porofessor-style tags: [(text, color)]. Pure function of the
-        normalized profile + match list so it's easy to test."""
+        normalized profile + match list so it's easy to test. Every tag type
+        carries its own unique leading glyph (rendered as a chip icon).
+        `champ` = the champion this player is locked onto right now; CS stats
+        are only produced for games on that champion."""
         from datetime import datetime, timezone, timedelta
         tags = []
         prof  = prof or {}
@@ -4800,8 +4845,29 @@ class App(tk.Tk):
                 else:
                     break
             if streak >= 3:
-                tags.append((f"🔥 Won last {streak}", GREEN) if res0 == "WIN"
+                tags.append((f"🚀 Won last {streak}", GREEN) if res0 == "WIN"
                             else (f"🧊 Lost last {streak} — tilted?", RED))
+            # farming: cs per minute on real (timed) SR games — shown ONLY for
+            # the champion this player is locked onto right now, so a support
+            # main's fill games can't smear their carry pick (and vice versa).
+            # High on the list: it's intel about the champion in THIS game.
+            timed = [g for g in games if g.get("dur", 0) >= 600
+                     and "ARAM" not in g.get("qtype", "")]
+            if champ:
+                norm = lambda s: _re.sub(r"[^a-z0-9]", "", str(s).lower())
+                on_champ = [g for g in timed if norm(g.get("champ")) == norm(champ)]
+                if len(on_champ) >= 3:
+                    cspm = sum(g.get("cs", 0) for g in on_champ) / \
+                           max(1.0, sum(g["dur"] for g in on_champ) / 60.0)
+                    as_supp = sum(1 for g in on_champ
+                                  if g.get("pos") == "SUPPORT") \
+                        >= len(on_champ) / 2
+                    if cspm >= 8.0:
+                        tags.append((f"🌾 {cspm:.1f} CS/min on {champ}"
+                                     " — farming machine", GOLD))
+                    elif cspm <= 4.5 and not as_supp:
+                        tags.append((f"🐟 {cspm:.1f} CS/min on {champ}"
+                                     " — allergic to minions", RED))
             # KDA
             k = sum(g["k"] for g in games)
             d = sum(g["d"] for g in games)
@@ -4819,7 +4885,7 @@ class App(tk.Tk):
             if by_champ:
                 top, cnt = max(by_champ.items(), key=lambda kv: kv[1])
                 if len(games) >= 6 and cnt / len(games) >= 0.5:
-                    tags.append((f"🎯 One-trick: {top}", GOLD))
+                    tags.append((f"🔂 One-trick: {top}", GOLD))
                 elif len(by_champ) >= 8:
                     tags.append(("🃏 Champion roulette — plays anything", TEAL))
             # play volume
@@ -4849,16 +4915,6 @@ class App(tk.Tk):
             aram = sum(1 for g in games if "ARAM" in g.get("qtype", ""))
             if len(games) >= 8 and aram / len(games) >= 0.5:
                 tags.append((f"🎲 {aram}/{len(games)} recent games are ARAM", TEAL))
-            # farming: cs per minute on real (timed) SR games, non-support
-            timed = [g for g in games if g.get("dur", 0) >= 600
-                     and "ARAM" not in g.get("qtype", "")]
-            if len(timed) >= 5 and main_pos != "SUPPORT":
-                cspm = sum(g.get("cs", 0) for g in timed) / \
-                       max(1.0, sum(g["dur"] for g in timed) / 60.0)
-                if cspm >= 8.0:
-                    tags.append((f"🌾 {cspm:.1f} CS/min farming machine", GOLD))
-                elif cspm <= 4.5:
-                    tags.append((f"🐟 {cspm:.1f} CS/min — allergic to minions", RED))
             # vision habits (control wards)
             if len(timed) >= 5:
                 avg_pinks = sum(g.get("pinks", 0) for g in timed) / len(timed)
@@ -4877,7 +4933,7 @@ class App(tk.Tk):
             # a recent quadra / penta
             best_multi = max((g.get("multi", 0) for g in games), default=0)
             if best_multi >= 5:
-                tags.append(("☠️ Penta in recent games", GOLD))
+                tags.append(("💀 Penta in recent games", GOLD))
             elif best_multi == 4:
                 tags.append(("🔪 Quadra in recent games", TEAL))
             # binge sessions: consecutive games queued back-to-back
@@ -4927,12 +4983,12 @@ class App(tk.Tk):
         return out
 
     # ── rendering ─────────────────────────────────────────────────────────────
-    def _scout_pool_line(self, data):
+    def _scout_pool_line(self, data, limit=4):
         """'Pool:  Ahri 54G 57% · Yone 42G 45% · …' from the season pool, or
         the recent-20 aggregation when no season data exists."""
         prof, games = data.get("prof") or {}, data.get("games") or []
         bits = []
-        for c in (prof.get("pool") or [])[:4]:
+        for c in (prof.get("pool") or [])[:limit]:
             nm = c.get("name")
             if not nm and c.get("id"):
                 try:
@@ -4949,32 +5005,52 @@ class App(tk.Tk):
                     gw = agg.setdefault(g["champ"], [0, 0])
                     gw[0] += 1
                     gw[1] += 1 if g["result"] == "WIN" else 0
-            top = sorted(agg.items(), key=lambda kv: -kv[1][0])[:4]
+            top = sorted(agg.items(), key=lambda kv: -kv[1][0])[:limit]
             bits = [f"{nm} {n}G {w / max(1, n):.0%}" for nm, (n, w) in top]
         return ("Pool:  " + "  ·  ".join(bits)) if bits else ""
 
-    def _scout_rank_line(self, prof):
+    def _scout_rank_line(self, prof, compact=False):
         if not prof:
             return "no data"
         if prof.get("tier"):
-            div = prof.get("division")
-            lp  = prof.get("lp")
+            tier = str(prof["tier"])
+            div  = prof.get("division")
+            lp   = prof.get("lp")
             w, l = prof.get("wins", 0), prof.get("losses", 0)
-            bits = [str(prof["tier"]).title()
-                    + (f" {div}" if div not in (None, "", 0) else "")]
+            short = {"PLATINUM": "Plat", "DIAMOND": "Dia",
+                     "GRANDMASTER": "GM", "CHALLENGER": "Chall"}
+            t = short.get(tier.upper(), tier.title()) if compact else tier.title()
+            bits = [t + (f" {div}" if div not in (None, "", 0) else "")]
             if lp is not None:
                 bits.append(f"{lp} LP")
             if w + l:
-                bits.append(f"{w}W {l}L ({w / max(1, w + l):.0%})")
+                bits.append(f"{w / max(1, w + l):.0%} of {w + l}G" if compact
+                            else f"{w}W {l}L ({w / max(1, w + l):.0%})")
             q = prof.get("queue", "")
-            return f"{'  ·  '.join(bits)}" + (f"   [{q}]" if q else "")
+            if compact:
+                # Solo is the default assumption — only flag the odd queue out
+                return " · ".join(bits) + (f" [{q}]" if q and q != "Solo" else "")
+            return "  ·  ".join(bits) + (f"   [{q}]" if q else "")
         lvl = prof.get("level")
-        return f"Unranked · level {lvl}" if lvl else "Unranked"
+        if not lvl:
+            return "Unranked"
+        return f"Unranked · lvl {lvl}" if compact else f"Unranked · level {lvl}"
+
+    def _scout_measure(self, text, font):
+        """Pixel width of `text` in `font` (Font objects cached per spec)."""
+        cache = getattr(self, "_scout_fonts", None)
+        if cache is None:
+            cache = self._scout_fonts = {}
+        f = cache.get(font)
+        if f is None:
+            f = cache[font] = tkfont.Font(font=font)
+        return f.measure(text)
 
     def _render_scouting(self):
         host = getattr(self, "_scout_list", None)
         if host is None:
             return
+        self._scout_reflow_job = None
         for w in host.winfo_children():
             w.destroy()
         roster = self._scout_roster
@@ -4994,61 +5070,198 @@ class App(tk.Tk):
                      font=FONT_SMALL).pack(anchor="w", pady=8)
             return
 
+        wrap_w = host.winfo_width()
+        if wrap_w < 200:   # not laid out yet — estimate from the window
+            wrap_w = max(480, self.winfo_width() - 196 - 2 * 18 - 18)
+        self._scout_wrap_w = wrap_w
+
         duo = self._scout_duo_tags(roster, self._scout_cache)
-        for p in sorted(roster, key=lambda x: (not x["ally"], x["name"].lower())):
-            border = tk.Frame(host, bg=CARD_BORDER)
-            border.pack(fill="x", pady=(0, 10))
-            card = tk.Frame(border, bg=CARD)
-            card.pack(fill="x", padx=1, pady=1)
-            row = tk.Frame(card, bg=CARD)
-            row.pack(fill="x", padx=14, pady=(10, 2))
+        by_name = lambda x: x["name"].lower()
+        allies  = sorted((p for p in roster if p["ally"]), key=by_name)
+        enemies = sorted((p for p in roster if not p["ally"]), key=by_name)
 
-            side_txt, side_fg = (("ALLY", GREEN) if p["ally"] else ("ENEMY", RED))
-            tk.Label(row, text=side_txt, bg=CARD, fg=side_fg,
+        if allies and enemies:
+            # Full game: the two teams sit side by side, scoreboard style, in
+            # compact cards — ten stacked full-width cards don't fit on screen.
+            cols = tk.Frame(host, bg=DARK)
+            cols.pack(fill="both", expand=True)
+            cols.columnconfigure(0, weight=1, uniform="scoutcol")
+            cols.columnconfigure(1, weight=1, uniform="scoutcol")
+            col_w = (wrap_w - 14) // 2
+            for i, (team, title, fg) in enumerate(
+                    ((allies, "YOUR TEAM", GREEN),
+                     (enemies, "ENEMY TEAM", RED))):
+                col = tk.Frame(cols, bg=DARK)
+                col.grid(row=0, column=i, sticky="new",
+                         padx=(0, 7) if i == 0 else (7, 0))
+                tk.Label(col, text=title, bg=DARK, fg=fg,
+                         font=("Segoe UI", 9, "bold"),
+                         anchor="w").pack(fill="x", pady=(0, 2))
+                for j, p in enumerate(team):
+                    self._scout_card(col, p, duo, col_w, compact=True,
+                                     last=j == len(team) - 1)
+        else:
+            n = len(allies) + len(enemies)
+            for j, p in enumerate(allies + enemies):
+                self._scout_card(host, p, duo, wrap_w, compact=False,
+                                 last=j == n - 1)
+
+    def _scout_card(self, parent, p, duo, wrap_w, compact, last=False):
+        """One player card. compact=True is the ten-man two-column mode:
+        smaller fonts, short rank text, tag flavour trimmed."""
+        border = tk.Frame(parent, bg=CARD_BORDER)
+        border.pack(fill="x", pady=(0, 0 if last else 5))
+        card = tk.Frame(border, bg=CARD)
+        card.pack(fill="x", padx=1, pady=1)
+        px = 10 if compact else 14
+        inner_w = wrap_w - 2 * px - 2      # usable width inside the card
+        row = tk.Frame(card, bg=CARD)
+        row.pack(fill="x", padx=px, pady=(4, 0))
+
+        if not p["ally"] and not compact:   # single-column view only
+            tk.Label(row, text="ENEMY", bg=CARD, fg=RED,
                      font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 10))
-            disp = p["name"] + (f"  #{p['tag']}" if p["tag"] else "")
-            tk.Label(row, text=disp, bg=CARD, fg=WHITE,
-                     font=("Segoe UI", 11, "bold")).pack(side="left")
+        disp = p["name"] + (f"  #{p['tag']}" if p["tag"] else "")
+        name_fnt = ("Segoe UI", 10, "bold")
+        tk.Label(row, text=disp, bg=CARD, fg=WHITE,
+                 font=name_fnt).pack(side="left")
 
-            if p.get("bot"):
-                tk.Label(row, text="🤖 Bot — free win", bg=CARD, fg=MUTED,
-                         font=FONT_SMALL).pack(side="right")
-                continue
-
-            data = self._scout_cache.get((p["name"], p["tag"]))
-            if data is None:
-                tk.Label(row, text="fetching…", bg=CARD, fg=FAINT,
-                         font=FONT_SMALL).pack(side="right")
-                continue
-            tk.Label(row, text=self._scout_rank_line(data.get("prof")),
-                     bg=CARD, fg=GOLD if data.get("ok") else FAINT,
+        bottom_pad = 4
+        if p.get("bot"):
+            icon = self._scout_glyph_image("🤖", 14, MUTED)
+            tk.Label(row, text=" Bot — free win" if icon else "🤖 Bot — free win",
+                     image=icon or "", compound="left" if icon else "none",
+                     bg=CARD, fg=MUTED, font=FONT_SMALL).pack(side="right")
+            tk.Frame(card, bg=CARD, height=bottom_pad, width=1).pack()
+            return
+        data = self._scout_cache.get((p["name"], p["tag"]))
+        if data is None:
+            tk.Label(row, text="fetching…", bg=CARD, fg=FAINT,
                      font=FONT_SMALL).pack(side="right")
+            tk.Frame(card, bg=CARD, height=bottom_pad, width=1).pack()
+            return
 
-            # champion preferences: season pool first, else the recent 20
-            pool_txt = self._scout_pool_line(data)
-            if pool_txt:
-                tk.Label(card, text=pool_txt, bg=CARD, fg=TEAL,
-                         font=FONT_SMALL, anchor="w").pack(
-                    fill="x", padx=14, pady=(2, 0))
+        rank_txt = self._scout_rank_line(data.get("prof"), compact=compact)
+        rank_fg  = GOLD if data.get("ok") else FAINT
+        rank_fnt = FONT_HINT if compact else FONT_SMALL
+        # Rank rides on the name line when both fit, else gets its own line.
+        if (self._scout_measure(disp, name_fnt) +
+                self._scout_measure(rank_txt, rank_fnt) + 16 <= inner_w):
+            tk.Label(row, text=rank_txt, bg=CARD, fg=rank_fg,
+                     font=rank_fnt).pack(side="right")
+        else:
+            tk.Label(card, text=rank_txt, bg=CARD, fg=rank_fg, font=rank_fnt,
+                     anchor="w").pack(fill="x", padx=px)
 
-            tags = ((data.get("tags") or []) +
-                    duo.get((p["name"], p["tag"]), []))[:9]
-            if tags:
-                grid = tk.Frame(card, bg=CARD)
-                grid.pack(fill="x", padx=14, pady=(4, 10))
-                for i, (txt, color) in enumerate(tags):
-                    chip = tk.Label(grid, text=txt, bg=DARK, fg=color,
-                                    font=FONT_SMALL, padx=8, pady=2)
-                    chip.grid(row=i // 3, column=i % 3, sticky="w",
-                              padx=(0, 8), pady=2)
-            elif not data.get("ok"):
-                tk.Label(card, text="op.gg lookup failed for this player.",
-                         bg=CARD, fg=FAINT, font=FONT_SMALL,
-                         anchor="w").pack(fill="x", padx=14, pady=(0, 10))
-            else:
-                tk.Label(card, text="Nothing notable — suspiciously normal. 🕵️",
-                         bg=CARD, fg=FAINT, font=FONT_SMALL,
-                         anchor="w").pack(fill="x", padx=14, pady=(0, 10))
+        # champion preferences: season pool first, else the recent 20
+        pool_txt = self._scout_pool_line(data, limit=3 if compact else 4)
+        if pool_txt:
+            tk.Label(card, text=pool_txt, bg=CARD, fg=TEAL,
+                     font=FONT_HINT if compact else FONT_SMALL,
+                     anchor="w").pack(fill="x", padx=px, pady=(1, 0))
+
+        # duo/premade intel first — it must survive the compact row cap
+        own = self._scout_tags(data.get("prof"), data.get("games"),
+                               p.get("champ")) if data.get("ok") else []
+        tags = (duo.get((p["name"], p["tag"]), []) + own)[:9]
+        if tags:
+            self._scout_tag_flow(card, tags, inner_w, compact, px)
+        elif not data.get("ok"):
+            tk.Label(card, text="op.gg lookup failed for this player.",
+                     bg=CARD, fg=FAINT, font=FONT_SMALL,
+                     anchor="w").pack(fill="x", padx=px, pady=(2, bottom_pad))
+        else:
+            tk.Label(card, text="Nothing notable — suspiciously normal. 🕵️",
+                     bg=CARD, fg=FAINT, font=FONT_SMALL,
+                     anchor="w").pack(fill="x", padx=px, pady=(2, bottom_pad))
+
+    @staticmethod
+    def _scout_emoji_split(txt):
+        """('🔥', 'Ranked hot streak') when the text leads with a glyph token,
+        else (None, txt). '+3' overflow chips have no glyph."""
+        head, _, rest = txt.partition(" ")
+        if rest and any(ord(c) > 0x2000 for c in head):
+            return head, rest.lstrip()
+        return None, txt
+
+    def _scout_glyph_image(self, glyph, size, color):
+        """`glyph` rendered via the Segoe UI Emoji color font as a size×size
+        PhotoImage. Monochrome dingbats (☠ 🕸 💀 …) are tinted with the tag
+        color so they don't vanish on the dark chip. None if it can't render
+        (caller falls back to plain text). Cached — PhotoImages must stay
+        referenced or Tk drops them."""
+        key = (glyph, size, color)
+        if key in self._scout_glyphs:
+            return self._scout_glyphs[key] or None
+        photo = None
+        try:
+            from PIL import Image, ImageDraw, ImageFont, ImageTk
+            fnt = ImageFont.truetype("seguiemj.ttf", size)
+            im = Image.new("RGBA", (size * 3, size * 3), (0, 0, 0, 0))
+            ImageDraw.Draw(im).text((size, size), glyph, font=fnt,
+                                    embedded_color=True)
+            box = im.getbbox()
+            if box:
+                im = im.crop(box)
+                pixels = [pxl for pxl in im.getdata() if pxl[3] > 0]
+                if pixels and max(max(pxl[:3]) - min(pxl[:3])
+                                  for pxl in pixels) <= 24:
+                    # monochrome glyph → recolor its silhouette
+                    tint = Image.new("RGBA", im.size, color)
+                    tint.putalpha(im.getchannel("A"))
+                    im = tint
+                im.thumbnail((size, size), Image.LANCZOS)
+                sq = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                sq.paste(im, ((size - im.width) // 2,
+                              (size - im.height) // 2), im)
+                photo = ImageTk.PhotoImage(sq)
+        except Exception as e:
+            _dbg(f"[scout] glyph {glyph!r}: {e}")
+        self._scout_glyphs[key] = photo or False
+        return photo
+
+    def _scout_tag_flow(self, card, tags, avail, compact, px):
+        """Tag chips laid out left→right, wrapping to a new row when the next
+        chip would spill past `avail`. Rows are capped (2 compact / 3 wide) so
+        one chatty player can't stretch their card — the overflow collapses
+        into a muted “+N” chip. Each chip leads with its tag's unique icon."""
+        fnt = FONT_HINT if compact else FONT_SMALL
+        pad_x = 6 if compact else 8
+        icon_px = 13 if compact else 15
+        max_rows = 2 if compact else 3
+        holder = tk.Frame(card, bg=CARD)
+        holder.pack(fill="x", padx=px, pady=(2, 1))
+        line, used, rows = None, 0, 0
+
+        def chip(parent, txt, color, icon=None):
+            tk.Label(parent, text=(" " + txt) if icon else txt,
+                     image=icon or "", compound="left" if icon else "none",
+                     bg=DARK, fg=color, font=fnt,
+                     padx=pad_x, pady=1).pack(side="left", padx=(0, 5),
+                                              pady=(0, 2))
+        for i, (txt, color) in enumerate(tags):
+            if compact:
+                txt = txt.split(" — ")[0]   # keep the stat, drop the flavour
+            glyph, shown = self._scout_emoji_split(txt)
+            icon = self._scout_glyph_image(glyph, icon_px, color) \
+                if glyph else None
+            if icon is None:
+                shown = txt                 # glyph unrenderable → keep as text
+            need = self._scout_measure(shown, fnt) + 2 * pad_x + 9 + \
+                (icon_px + 6 if icon else 0)
+            last_row = rows == max_rows
+            more = len(tags) - i
+            # reserve room for a “+N” chip whenever tags would be cut
+            if last_row and (used + need + (34 if more > 1 else 0) > avail):
+                chip(line, f"+{more}", FAINT)
+                break
+            if not last_row and (line is None or used + need > avail):
+                line = tk.Frame(holder, bg=CARD)
+                line.pack(fill="x", anchor="w")
+                used, rows = 0, rows + 1
+                last_row = rows == max_rows
+            chip(line, shown, color, icon)
+            used += need
 
     # ── Champion portrait icons (for the squishy pick/ban chips) ───────────────
     def request_icon_prefetch(self):
