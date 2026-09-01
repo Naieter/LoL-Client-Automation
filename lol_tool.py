@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.20.0"
+APP_VERSION = "1.21.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -2345,19 +2345,30 @@ class HexButton(tk.Canvas):
 
 class HexSlider(tk.Canvas):
     """A horizontal slider with an always-visible gold diamond handle and a
-    gold-filled track. Click or drag to set a 0–100 value; calls command(value)."""
+    gold-filled track. Click or drag to set a value between minv and maxv
+    (snapped to step); calls command(value)."""
 
     def __init__(self, parent, value=80, command=None, width=170, height=24,
-                 bg=CARD):
+                 bg=CARD, minv=0, maxv=100, step=1, enabled=True):
         super().__init__(parent, width=width, height=height, bg=bg,
-                         highlightthickness=0, bd=0, cursor="hand2")
-        self._val     = max(0, min(100, int(value)))
+                         highlightthickness=0, bd=0,
+                         cursor="hand2" if enabled else "arrow")
+        self._minv    = minv
+        self._maxv    = maxv
+        self._step    = step
         self._command = command
         self._pad     = 10
+        self._enabled = enabled
+        self._val     = self._snap(value)
         self.bind("<Button-1>", self._set_from_x)
         self.bind("<B1-Motion>", self._set_from_x)
         self.bind("<Configure>", lambda _e: self._draw())
         self._draw()
+
+    def _snap(self, val):
+        val = max(self._minv, min(self._maxv, val))
+        val = round((val - self._minv) / self._step) * self._step + self._minv
+        return int(val) if float(self._step).is_integer() else round(val, 2)
 
     def _pxw(self):
         w = self.winfo_width()
@@ -2369,38 +2380,50 @@ class HexSlider(tk.Canvas):
         h = int(self["height"])
         pad, cy = self._pad, h // 2
         x0, x1 = pad, w - pad
-        hx = x0 + (x1 - x0) * self._val / 100.0
-        # groove, then gold fill up to the handle
-        self.create_line(x0, cy, x1, cy, fill=EDGE_GOLD, width=3,
+        frac = (self._val - self._minv) / (self._maxv - self._minv)
+        hx = x0 + (x1 - x0) * frac
+        groove_col  = EDGE_GOLD   if self._enabled else TRACK_OFF
+        fill_col    = GOLD        if self._enabled else TRACK_OFF
+        handle_fill = GOLD        if self._enabled else MUTED
+        handle_edge = BRIGHT_GOLD if self._enabled else MUTED
+        # groove, then filled portion up to the handle
+        self.create_line(x0, cy, x1, cy, fill=groove_col, width=3,
                          capstyle="round")
-        self.create_line(x0, cy, hx, cy, fill=GOLD, width=3, capstyle="round")
-        # always-visible gold diamond handle (anti-aliased)
+        self.create_line(x0, cy, hx, cy, fill=fill_col, width=3, capstyle="round")
+        # always-visible diamond handle (anti-aliased)
         hs  = 16
-        him = _render_diamond_image(hs, GOLD, BRIGHT_GOLD, outline_width=1.4)
+        him = _render_diamond_image(hs, handle_fill, handle_edge, outline_width=1.4)
         if him is not None:
             self._handle_img = him
             self.create_image(hx, cy, image=him)
         else:
             r = 7
             self.create_polygon(hx, cy - r, hx + r, cy, hx, cy + r, hx - r, cy,
-                                fill=GOLD, outline=BRIGHT_GOLD)
+                                fill=handle_fill, outline=handle_edge)
 
     def _set_from_x(self, e):
+        if not self._enabled:
+            return
         w = self._pxw()
         pad = self._pad
         frac = (e.x - pad) / max(1, (w - 2 * pad))
-        val = int(round(max(0.0, min(1.0, frac)) * 100))
-        self._val = val
+        val = self._minv + max(0.0, min(1.0, frac)) * (self._maxv - self._minv)
+        self._val = self._snap(val)
         self._draw()
         if self._command:
-            self._command(val)
+            self._command(self._val)
 
     def set(self, val):
-        self._val = max(0, min(100, int(val)))
+        self._val = self._snap(val)
         self._draw()
 
     def get(self):
         return self._val
+
+    def set_enabled(self, enabled):
+        self._enabled = bool(enabled)
+        self.config(cursor="hand2" if self._enabled else "arrow")
+        self._draw()
 
 
 class ToggleSwitch(tk.Canvas):
@@ -3799,7 +3822,6 @@ class App(tk.Tk):
                                   self.ddragon, self._on_phase_change)
 
         self._role_panels: dict = {}   # role → RolePanel
-        self._delay_vars:  dict = {}
         self._connected    = False
         self._icon_images:   dict = {}   # champ id → ImageTk.PhotoImage (circular avatar)
         self._icon_pil_cache: dict = {}  # champ id → PIL.Image, awaiting main-thread materialize
@@ -3817,6 +3839,7 @@ class App(tk.Tk):
 
         # Dashboard state
         self._auto_switches: dict = {}   # key → ToggleSwitch
+        self._timer_widgets: dict = {}   # toggle key → (HexSlider, icon label, value label)
         self._nav_rows:      dict = {}   # page-name → (row, accent, label)
         self._nav_suffixes:  dict = {}   # page-name → badge label ("(beta)")
         self._pages:         dict = {}   # page-name → content frame
@@ -5629,8 +5652,17 @@ class App(tk.Tk):
             ("Auto Invites",       "Accept friend invites",
              [("", "autoAcceptInvites")]),
         ]
+        # Toggles whose wait can be tuned right on the dashboard: toggle config
+        # key → (delay config key, slider max seconds). These used to live in
+        # Settings → Timings; keep the same config keys and max values.
+        _TIMER_META = {
+            "autoAccept":  ("acceptDelay",  60),
+            "autoPrePick": ("prePickDelay", 60),
+            "autoPick":    ("pickDelay",    29),
+            "autoBan":     ("banDelay",      8),
+        }
         for r in range((len(_auto_items) + 1) // 2):
-            grid.rowconfigure(r, weight=1, uniform="rows")
+            grid.rowconfigure(r, weight=1, uniform=f"row{r}")
 
         def _toggle(parent, subkey):
             on = bool(self.cfg.get(subkey, DEFAULT_CONFIG.get(subkey, True)))
@@ -5639,14 +5671,44 @@ class App(tk.Tk):
             self._auto_switches[subkey] = sw
             return sw
 
+        def _timer_row(parent, subkey):
+            cfg_key, max_val = _TIMER_META[subkey]
+            secs = round(int(self.cfg.get(cfg_key, DEFAULT_CONFIG.get(cfg_key, 0)))
+                         / 1000, 1)
+            on = bool(self.cfg.get(subkey, DEFAULT_CONFIG.get(subkey, True)))
+            row = tk.Frame(parent, bg=CARD)
+            row.pack(fill="x", pady=(6, 0))
+            # A clock glyph stands in for a text label — its colour (and the
+            # slider's) tracks the toggle above, so the pairing reads as one
+            # control instead of two.
+            icon = tk.Label(row, text="⏱", bg=CARD, fg=MUTED if on else FAINT,
+                            font=FONT_LABEL)
+            icon.pack(side="left")
+            val_str = tk.StringVar(value=f"{secs:g}s")
+            val_lbl = tk.Label(row, textvariable=val_str, bg=CARD,
+                               fg=TEXT if on else FAINT,
+                               font=FONT_SMALL, width=5, anchor="e")
+            val_lbl.pack(side="right")
+
+            def _on_change(v):
+                self.cfg[cfg_key] = int(round(v * 1000))
+                save_config(self.cfg)
+                val_str.set(f"{v:g}s")
+
+            slider = HexSlider(row, value=secs, minv=0, maxv=max_val, step=0.5,
+                               command=_on_change, bg=CARD, width=110, enabled=on)
+            slider.pack(side="right", padx=(0, 8))
+            self._timer_widgets[subkey] = (slider, icon, val_lbl)
+
         for i, (title, desc, toggles) in enumerate(_auto_items):
             row, col = divmod(i, 2)
-            card = HexCard(grid, fill=CARD, border=CARD_BORDER, height=104)
+            card = HexCard(grid, fill=CARD, border=CARD_BORDER, height=104,
+                           autofit=True)
             card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
             # Top-anchored (not centred) so every card's title lines up at the
             # same height, regardless of how much content sits below it.
             inner = tk.Frame(card.body, bg=CARD)
-            inner.pack(fill="x", padx=18, pady=(18, 0))
+            inner.pack(fill="x", padx=18, pady=(18, 18))
 
             if len(toggles) == 1:
                 # Plain card: title (left) + toggle (right edge), description below.
@@ -5658,6 +5720,8 @@ class App(tk.Tk):
                 if desc:
                     tk.Label(inner, text=desc, bg=CARD, fg=MUTED,
                              font=FONT_LABEL).pack(anchor="w", pady=(5, 0))
+                if toggles[0][1] in _TIMER_META:
+                    _timer_row(inner, toggles[0][1])
             else:
                 # Split card: each labelled toggle shares a row with the card's
                 # left-hand text, so the toggles sit exactly where a plain card's
@@ -5675,6 +5739,8 @@ class App(tk.Tk):
                     _toggle(r_, subkey).pack(side="right")
                     tk.Label(r_, text=sublabel, bg=CARD, fg=MUTED,
                              font=FONT_LABEL).pack(side="right", padx=(0, 8))
+                    if subkey in _TIMER_META:
+                        _timer_row(inner, subkey)
 
         self._set_run_state("disabled")
 
@@ -6438,38 +6504,6 @@ class App(tk.Tk):
               self._on_restore_tft).pack(side="left")
         self._update_tft_status()
 
-        # ── Timings ───────────────────────────────────────────────────────────
-        s = _section("Timings  (seconds)")
-
-        g = tk.Frame(s, bg=CARD)
-        g.pack(anchor="nw")
-        for i, (label, key, note, max_val) in enumerate([
-            ("Accept delay:",   "acceptDelay",
-             "Wait before auto-accepting a found match",               60),
-            ("Pre-pick delay:", "prePickDelay",
-             "Wait into champ select before hovering your pre-pick",   60),
-            ("Pick delay:",     "pickDelay",
-             "Wait after your pick turn starts before locking in",     29),
-            ("Ban delay:",      "banDelay",
-             "Wait after your ban turn starts before banning",          8),
-        ]):
-            tk.Label(g, text=label, bg=CARD, fg=TEXT,
-                     font=FONT_SMALL).grid(row=i, column=0, sticky="w", pady=4)
-            var = tk.DoubleVar(value=round(int(self.cfg.get(key, 1000)) / 1000, 1))
-            self._delay_vars[key] = var
-
-            def _on_change(k=key, v=var, mx=max_val):
-                self.cfg[k] = int(round(min(v.get(), mx) * 1000))
-
-            tk.Spinbox(g, from_=0, to=max_val, increment=0.5, textvariable=var,
-                       width=8, bg=FIELD_BG, fg=WHITE, relief="flat", format="%.1f",
-                       buttonbackground=BTN_BG, insertbackground=WHITE,
-                       highlightthickness=1, highlightbackground=EDGE_GOLD,
-                       command=_on_change).grid(row=i, column=1, padx=(12, 16),
-                                                sticky="w")
-            tk.Label(g, text=note, bg=CARD, fg=FAINT,
-                     font=FONT_HINT).grid(row=i, column=2, sticky="w")
-
         # ── Stream Deck API ───────────────────────────────────────────────────
         s = _section("Stream Deck API")
 
@@ -6811,9 +6845,22 @@ class App(tk.Tk):
         """Called when a dashboard ToggleSwitch is clicked."""
         self.cfg[key] = bool(value)
         save_config(self.cfg)
+        self._set_timer_enabled(key, bool(value))
         # Keep Settings panel checkbox in sync if it exists.
         if key == "autoAcceptInvites" and hasattr(self, "_invite_var"):
             self._invite_var.set(bool(value))
+
+    def _set_timer_enabled(self, key: str, enabled: bool):
+        """Dim/undim a toggle's dashboard timer slider to match its state —
+        the slider IS that toggle's setting, so it reads as live only when
+        the automation above it is actually on."""
+        parts = self._timer_widgets.get(key)
+        if not parts:
+            return
+        slider, icon, val_lbl = parts
+        slider.set_enabled(enabled)
+        icon.config(fg=MUTED if enabled else FAINT)
+        val_lbl.config(fg=TEXT if enabled else FAINT)
 
     def _toggle_auto(self, key: str):
         """Flip an automation programmatically (external trigger / hotkey)."""
@@ -6824,6 +6871,7 @@ class App(tk.Tk):
         sw = self._auto_switches.get(key)
         if sw:
             sw.set(active)   # reflect on the dashboard toggle (silent)
+        self._set_timer_enabled(key, active)
         if key == "autoAcceptInvites" and hasattr(self, "_invite_var"):
             self._invite_var.set(active)
 
@@ -6913,8 +6961,6 @@ class App(tk.Tk):
         self.log(f"Ready Up {'enabled' if enabled else 'disabled'}.")
 
     def _save(self):
-        for k, v in self._delay_vars.items():
-            self.cfg[k] = int(round(v.get() * 1000))   # seconds (UI) → ms (config)
         if hasattr(self, "_overlay_enabled_var"):
             self.cfg["overlayEnabled"] = self._overlay_enabled_var.get()
         if hasattr(self, "_ready_up_var"):
