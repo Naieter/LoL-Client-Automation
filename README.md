@@ -82,6 +82,7 @@ Enable it in **Settings → Stream Deck API** by entering a port (e.g. `8778`). 
 - **System tray** — minimizes to tray; can launch hidden at Windows startup
 - **Ultimate Bravery** — rolls a random available champion during champion select
 - **Scouting (beta)** — Porofessor-style lobby intel for both teams whenever the client exposes them: custom lobbies list both sides, champ select includes the enemy team unless Riot hides names for that queue, and the live game always shows all ten
+- **Ban suggestions** — in lobby and champ select the Scouting tab ranks the top 5 champions to ban against the scouted enemies, weighted toward players with narrow champion pools (a one-trick's champion counts far more than the same champion in a wide pool; champions they actually win on count more; already banned or locked champions are skipped). Riot hides enemy identities in ranked solo/flex champ select, so suggestions appear where the enemy roster is visible: Clash, custom and tournament-draft lobbies
 
 ---
 

@@ -4515,6 +4515,7 @@ class App(tk.Tk):
         self._scout_fetching: set  = set() # (name, tag) fetches in flight
         self._scout_source    = ""         # "lobby" / "champ select" / "in game"
         self._scout_glyphs:   dict = {}    # (glyph, px, color) → PhotoImage | False
+        self._scout_banned:   list = []    # champ names already banned/locked this champ select
 
         # Dashboard state
         self._auto_switches: dict = {}   # key → ToggleSwitch
@@ -5194,6 +5195,12 @@ class App(tk.Tk):
                 if r.status_code == 200:
                     phase = str(r.json())
                 roster, source = self._scout_roster_for_phase(phase)
+                # Champions already banned or locked can't be banned any more —
+                # the ban suggestions skip them, so keep that list current.
+                banned = self._scout_current_bans() if phase == "ChampSelect" else []
+                if banned != self._scout_banned:
+                    self._scout_banned = banned
+                    self.after(0, self._render_scouting)
                 if roster is not None:
                     key = (source, tuple(sorted((p["name"], p["tag"], p["ally"])
                                                 for p in roster)))
@@ -5756,6 +5763,116 @@ class App(tk.Tk):
             tags.append(("👻 No public history", MUTED))
         return tags
 
+    def _scout_current_bans(self) -> list:
+        """Champion names already banned, or locked by either team, in the
+        current champ select — nothing on this list can still be banned."""
+        out = []
+        try:
+            r = self._lcu.get("/lol-champ-select/v1/session")
+            if r.status_code != 200:
+                return []
+            sess = r.json()
+            ids = set()
+            for k in ("myTeamBans", "theirTeamBans"):
+                for cid in (sess.get("bans") or {}).get(k, []) or []:
+                    if int(cid or 0):
+                        ids.add(int(cid))
+            for k in ("myTeam", "theirTeam"):
+                for mbr in sess.get(k, []) or []:
+                    cid = int(mbr.get("championId") or 0)
+                    if cid:
+                        ids.add(cid)
+            for grp in sess.get("actions", []) or []:
+                for a in grp:
+                    if a.get("completed") and a.get("type") in ("ban", "pick"):
+                        cid = int(a.get("championId") or 0)
+                        if cid:
+                            ids.add(cid)
+            out = sorted(self.ddragon.name(c) for c in ids)
+        except Exception as e:
+            _dbg(f"[scout] current bans: {e}")
+        return out
+
+    # Queues whose games say nothing about a draft pick.
+    _SCOUT_OFF_MAP = ("ARAM", "URF", "ARENA", "NEXUS", "TUTORIAL")
+
+    @staticmethod
+    def _scout_ban_suggestions(roster, cache, n=5, exclude=()):
+        """Top-n champions to ban against the scouted ENEMY players, weighted
+        toward banning out narrow pools. Pure function of the roster + cache.
+
+        Per enemy, each champion's share of their games is built from the
+        season pool (ranked-preferred top champions) and their recent
+        Summoner's Rift games, weighted by sample size. A player's pool
+        concentration H = Σ share² (1 = pure one-trick, ~0.1 = plays
+        anything). Then
+
+            score(champ, player) = share · (0.4 + H) · confidence · (0.5 + WR)
+
+        so the same share counts about 2.7× more against a one-trick than
+        against a champion-roulette player, a champion they actually win on
+        counts more, and thin samples (confidence = min(1, games/6)) count
+        less. Scores add across enemies who share a champion. Champions in
+        `exclude` (already banned / locked) are skipped.
+
+        Returns [{champ, score, players: [{name, games, total, wr, share,
+        narrow}], why}] best first; [] when no enemy data is cached."""
+        norm = lambda x: _re.sub(r"[^a-z0-9]", "", str(x or "").lower())
+        skip = {norm(x) for x in exclude}
+        agg: dict = {}        # norm champ → {"champ", "score", "players"}
+        for p in roster or []:
+            if p.get("ally") or p.get("bot"):
+                continue
+            data = (cache or {}).get((p["name"], p["tag"])) or {}
+            prof  = data.get("prof") or {}
+            games = [g for g in (data.get("games") or [])
+                     if g.get("champ") and not any(
+                         t in str(g.get("qtype", "")).upper()
+                         for t in App._SCOUT_OFF_MAP)]
+            stats: dict = {}   # norm champ → [games, wins, display name]
+            for c in prof.get("pool") or []:
+                nm = c.get("name") or ""
+                if not nm:
+                    continue
+                st = stats.setdefault(norm(nm), [0, 0, nm])
+                st[0] += int(c.get("play") or 0)
+                st[1] += int(c.get("win") or 0)
+            for g in games:
+                st = stats.setdefault(norm(g["champ"]), [0, 0, g["champ"]])
+                st[0] += 1
+                st[1] += 1 if g.get("result") == "WIN" else 0
+            total = int(prof.get("pool_games") or 0) + len(games)
+            if total <= 0 or not stats:
+                continue
+            shares = {k: v[0] / total for k, v in stats.items()}
+            H = sum(sh * sh for sh in shares.values())
+            for k, (gc, wc, nm) in stats.items():
+                if k in skip or gc <= 0:
+                    continue
+                share = shares[k]
+                wr    = (wc + 2) / (gc + 4)              # smoothed toward 50 %
+                conf  = min(1.0, gc / 6.0)
+                sc    = share * (0.4 + H) * conf * (0.5 + wr)
+                if sc <= 0:
+                    continue
+                ent = agg.setdefault(k, {"champ": nm, "score": 0.0, "players": []})
+                ent["score"] += sc
+                ent["players"].append({
+                    "name": p["name"], "games": gc, "total": total,
+                    "wr": wc / gc if gc else 0.0, "share": share,
+                    "narrow": H >= 0.3 or share >= 0.4,
+                })
+        out = sorted(agg.values(), key=lambda e: -e["score"])[:n]
+        for e in out:
+            bits = []
+            for pl in sorted(e["players"], key=lambda x: -x["share"]):
+                tag = ("one-trick" if pl["share"] >= 0.4 else
+                       "narrow pool" if pl["narrow"] else "")
+                bits.append(f"{pl['name']}: {pl['games']} of {pl['total']} games, "
+                            f"{pl['wr']:.0%} WR" + (f" · {tag}" if tag else ""))
+            e["why"] = "   |   ".join(bits)
+        return out
+
     @staticmethod
     def _scout_duo_tags(roster, cache):
         """Cross-player pattern: shared recent game ids = premade. Returns
@@ -5884,6 +6001,10 @@ class App(tk.Tk):
         allies  = sorted((p for p in roster if p["ally"]), key=by_name)
         enemies = sorted((p for p in roster if not p["ally"]), key=by_name)
 
+        # ── Ban suggestions — only while bans are still possible ──
+        if self._scout_source in ("lobby", "champ select"):
+            self._render_ban_suggestions(host, roster, enemies, wrap_w)
+
         if allies and enemies:
             # Full game: the two teams sit side by side, scoreboard style, in
             # compact cards — ten stacked full-width cards don't fit on screen.
@@ -5909,6 +6030,72 @@ class App(tk.Tk):
             for j, p in enumerate(allies + enemies):
                 self._scout_card(host, p, duo, wrap_w, compact=False,
                                  last=j == n - 1)
+
+    def _render_ban_suggestions(self, host, roster, enemies, wrap_w):
+        """The 'who to ban' block at the top of the Scouting tab: the top 5
+        champions scored by _scout_ban_suggestions over the scouted enemies.
+        In ranked solo/flex champ select Riot hides enemy identities, so
+        there is nothing to score — say so instead of showing nothing."""
+        if not enemies:
+            if self._scout_source == "champ select":
+                tk.Label(host, bg=DARK, fg=FAINT, font=FONT_HINT, justify="left",
+                         wraplength=max(300, wrap_w - 8),
+                         text=("Ban suggestions need the enemy roster — Riot hides "
+                               "it in ranked solo/flex champ select. They appear in "
+                               "Clash, custom and tournament-draft lobbies, where the "
+                               "enemy team is visible.")).pack(anchor="w", pady=(0, 8))
+            return
+        sugg = self._scout_ban_suggestions(roster, self._scout_cache, n=5,
+                                           exclude=self._scout_banned)
+        fetched = sum(1 for p in enemies if not p.get("bot")
+                      and (p["name"], p["tag"]) in self._scout_cache)
+        pending = sum(1 for p in enemies if not p.get("bot")) - fetched
+        head = tk.Frame(host, bg=DARK)
+        head.pack(fill="x", pady=(0, 3))
+        tk.Label(head, text="BAN SUGGESTIONS", bg=DARK, fg=RED,
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        note = ("weighted toward narrow champion pools"
+                + (f"  ·  {pending} enemy fetch{'es' if pending != 1 else ''} pending"
+                   if pending else ""))
+        tk.Label(head, text=note, bg=DARK, fg=FAINT,
+                 font=FONT_HINT).pack(side="left", padx=(10, 0), pady=(2, 0))
+        if not sugg:
+            tk.Label(host, text=("Nothing to ban yet — waiting on enemy data."
+                                 if pending else
+                                 "No enemy champion data to score."),
+                     bg=DARK, fg=FAINT, font=FONT_HINT).pack(anchor="w", pady=(0, 8))
+            return
+        border = tk.Frame(host, bg=CARD_BORDER)
+        border.pack(fill="x", pady=(0, 8))
+        card = tk.Frame(border, bg=CARD)
+        card.pack(fill="x", padx=1, pady=1)
+        top = sugg[0]["score"] or 1.0
+        for i, e in enumerate(sugg):
+            row = tk.Frame(card, bg=CARD)
+            row.pack(fill="x", padx=10, pady=(5 if i == 0 else 2, 5 if i == len(sugg) - 1 else 2))
+            tk.Label(row, text=f"{i + 1}", bg=CARD, fg=FAINT, width=2, anchor="e",
+                     font=("Segoe UI", 9, "bold")).pack(side="left")
+            cid = self.ddragon.find_id_fuzzy(e["champ"])
+            icon = self.get_champ_icon(cid) if cid is not None else None
+            if icon is not None:
+                tk.Label(row, image=icon, bg=CARD, bd=0).pack(side="left", padx=(6, 6))
+            info = tk.Frame(row, bg=CARD)
+            info.pack(side="left", fill="x", expand=True)
+            line = tk.Frame(info, bg=CARD)
+            line.pack(fill="x", anchor="w")
+            tk.Label(line, text=e["champ"], bg=CARD, fg=GOLD,
+                     font=("Segoe UI", 10, "bold")).pack(side="left")
+            # relative-strength bar
+            bar_w = 90
+            bar = tk.Canvas(line, width=bar_w, height=6, bg=CARD,
+                            highlightthickness=0, bd=0)
+            bar.pack(side="left", padx=(10, 0), pady=(5, 0))
+            bar.create_rectangle(0, 0, bar_w, 6, fill=PANEL, outline="")
+            bar.create_rectangle(0, 0, max(4, int(bar_w * e["score"] / top)), 6,
+                                 fill=RED, outline="")
+            tk.Label(info, text=e["why"], bg=CARD, fg=MUTED, font=FONT_HINT,
+                     anchor="w", justify="left",
+                     wraplength=max(240, wrap_w - 110)).pack(anchor="w")
 
     def _scout_card(self, parent, p, duo, wrap_w, compact, last=False):
         """One player card. compact=True is the ten-man two-column mode:

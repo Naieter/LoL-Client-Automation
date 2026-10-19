@@ -672,6 +672,117 @@ class TestOpggRetry(unittest.TestCase):
         urls = [src.splitlines()[ln - 1] + src.splitlines()[ln] for ln in lines]
         self.assertEqual(sum("op.gg" in u or "OPGG_URL" in u for u in urls), 1, urls)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+def _enemy(name, pool=None, games=None, pool_games=None):
+    """(roster entry, cache entry) for one enemy. pool = [(champ, play, win)],
+    games = [(champ, result, qtype)]."""
+    pool = pool or []
+    games = games or []
+    prof = {}
+    if pool:
+        prof["pool"] = [{"id": 0, "name": c, "play": g, "win": w, "lose": g - w}
+                        for c, g, w in pool]
+        prof["pool_games"] = pool_games or sum(g for _, g, _ in pool)
+    return ({"name": name, "tag": "NA1", "ally": False, "bot": False},
+            {"prof": prof,
+             "games": [{"champ": c, "result": r, "qtype": q, "gid": f"{name}{i}"}
+                       for i, (c, r, q) in enumerate(games)],
+             "ok": True})
+
+
+def _scene(*enemies, allies=()):
+    roster, cache = [], {}
+    for r, c in enemies:
+        roster.append(r)
+        cache[(r["name"], r["tag"])] = c
+    for r, c in allies:
+        r = dict(r, ally=True)
+        roster.append(r)
+        cache[(r["name"], r["tag"])] = c
+    return roster, cache
+
+
+class TestBanSuggestions(unittest.TestCase):
+    bans = staticmethod(lol_tool.App._scout_ban_suggestions)
+
+    def test_one_trick_outranks_a_wide_pool_with_same_games(self):
+        # Both played Zed 10 times at 60 % — but Foe has nothing else.
+        roster, cache = _scene(
+            _enemy("Foe", pool=[("Zed", 10, 6)]),
+            _enemy("Wide", pool=[("Zed", 10, 6), ("Ahri", 10, 6), ("Lux", 10, 6),
+                                 ("Jinx", 10, 6), ("Vi", 10, 6)]),
+        )
+        out = self.bans(roster, cache, n=5)
+        zed = next(e for e in out if e["champ"] == "Zed")
+        foe  = next(p for p in zed["players"] if p["name"] == "Foe")
+        wide = next(p for p in zed["players"] if p["name"] == "Wide")
+        self.assertGreater(foe["share"], wide["share"])
+        self.assertTrue(foe["narrow"])
+        self.assertFalse(wide["narrow"])
+        self.assertIn("one-trick", zed["why"])
+        # Foe's contribution alone must beat Wide's whole pool entries
+        wide_only = self.bans(roster[1:], cache, n=1)[0]["score"]
+        foe_only  = self.bans(roster[:1], cache, n=1)[0]["score"]
+        self.assertGreater(foe_only, wide_only * 2)
+
+    def test_winning_champion_scores_above_losing_one(self):
+        roster, cache = _scene(_enemy("Foe", pool=[("Zed", 20, 14), ("Yasuo", 20, 6)]))
+        out = self.bans(roster, cache)
+        self.assertEqual([e["champ"] for e in out], ["Zed", "Yasuo"])
+
+    def test_scores_add_across_enemies_sharing_a_champion(self):
+        roster, cache = _scene(
+            _enemy("A", pool=[("Zed", 10, 5), ("Ahri", 10, 5)]),
+            _enemy("B", pool=[("Zed", 10, 5), ("Lux", 10, 5)]),
+        )
+        out = self.bans(roster, cache)
+        self.assertEqual(out[0]["champ"], "Zed")
+        self.assertEqual(sorted(p["name"] for p in out[0]["players"]), ["A", "B"])
+        self.assertIn("A:", out[0]["why"]); self.assertIn("B:", out[0]["why"])
+
+    def test_allies_and_bots_are_ignored(self):
+        enemy = _enemy("Foe", pool=[("Zed", 10, 6)])
+        ally  = _enemy("Pal", pool=[("Ahri", 30, 20)])
+        roster, cache = _scene(enemy, allies=[ally])
+        bot = {"name": "Bot", "tag": "", "ally": False, "bot": True}
+        roster.append(bot)
+        out = self.bans(roster, cache)
+        self.assertEqual([e["champ"] for e in out], ["Zed"])
+
+    def test_banned_and_locked_champions_are_skipped(self):
+        roster, cache = _scene(_enemy("Foe", pool=[("Zed", 10, 6), ("Kai'Sa", 8, 4)]))
+        out = self.bans(roster, cache, exclude=["Zed", "kaisa"])
+        self.assertEqual(out, [])
+
+    def test_top_n_and_ordering(self):
+        roster, cache = _scene(_enemy("Foe", pool=[(f"C{i}", 10 + i, 5 + i)
+                                                   for i in range(8)]))
+        out = self.bans(roster, cache, n=5)
+        self.assertEqual(len(out), 5)
+        self.assertEqual([e["champ"] for e in out], ["C7", "C6", "C5", "C4", "C3"])
+        self.assertTrue(all(out[i]["score"] >= out[i + 1]["score"]
+                            for i in range(4)))
+
+    def test_recent_sr_games_count_but_aram_does_not(self):
+        roster, cache = _scene(_enemy(
+            "Foe", games=[("Zed", "WIN", "SOLORANKED")] * 5
+                          + [("Jinx", "WIN", "ARAM")] * 10))
+        out = self.bans(roster, cache)
+        self.assertEqual([e["champ"] for e in out], ["Zed"])
+        self.assertEqual(out[0]["players"][0]["games"], 5)
+
+    def test_no_enemy_data_gives_nothing(self):
+        roster = [{"name": "Foe", "tag": "NA1", "ally": False, "bot": False}]
+        self.assertEqual(self.bans(roster, {}), [])
+        self.assertEqual(self.bans([], {}), [])
+        self.assertEqual(self.bans(roster, {("Foe", "NA1"): {"prof": {}, "games": []}}), [])
+
+    def test_why_text_reads_as_a_sentence(self):
+        roster, cache = _scene(_enemy("Foe", pool=[("Zed", 30, 20)], pool_games=40))
+        out = self.bans(roster, cache)
+        self.assertEqual(out[0]["why"], "Foe: 30 of 40 games, 67% WR · one-trick")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     loader = unittest.TestLoader()
@@ -688,6 +799,7 @@ if __name__ == "__main__":
         TestBuildOverlayHelpers,
         TestScoutingBothTeams,
         TestOpggRetry,
+        TestBanSuggestions,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
