@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.21.0"
+APP_VERSION = "1.22.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -101,7 +101,24 @@ ROLE_LABEL = {
     "middle":  "Mid",
     "bottom":  "ADC",
     "utility": "Support",
+    "aram":    "ARAM",     # pseudo-role: the ARAM bench-swap / reroll list
 }
+
+# ARAM has no positions and no bans. Its priority list lives under
+# cfg["roleChampions"]["aram"]["picks"] so the list editor, reorder, remove
+# and icon prefetch all work unchanged — it just isn't one of ROLES, so the
+# draft pick/ban code never sees it.
+ARAM_ROLE      = "aram"
+MAX_ARAM_ITEMS = 15   # ARAM list cap — bench swaps want a deeper pool than 5
+
+# LCU gameMode → op.gg game_mode. op.gg serves ranked / flex / urf / aram /
+# nexus_blitz (verified live); anything else (CLASSIC, PRACTICETOOL, …) gets
+# ranked data.
+OPGG_GAME_MODE = {"ARAM": "aram", "URF": "urf", "ARURF": "urf",
+                  "NEXUSBLITZ": "nexus_blitz"}
+
+def _opgg_mode(game_mode) -> str:
+    return OPGG_GAME_MODE.get(str(game_mode or "").upper(), "ranked")
 
 MAX_PRIORITY_ITEMS = 5   # pick/ban priority list cap; a cross-list drop that
                          # pushes a list past this bumps its 6th champion
@@ -119,6 +136,7 @@ ROLE_SPELLS = {
     "middle":  (4, 14),   # Flash + Ignite
     "bottom":  (4, 7),    # Flash + Heal
     "utility": (4, 14),   # Flash + Ignite
+    "aram":    (4, 32),   # Flash + Mark (ARAM's snowball)
 }
 
 # LCU assignedPosition → op.gg position enum
@@ -167,7 +185,14 @@ DEFAULT_CONFIG = {
     "autoAcceptInvites": False, # auto-accept lobby invites from friends
     "inviteWhitelist":   [],    # restrict to these summoner names; empty = all friends
     "permaBans":    [],      # champion ids always banned first, regardless of role
-    "roleChampions": {role: {"picks": [], "bans": []} for role in ROLES},
+    "autoAramSwap":   True,  # ARAM: swap with a higher-priority bench champion
+    "autoAramReroll": True,  # ARAM: reroll when nothing listed is in hand or on the bench
+    "buildOverlayKey":      "Ctrl+Z",  # global hotkey toggling the build-path overlay
+    "buildOverlayX":        None,      # saved build overlay screen position (None = default)
+    "buildOverlayY":        None,
+    "buildOverlayAutoShow": False,     # pop the build overlay up when the game starts
+    "roleChampions": {role: {"picks": [], "bans": []}
+                      for role in ROLES + [ARAM_ROLE]},
 }
 
 
@@ -181,7 +206,7 @@ def load_config() -> dict:
             for k, v in DEFAULT_CONFIG.items():
                 if k not in cfg:
                     cfg[k] = v
-            for role in ROLES:
+            for role in ROLES + [ARAM_ROLE]:
                 cfg.setdefault("roleChampions", {})
                 if role not in cfg["roleChampions"]:
                     cfg["roleChampions"][role] = {"picks": [], "bans": []}
@@ -376,6 +401,55 @@ SPELL_IMG = {
     21: "SummonerBarrier",  32: "SummonerSnowball", 39: "SummonerSnowball",
 }
 
+OPGG_URL         = "https://mcp-api.op.gg/mcp"
+OPGG_RETRY_DELAY = 15   # seconds to wait before the single retry of a failed lookup
+
+
+class _OpggError(Exception):
+    """op.gg answered, but with an error. `retriable` is False for validation
+    errors (a malformed request fails identically the second time)."""
+    def __init__(self, msg, retriable=True):
+        super().__init__(msg)
+        self.retriable = retriable
+
+
+def _opgg_retry_msg(exc) -> str:
+    return (f"op.gg lookup failed ({type(exc).__name__}: {str(exc)[:80]}) — "
+            f"retrying once in {OPGG_RETRY_DELAY} s.")
+
+
+def _opgg_post(body: dict, timeout: float = 15, on_retry=None) -> str:
+    """POST one op.gg MCP request and return the reply text. A failure — no
+    connection, timeout, HTTP error, or a malformed / error reply — is retried
+    ONCE after OPGG_RETRY_DELAY seconds; if the second attempt fails too, the
+    exception propagates to the caller as before. A JSON-RPC validation error
+    (-32600) is deterministic, so it is not retried.
+
+    Blocks for the delay, so call it from a worker thread — every caller is
+    one. `on_retry(exc)` runs before the wait (log line / status text)."""
+    for attempt in (1, 2):
+        try:
+            r = requests.post(OPGG_URL, json=body, timeout=timeout,
+                              headers={"Accept": "application/json, text/event-stream"})
+            r.raise_for_status()
+            j = r.json()
+            err = j.get("error") if isinstance(j, dict) else None
+            if err:
+                code = err.get("code") if isinstance(err, dict) else None
+                raise _OpggError(str(err)[:160], retriable=(code != -32600))
+            return j["result"]["content"][0]["text"]
+        except Exception as exc:
+            if attempt == 2 or not getattr(exc, "retriable", True):
+                raise
+            _dbg(f"[opgg] attempt 1 failed: {exc!r} — retrying in {OPGG_RETRY_DELAY}s")
+            if on_retry:
+                try:
+                    on_retry(exc)
+                except Exception:
+                    pass
+            time.sleep(OPGG_RETRY_DELAY)
+
+
 def _parse_opgg_record(text: str):
     """Parse op.gg's MCP 'class-schema + positional record' payload into nested
     dicts. The header lines ('class Name: f1,f2,...') define each record type's
@@ -482,6 +556,39 @@ def _parse_opgg_record(text: str):
         return None
 
 
+def _build_summary_lines(data) -> list:
+    """Plain-text rows [(label, text), …] of a build dict from App._fetch_build —
+    the build overlay's text form and what the log prints. [] when there's
+    nothing to show (no data, or an op.gg error)."""
+    if not data or data.get("error"):
+        return []
+    rows = []
+    if data.get("starter"):
+        rows.append(("Start", ", ".join(data["starter"])))
+    if data.get("core"):
+        rows.append(("Core", " › ".join(data["core"])))
+    if data.get("boots"):
+        rows.append(("Boots", ", ".join(data["boots"])))
+    if data.get("situational"):
+        rows.append(("Later", ", ".join(data["situational"])))
+    maxo  = data.get("max_order") or []
+    order = data.get("skill_order") or []
+    if maxo or order:
+        txt = " › ".join(maxo)
+        if order:
+            txt += ("   " if txt else "") + "(start " + " ".join(order[:3]) + ")"
+        rows.append(("Skills", txt))
+    if data.get("spells"):
+        rows.append(("Spells", " + ".join(data["spells"])))
+    prim  = data.get("rune_primary") or []
+    pages = " + ".join(p for p in (data.get("rune_primary_page", ""),
+                                   data.get("rune_secondary_page", "")) if p)
+    if prim or pages:
+        rows.append(("Runes", (prim[0] if prim else "")
+                     + (("  ·  " if prim else "") + pages if pages else "")))
+    return rows
+
+
 # ── DDragon champion data ─────────────────────────────────────────────────────
 class DDragon:
     def __init__(self):
@@ -556,6 +663,29 @@ class DDragon:
             if path.exists() and path.stat().st_size > 0:
                 return path
             url = f"{DDRAGON_URL}/cdn/{self._version}/img/spell/{img}.png"
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                path.write_bytes(r.content)
+                return path
+        except Exception:
+            pass
+        return None
+
+    def item_icon_file(self, item_id: int):
+        """Local cached path to an item's icon PNG (DDragon), downloading it
+        once if needed. None if unavailable (no id / no data / no network)."""
+        try:
+            iid = int(item_id or 0)
+        except (TypeError, ValueError):
+            return None
+        if not iid or not self._version:
+            return None
+        try:
+            self._icon_dir.mkdir(parents=True, exist_ok=True)
+            path = self._icon_dir / f"item_{iid}.png"
+            if path.exists() and path.stat().st_size > 0:
+                return path
+            url = f"{DDRAGON_URL}/cdn/{self._version}/img/item/{iid}.png"
             r = requests.get(url, timeout=8)
             if r.status_code == 200:
                 path.write_bytes(r.content)
@@ -757,6 +887,16 @@ class AutoEngine:
         self._last_tft_poll:        float = 0.0   # throttle TFT gameMode checks
         self._tft_saved_click_value: str  = None  # pre-TFT value pending restore
         self._tft_detected_logged:  bool  = False # already reported this TFT session
+        self.game_mode           = ""    # live session's LCU gameMode ("ARAM", "CLASSIC", "TFT", …)
+        self.queue_id            = 0     # live session's queue id (450 = ARAM)
+        # ARAM champ select (bench mode) — see _handle_aram_select
+        self._aram_initial       = None  # champion the client first dealt us
+        self._aram_user_choice   = None  # champion the USER swapped to manually (respected)
+        self._aram_tool_targets: set = set()  # champions the TOOL swapped/rerolled onto
+        self._aram_pending       = 0.0   # monotonic until which the next champ change is ours
+        self._aram_last_act      = 0.0   # monotonic of the last swap/reroll (throttle)
+        self._aram_champ         = 0     # champion currently in hand
+        self._aram_champ_since   = 0.0   # monotonic when it last changed (import settle)
 
     def start(self):
         self._stop.clear()
@@ -790,8 +930,19 @@ class AutoEngine:
             # No active session — fall back to idle_phase so the overlay
             # updates correctly instead of staying stale as "Lobby" forever.
             phase = idle_phase if idle_phase else "None"
+            self.game_mode, self.queue_id = "", 0
         else:
-            phase = r.json().get("phase", "")
+            sj    = r.json()
+            phase = sj.get("phase", "")
+            # The session's queue tells us the mode (ARAM / CLASSIC / TFT …)
+            # for free on every poll — the Builds tab and the build overlay
+            # follow it, and the ARAM handler uses it as a second signal.
+            q = (sj.get("gameData") or {}).get("queue") or {}
+            self.game_mode = str(q.get("gameMode") or "")
+            try:
+                self.queue_id = int(q.get("id") or 0)
+            except (TypeError, ValueError):
+                self.queue_id = 0
 
         # Definitive champ-select probe: BOTH gameflow endpoints have been seen
         # in the wild reporting 'Lobby' through an entire champ select, which
@@ -835,6 +986,13 @@ class AutoEngine:
                 self._items_key      = None
                 self._last_role      = None
                 self._last_state_key = None   # force [tick] on first poll
+                self._aram_initial      = None
+                self._aram_user_choice  = None
+                self._aram_tool_targets = set()
+                self._aram_pending      = 0.0
+                self._aram_last_act     = 0.0
+                self._aram_champ        = 0
+                self._aram_champ_since  = 0.0
                 self._champ_select_start = time.monotonic()  # for pre-pick delay
                 # A game started — the ready cycle is done; clear my ready state.
                 self._i_am_ready = False
@@ -1003,6 +1161,14 @@ class AutoEngine:
         if r.status_code != 200:
             return
         session = r.json()
+
+        # ARAM (any bench lobby): no bans and no pick turns — the client deals
+        # a champion and the bench is the only choice. The draft logic below
+        # would find nothing to act on, but it must never touch a bench lobby,
+        # so hand the whole session to the ARAM handler instead.
+        if session.get("benchEnabled") or self.game_mode.upper() == "ARAM":
+            self._handle_aram_select(cfg, session)
+            return
 
         # ── bans + ally pick intents (reference: bans list + championPickIntent) ──
         bans: set = set()
@@ -1411,6 +1577,153 @@ class AutoEngine:
                     daemon=True,
                 ).start()
 
+    # ── ARAM champion select ──────────────────────────────────────────────────
+    # ARAM has no pick/ban turns: the client deals everyone a random champion
+    # and the only choices are swapping with the bench (champions teammates
+    # rolled away) or rerolling. The ARAM priority list (Champions → ARAM)
+    # drives both:
+    #   • swap whenever the bench holds a champion ranked above the one in hand
+    #     (POST /lol-champ-select/v1/session/bench/swap/{championId});
+    #   • reroll only when neither the champion in hand nor anything on the
+    #     bench is on the list at all — a reroll is never spent on a roll that
+    #     was already fine (POST /lol-champ-select/v1/session/my-selection/reroll).
+    # A champion the USER swaps to by hand is respected: the tool stops
+    # swapping and rerolling for the rest of that champ select. Runes, spells
+    # and the item set import once the champion in hand has stayed put for a
+    # few seconds, so a run of swaps doesn't hammer op.gg or the client.
+    ARAM_ACT_GAP     = 1.5   # s between swaps/rerolls (the bench needs a beat to update)
+    ARAM_IMPORT_WAIT = 3.0   # s a champion must stay in hand before imports fire
+
+    @staticmethod
+    def _aram_bench_ids(session: dict) -> list:
+        """Bench champion ids from either LCU shape: benchChampions[{championId}]
+        (current client) or benchChampionIds[int] (older builds)."""
+        ids = []
+        for b in session.get("benchChampions") or []:
+            try:
+                cid = int((b.get("championId") if isinstance(b, dict) else b) or 0)
+            except (TypeError, ValueError):
+                continue
+            if cid:
+                ids.append(cid)
+        if not ids:
+            for b in session.get("benchChampionIds") or []:
+                try:
+                    cid = int(b or 0)
+                except (TypeError, ValueError):
+                    continue
+                if cid:
+                    ids.append(cid)
+        return ids
+
+    @staticmethod
+    def _aram_swap_target(priority: list, current: int, bench: list):
+        """The bench champion to swap to — the highest-priority listed champion
+        on the bench, and only if it outranks the champion in hand — or None."""
+        rank = {int(c): i for i, c in enumerate(priority)}
+        best_rank = rank.get(int(current or 0), len(priority))
+        best = None
+        for cid in bench:
+            r = rank.get(int(cid))
+            if r is not None and r < best_rank:
+                best, best_rank = int(cid), r
+        return best
+
+    @staticmethod
+    def _aram_should_reroll(priority: list, current: int, bench: list,
+                            rerolls_remaining, allow=True) -> bool:
+        """Reroll only when it can't make things worse: there is a list, rerolls
+        are left, and neither the champion in hand nor any bench champion is
+        on the list."""
+        try:
+            left = int(rerolls_remaining or 0)
+        except (TypeError, ValueError):
+            left = 0
+        if not allow or not priority or left <= 0:
+            return False
+        wanted = {int(c) for c in priority}
+        if int(current or 0) in wanted:
+            return False
+        return not any(int(c) in wanted for c in bench)
+
+    def _handle_aram_select(self, cfg: dict, session: dict):
+        my_cell = str(session.get("localPlayerCellId"))
+        me = next((p for p in session.get("myTeam", [])
+                   if str(p.get("cellId", "")) == my_cell), {})
+        current = int(me.get("championId", 0) or 0)
+        bench   = self._aram_bench_ids(session)
+        prio    = [int(c) for c in cfg.get("roleChampions", {})
+                   .get(ARAM_ROLE, {}).get("picks", [])]
+        now     = time.monotonic()
+        nm      = (lambda c: self._dd.name(c)) if self._dd else (lambda c: f"#{c}")
+
+        # Track the champion in hand: for the import settle timer, and to tell
+        # the user's own swap from one of ours.
+        if current != self._aram_champ:
+            self._aram_champ, self._aram_champ_since = current, now
+            if current:
+                if self._aram_initial is None:
+                    self._aram_initial = current
+                elif now < self._aram_pending or current in self._aram_tool_targets:
+                    self._aram_tool_targets.add(current)   # our swap/reroll landed
+                    self._aram_pending = 0.0
+                elif self._aram_user_choice != current:
+                    self._aram_user_choice = current
+                    self._log(f"You swapped to {nm(current)} — keeping it.")
+
+        _key = f"aram|{current}|{bench}|{session.get('rerollsRemaining')}"
+        if _key != getattr(self, "_last_state_key", None):
+            self._log(f"[tick] ARAM champ={current} bench={bench} "
+                      f"rerolls={session.get('rerollsRemaining')} prio={prio}")
+            self._last_state_key = _key
+
+        user_locked = (self._aram_user_choice is not None
+                       and current == self._aram_user_choice)
+        if (prio and current and not user_locked
+                and now - self._aram_last_act >= self.ARAM_ACT_GAP):
+            target = (self._aram_swap_target(prio, current, bench)
+                      if cfg.get("autoAramSwap") else None)
+            if target:
+                r = self._lcu.post(f"/lol-champ-select/v1/session/bench/swap/{target}")
+                self._aram_last_act = now
+                if r.status_code in (200, 204):
+                    self._aram_tool_targets.add(target)
+                    self._aram_pending = now + 4.0
+                    self._log(f"ARAM: swapped {nm(current)} → {nm(target)} from the bench.")
+                else:
+                    self._log(f"[debug] ARAM swap HTTP {r.status_code} {r.text[:120]}")
+            elif cfg.get("autoAramReroll") and self._aram_should_reroll(
+                    prio, current, bench, session.get("rerollsRemaining", 0),
+                    session.get("allowRerolling", True)):
+                r = self._lcu.post("/lol-champ-select/v1/session/my-selection/reroll")
+                self._aram_last_act = now
+                if r.status_code in (200, 204):
+                    self._aram_pending = now + 4.0   # whatever lands next is ours
+                    self._log(f"ARAM: rerolled {nm(current)} — nothing on your "
+                              f"list in hand or on the bench.")
+                else:
+                    self._log(f"[debug] ARAM reroll HTTP {r.status_code} {r.text[:120]}")
+
+        # ── Imports once the champion in hand has settled ──
+        if current and now - self._aram_champ_since >= self.ARAM_IMPORT_WAIT:
+            key = (current, ARAM_ROLE)
+            do_runes  = bool(cfg.get("autoRunes"))
+            do_spells = bool(cfg.get("autoSpells"))
+            if (do_runes or do_spells) and key != self._runes_key:
+                self._runes_key = key
+                threading.Thread(
+                    target=self._import_runes_spells,
+                    args=(current, ARAM_ROLE, do_runes, do_spells),
+                    daemon=True,
+                ).start()
+            if cfg.get("autoItems") and key != self._items_key:
+                self._items_key = key
+                threading.Thread(
+                    target=self._import_item_set,
+                    args=(current, ARAM_ROLE),
+                    daemon=True,
+                ).start()
+
     def _import_runes_spells(self, champ_id: int, position: str,
                              do_runes: bool = True, do_spells: bool = True):
         """Import the meta rune page and/or summoner spells for the locked-in
@@ -1422,7 +1735,11 @@ class AutoEngine:
             return
         try:
             champ_name = self._dd.opgg_name(champ_id) if self._dd else None
-            opgg_pos   = OPGG_POSITION.get((position or "").lower())
+            aram       = (position or "").lower() == ARAM_ROLE
+            mode       = "aram" if aram else "ranked"
+            # op.gg requires a position even for ARAM and then ignores it.
+            opgg_pos   = "mid" if aram else OPGG_POSITION.get((position or "").lower())
+            pos_label  = "ARAM" if aram else opgg_pos
             label      = self._dd.name(champ_id) if self._dd else f"#{champ_id}"
 
             prim = sub = None
@@ -1431,10 +1748,10 @@ class AutoEngine:
 
             # ── Primary: op.gg Diamond+ for this champion + role ──
             if champ_name and opgg_pos:
-                data = self._opgg_runes(champ_name, opgg_pos)
+                data = self._opgg_runes(champ_name, opgg_pos, mode)
                 if data:
                     prim, perks, sub, spells = data
-                    self._log(f"Runes: using Diamond+ meta for {label} ({opgg_pos}).")
+                    self._log(f"Runes: using Diamond+ meta for {label} ({pos_label}).")
 
             # ── Fallback: League client's own recommended page ──
             if not (prim and sub and perks):
@@ -1493,10 +1810,11 @@ class AutoEngine:
         except Exception as e:
             self._log(f"[runes] error: {e}")
 
-    def _opgg_runes(self, champ_name: str, opgg_pos: str):
+    def _opgg_runes(self, champ_name: str, opgg_pos: str, mode: str = "ranked"):
         """Query op.gg for the most-played Diamond+ rune page + spells for this
-        champion and role. Returns (primary_style, perk_ids, sub_style, spell_ids)
-        or None. perk_ids = keystone+primary minors + secondary minors + shards."""
+        champion and role (or ARAM, mode="aram"). Returns (primary_style,
+        perk_ids, sub_style, spell_ids) or None. perk_ids = keystone+primary
+        minors + secondary minors + shards."""
         try:
             body = {
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -1506,7 +1824,7 @@ class AutoEngine:
                         "champion":  champ_name,
                         "position":  opgg_pos,
                         "tier":      "diamond_plus",
-                        "game_mode": "ranked",
+                        "game_mode": mode,
                         "desired_output_fields": [
                             "data.runes.primary_page_id",
                             "data.runes.primary_rune_ids",
@@ -1518,12 +1836,8 @@ class AutoEngine:
                     },
                 },
             }
-            r = requests.post(
-                "https://mcp-api.op.gg/mcp", json=body, timeout=15,
-                headers={"Accept": "application/json, text/event-stream"},
-            )
-            r.raise_for_status()
-            text = r.json()["result"]["content"][0]["text"]
+            text = _opgg_post(
+                body, 15, on_retry=lambda e: self._log(_opgg_retry_msg(e)))
 
             m = _re.search(
                 r"Runes\((\d+),\[([\d,]+)\],(\d+),\[([\d,]+)\],\[([\d,]+)\]",
@@ -1567,9 +1881,9 @@ class AutoEngine:
         except Exception:
             pass
 
-    def _opgg_items(self, champ_name: str, opgg_pos: str):
-        """op.gg Diamond+ item IDs for a champion + role. Returns a dict with
-        {starter, core, boots, situational} id lists, or None."""
+    def _opgg_items(self, champ_name: str, opgg_pos: str, mode: str = "ranked"):
+        """op.gg Diamond+ item IDs for a champion + role (or ARAM, mode="aram").
+        Returns a dict with {starter, core, boots, situational} id lists, or None."""
         try:
             body = {
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -1577,7 +1891,7 @@ class AutoEngine:
                     "name": "lol_get_champion_analysis",
                     "arguments": {
                         "champion": champ_name, "position": opgg_pos,
-                        "tier": "diamond_plus", "game_mode": "ranked",
+                        "tier": "diamond_plus", "game_mode": mode,
                         "desired_output_fields": [
                             "data.starter_items.ids", "data.core_items.ids",
                             "data.boots.ids", "data.fourth_items[].ids",
@@ -1586,10 +1900,8 @@ class AutoEngine:
                     },
                 },
             }
-            r = requests.post("https://mcp-api.op.gg/mcp", json=body, timeout=15,
-                              headers={"Accept": "application/json, text/event-stream"})
-            r.raise_for_status()
-            rec = _parse_opgg_record(r.json()["result"]["content"][0]["text"])
+            rec = _parse_opgg_record(_opgg_post(
+                body, 15, on_retry=lambda e: self._log(_opgg_retry_msg(e))))
         except Exception as e:
             self._log(f"[items] op.gg fetch failed: {e}")
             return None
@@ -1622,11 +1934,14 @@ class AutoEngine:
         to the League client. Worker thread. Replaces our own prior set."""
         try:
             champ_name = self._dd.opgg_name(champ_id) if self._dd else None
-            opgg_pos   = OPGG_POSITION.get((position or "").lower())
+            aram       = (position or "").lower() == ARAM_ROLE
+            mode       = "aram" if aram else "ranked"
+            opgg_pos   = "mid" if aram else OPGG_POSITION.get((position or "").lower())
+            pos_label  = "ARAM" if aram else opgg_pos
             label      = self._dd.name(champ_id) if self._dd else f"#{champ_id}"
             if not (champ_name and opgg_pos):
                 return
-            items = self._opgg_items(champ_name, opgg_pos)
+            items = self._opgg_items(champ_name, opgg_pos, mode)
             if not items:
                 self._log(f"Items: no Diamond+ item data for {label}.")
                 return
@@ -1665,18 +1980,18 @@ class AutoEngine:
                 return
 
             new_set = {
-                "title": f"op.gg: {label} ({opgg_pos})",
+                "title": f"op.gg: {label} ({pos_label})",
                 "type": "custom", "map": "any", "mode": "any",
                 "priority": False, "sortrank": 0, "startedFrom": "blank",
                 "associatedChampions": [int(champ_id)],
-                "associatedMaps": [11, 12],
+                "associatedMaps": [12] if aram else [11, 12],
                 "uid": str(_uuid.uuid4()),
                 "blocks": blocks,
             }
             data["itemSets"] = [new_set] + existing
             pr = self._lcu.put(f"/lol-item-sets/v1/item-sets/{sid}/sets", data)
             if pr.status_code in (200, 201, 204):
-                self._log(f"Imported item set for {label} ({opgg_pos}).")
+                self._log(f"Imported item set for {label} ({pos_label}).")
             else:
                 self._log(f"[items] PUT sets HTTP {pr.status_code} {pr.text[:150]}")
                 _dbg(f"[items] PUT failed HTTP {pr.status_code} {pr.text[:300]}")
@@ -2932,7 +3247,7 @@ class ChampionList(tk.Frame):
 class RolePanel:
     """The pick + ban list editor for a single role."""
 
-    def __init__(self, parent: tk.Widget, role: str, app: "App"):
+    def __init__(self, parent: tk.Widget, role: str, app: "App", aram: bool = False):
         self._role = role
         self._app  = app
         self._widgets: dict = {}
@@ -2940,6 +3255,18 @@ class RolePanel:
 
         self._wrap = wrap = tk.Frame(parent, bg=DARK)
         wrap.pack(fill="both", expand=True, padx=24, pady=(6, 16))
+        if aram:
+            # ARAM: one deeper list — no bans, no positions. The top of the
+            # list is what the tool swaps to first when it shows on the bench.
+            wrap.columnconfigure(0, weight=1)
+            wrap.rowconfigure(0, weight=1)
+            self._build_side(
+                wrap, 0, "picks", "ARAM Priority", TEAL, full=True,
+                cap=MAX_ARAM_ITEMS,
+                hint=("Top = swapped to first  ·  the tool takes the best listed "
+                      "champion off the bench, and rerolls only when nothing "
+                      "listed is in hand or on the bench"))
+            return
         wrap.columnconfigure(0, weight=1, uniform="rp")
         wrap.columnconfigure(1, weight=1, uniform="rp")
         wrap.rowconfigure(0, weight=1)
@@ -2987,13 +3314,14 @@ class RolePanel:
             self._flying.place_forget()
 
     def _build_side(self, parent, col: int, list_key: str,
-                    title: str, accent: str):
+                    title: str, accent: str, hint: str = "Top = highest priority",
+                    cap: int = MAX_PRIORITY_ITEMS, full: bool = False):
         role  = self._role
         app   = self._app
 
         card = HexCard(parent, fill=CARD, border=CARD_BORDER)
-        card.grid(row=0, column=col, sticky="nsew", padx=(0, 6) if col == 0
-                  else (6, 0))
+        card.grid(row=0, column=col, sticky="nsew",
+                  padx=(0, 0) if full else ((0, 6) if col == 0 else (6, 0)))
         container = card.body
 
         hdr = tk.Frame(container, bg=CARD)
@@ -3004,8 +3332,8 @@ class RolePanel:
         dia.pack(side="left", padx=(0, 8), pady=(3, 0))
         tk.Label(hdr, text=title.upper(), bg=CARD, fg=accent,
                  font=FONT_SECTION).pack(side="left")
-        tk.Label(container, text="Top = highest priority",
-                 bg=CARD, fg=FAINT, font=FONT_HINT).pack(anchor="w", padx=14)
+        tk.Label(container, text=hint, bg=CARD, fg=FAINT, font=FONT_HINT,
+                 wraplength=640, justify="left").pack(anchor="w", padx=14)
 
         champ_list = ChampionList(
             container, accent, bg=CARD, get_icon=app.get_champ_icon,
@@ -3057,8 +3385,8 @@ class RolePanel:
             if cid not in lst:
                 lst.insert(0, cid)                       # newest goes to the top
                 bumped = None
-                if len(lst) > MAX_PRIORITY_ITEMS:        # keep only the top 5
-                    bumped = lst.pop(MAX_PRIORITY_ITEMS)
+                if len(lst) > cap:                       # keep only the top N
+                    bumped = lst.pop(cap)
                 save_config(app.cfg)       # persist immediately
                 app.refresh_list(_role, _list_key)
                 app.request_icon_prefetch()
@@ -3068,7 +3396,7 @@ class RolePanel:
                 )
                 if bumped is not None:
                     app.log(f"{ROLE_LABEL[_role]} {_list_key[:-1]} list capped at "
-                            f"{MAX_PRIORITY_ITEMS} — removed {app.ddragon.name(bumped)}.")
+                            f"{cap} — removed {app.ddragon.name(bumped)}.")
             _ev.set("")
             _ac.pack_forget()
 
@@ -3223,10 +3551,14 @@ def _make_api_handler(app):
                     except Exception: pass
                 threading.Thread(target=_do, daemon=True).start()
                 self._respond({"ok": True, "action": "accept"})
+            elif path == "/build-overlay":
+                app.after(0, app._toggle_build_overlay)
+                self._respond({"ok": True, "action": "build-overlay"})
             elif path == "/status":
                 eng = app._engine
                 self._respond({
                     "phase":         getattr(eng, "_last_phase",    ""),
+                    "game_mode":     getattr(eng, "game_mode",      ""),
                     "ready":         getattr(eng, "_i_am_ready",    False),
                     "ready_count":   getattr(eng, "_ready_count",   0),
                     "present_count": getattr(eng, "_present_count", 0),
@@ -3255,7 +3587,7 @@ def _start_local_api(app, port: int):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         app.log(
             f"Stream Deck API → http://127.0.0.1:{port}"
-            f"  (GET /ready-up  /accept  /status)"
+            f"  (GET /ready-up  /accept  /build-overlay  /status)"
         )
     except OSError as e:
         app.log(f"[api] Could not bind port {port}: {e}")
@@ -3786,6 +4118,351 @@ class LCUOverlay:
 
 
 
+# ── Build-path overlay ────────────────────────────────────────────────────────
+class BuildOverlay:
+    """Frameless always-on-top panel with the recommended build path for the
+    champion loaded on the Builds tab — ranked or ARAM, whichever the Builds
+    tab is showing (it auto-follows champ select). Toggled by a global hotkey
+    (default Ctrl+Z), draggable, remembers where you left it.
+
+    It is an ordinary topmost window, so it shows over the League client and
+    over the game in Borderless / Windowed mode. Exclusive Fullscreen hides
+    every overlay on Windows — nothing to be done about that here."""
+
+    _BG, _HDR, _EDGE = "#0A1428", "#06101E", "#785A28"
+    _GOLD, _TEXT, _MUTED, _FAINT, _TEAL = ("#C8AA6E", "#F0E6D2", "#A09B8C",
+                                           "#5B5A56", "#0AC8B9")
+    _FONT    = "Segoe UI"
+    _ICON    = 30     # item icon size, px
+    _WRAP    = 330    # text wrap width inside the panel, px
+    _ABILITY = {"Q": "#0AC8B9", "W": "#3CBF6A", "E": "#C8AA6E", "R": "#E04040"}
+    _WS_EX_NOACTIVATE = 0x08000000
+    _WS_EX_TOOLWINDOW = 0x00000080
+
+    def __init__(self, app: "App"):
+        self._app     = app
+        self._data    = None
+        self._visible = False
+        self._drag_x  = self._drag_y = 0
+        self._dragged = False
+        self._photos: list = []   # PhotoImage refs the labels need kept alive
+        self._tip     = None
+
+        win = tk.Toplevel(app)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.wm_attributes("-topmost", True)
+        win.wm_attributes("-alpha", 0.95)
+        win.configure(bg=self._EDGE)      # 1-px gold edge around the body
+        self._win  = win
+        self._body = tk.Frame(win, bg=self._BG)
+        self._body.pack(fill="both", expand=True, padx=1, pady=1)
+        self._render()
+
+    # ── public ────────────────────────────────────────────────────────────────
+    def is_visible(self) -> bool:
+        return self._visible
+
+    def toggle(self):
+        if self._visible:
+            self.hide()
+        else:
+            self.show()
+
+    def show(self):
+        self._visible = True
+        self._render()
+        self._place()
+        self._win.deiconify()
+        self._win.lift()
+        self._win.wm_attributes("-topmost", True)
+        self._no_activate()
+
+    def hide(self):
+        self._visible = False
+        self._hide_tip()
+        self._win.withdraw()
+
+    def set_data(self, data):
+        """New build data from the Builds tab (a build dict, an {'error': …}
+        dict, or None)."""
+        self._data = data
+        if self._visible:
+            self._render()
+            self._place()
+
+    def set_phase(self, phase: str):
+        cfg = self._app.cfg
+        if (phase == "InProgress" and cfg.get("buildOverlayAutoShow")
+                and not self._visible):
+            self._app._set_build_overlay_visible(True)
+        elif phase in ("PreEndOfGame", "EndOfGame", "WaitingForStats") \
+                and self._visible:
+            self._app._set_build_overlay_visible(False)   # game over — get out of the way
+
+    def reset_position(self):
+        cfg = self._app.cfg
+        cfg["buildOverlayX"] = None
+        cfg["buildOverlayY"] = None
+        save_config(cfg)
+        if self._visible:
+            self._place()
+
+    # ── window plumbing ───────────────────────────────────────────────────────
+    def _no_activate(self):
+        """Never take keyboard focus: clicking or dragging the panel must not
+        pull focus off the game. Applied to the Tk wrapper AND the inner window
+        (Tk wraps a Toplevel; GetAncestor finds the real top-level)."""
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetAncestor.restype  = ctypes.c_void_p
+            user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            inner = self._win.winfo_id()
+            root  = user32.GetAncestor(inner, 2) or inner
+            for hwnd in {inner, root}:
+                style = user32.GetWindowLongW(hwnd, -20)
+                user32.SetWindowLongW(
+                    hwnd, -20,
+                    style | self._WS_EX_NOACTIVATE | self._WS_EX_TOOLWINDOW)
+                # NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED — commit the style
+                user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                                    0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020)
+        except Exception as exc:
+            _dbg(f"[build-overlay] no-activate: {exc}")
+
+    def _place(self):
+        cfg = self._app.cfg
+        x, y = cfg.get("buildOverlayX"), cfg.get("buildOverlayY")
+        if x is None or y is None:
+            x, y = 24, 110          # top-left, clear of the in-game HUD
+        self._win.update_idletasks()
+        w, h = self._win.winfo_reqwidth(), self._win.winfo_reqheight()
+        # Keep it on the virtual desktop: a spot saved on a monitor that is
+        # gone would otherwise leave it invisible. Metrics are physical px;
+        # Tk geometry is logical, hence the DPI scale.
+        try:
+            u  = ctypes.windll.user32
+            sc = LCUOverlay._dpi_scale() or 1.0
+            vx, vy = u.GetSystemMetrics(76) / sc, u.GetSystemMetrics(77) / sc
+            vw, vh = u.GetSystemMetrics(78) / sc, u.GetSystemMetrics(79) / sc
+            x = max(vx, min(float(x), vx + vw - w))
+            y = max(vy, min(float(y), vy + vh - h))
+        except Exception:
+            pass
+        self._win.geometry(f"+{int(x)}+{int(y)}")
+
+    # ── drag anywhere on the panel (except the ✕) ─────────────────────────────
+    def _bind_drag(self, widget):
+        if getattr(widget, "_no_drag", False):
+            return
+        widget.bind("<ButtonPress-1>",   self._drag_start)
+        widget.bind("<B1-Motion>",       self._drag_move)
+        widget.bind("<ButtonRelease-1>", self._drag_end)
+        for ch in widget.winfo_children():
+            self._bind_drag(ch)
+
+    def _drag_start(self, event):
+        self._drag_x  = event.x_root - self._win.winfo_x()
+        self._drag_y  = event.y_root - self._win.winfo_y()
+        self._dragged = False
+
+    def _drag_move(self, event):
+        self._dragged = True
+        self._hide_tip()
+        self._win.geometry(f"+{event.x_root - self._drag_x}+{event.y_root - self._drag_y}")
+
+    def _drag_end(self, _event):
+        if not self._dragged:
+            return
+        cfg = self._app.cfg
+        cfg["buildOverlayX"] = self._win.winfo_x()
+        cfg["buildOverlayY"] = self._win.winfo_y()
+        save_config(cfg)
+
+    # ── tooltips (item names under the cursor) ────────────────────────────────
+    def _tip_bind(self, widget, text):
+        def _show(_e):
+            self._hide_tip()
+            try:
+                x = widget.winfo_rootx()
+                y = widget.winfo_rooty() + widget.winfo_height() + 4
+                t = tk.Toplevel(widget)
+                t.wm_overrideredirect(True)
+                t.wm_attributes("-topmost", True)
+                t.wm_geometry(f"+{x}+{y}")
+                tk.Label(t, text=text, bg=TIP_BG, fg=TEXT, font=FONT_HINT,
+                         padx=7, pady=4, relief="solid", borderwidth=1).pack()
+                self._tip = t
+            except Exception:
+                pass
+        widget.bind("<Enter>", _show)
+        widget.bind("<Leave>", lambda _e: self._hide_tip())
+
+    def _hide_tip(self):
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+    # ── rendering ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _pairs(data, key):
+        """[(item id, item name)] for a build list, ids padded with 0."""
+        names = data.get(key) or []
+        ids   = data.get(f"{key}_ids") or []
+        return [(int(ids[i]) if i < len(ids) and ids[i] else 0, n)
+                for i, n in enumerate(names)]
+
+    def _row(self, parent, label):
+        row = tk.Frame(parent, bg=self._BG)
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text=label, bg=self._BG, fg=self._FAINT, width=7, anchor="w",
+                 font=(self._FONT, 8, "bold")).pack(side="left")
+        return row
+
+    def _item_row(self, parent, label, pairs, sep=None):
+        if not pairs:
+            return
+        row = self._row(parent, label)
+        for i, (iid, name) in enumerate(pairs):
+            if sep and i:
+                tk.Label(row, text=sep, bg=self._BG, fg=self._FAINT,
+                         font=(self._FONT, 10)).pack(side="left", padx=2)
+            photo = self._app._item_photo(iid, self._ICON) if iid else None
+            if photo is not None:
+                self._photos.append(photo)
+                lbl = tk.Label(row, image=photo, bg=self._BG, bd=0)
+                lbl.pack(side="left", padx=(0, 3))
+                self._tip_bind(lbl, name)
+            else:
+                tk.Label(row, text=name, bg=self._BG, fg=self._TEXT,
+                         font=(self._FONT, 9)).pack(side="left", padx=(0, 6))
+
+    def _render(self):
+        for w in self._body.winfo_children():
+            w.destroy()
+        self._photos.clear()
+        self._hide_tip()
+        app, d, B = self._app, self._data, self._BG
+        ok = bool(d) and not d.get("error")
+
+        # ── header: champion · mode · win rate | hotkey · ✕ ──
+        hdr = tk.Frame(self._body, bg=self._HDR)
+        hdr.pack(fill="x")
+        tk.Frame(self._body, bg=self._EDGE, height=1).pack(fill="x")
+        name = str(d.get("champion", "") or "") if ok else "BUILD PATH"
+        icon = None
+        if ok:
+            try:
+                cid  = app.ddragon.find_id_fuzzy(name)
+                icon = app.get_champ_icon(cid) if cid is not None else None
+            except Exception:
+                icon = None
+        if icon is not None:
+            tk.Label(hdr, image=icon, bg=self._HDR, bd=0).pack(
+                side="left", padx=(10, 6), pady=6)
+        else:
+            dia = tk.Canvas(hdr, width=12, height=12, bg=self._HDR,
+                            highlightthickness=0, bd=0)
+            dia.create_polygon(6, 0, 12, 6, 6, 12, 0, 6,
+                               fill=self._GOLD, outline=self._GOLD)
+            dia.pack(side="left", padx=(12, 8))
+        tk.Label(hdr, text=name.upper(), bg=self._HDR, fg=self._GOLD,
+                 font=(self._FONT, 11, "bold")).pack(side="left", pady=8)
+        if ok:
+            sub = str(d.get("position", "") or "").upper().replace("_", " ")
+            wr  = d.get("win_rate")
+            if isinstance(wr, (int, float)):
+                sub += f"  ·  {round(wr * 100)}% WR"
+            tk.Label(hdr, text=sub, bg=self._HDR, fg=self._MUTED,
+                     font=(self._FONT, 8)).pack(side="left", padx=(8, 0), pady=(10, 8))
+        close = tk.Label(hdr, text="✕", bg=self._HDR, fg=self._MUTED,
+                         font=(self._FONT, 10, "bold"), cursor="hand2", padx=8)
+        close.pack(side="right", pady=6)
+        close._no_drag = True
+        close.bind("<Button-1>", lambda _e: app._set_build_overlay_visible(False))
+        close.bind("<Enter>", lambda _e: close.config(fg=self._TEXT))
+        close.bind("<Leave>", lambda _e: close.config(fg=self._MUTED))
+        combo = _overlay_combo_label(app.cfg.get("buildOverlayKey") or "")
+        if combo != "None":
+            tk.Label(hdr, text=combo, bg=self._HDR, fg=self._FAINT,
+                     font=(self._FONT, 8)).pack(side="right", padx=(0, 2))
+
+        if not ok:
+            msg = ((d or {}).get("error")
+                   or "No build loaded yet.\nHover or lock a champion in champ "
+                      "select, or search one on the Builds tab.")
+            tk.Label(self._body, text=msg, bg=B, fg=self._MUTED,
+                     font=(self._FONT, 9), justify="left",
+                     wraplength=self._WRAP).pack(anchor="w", padx=14, pady=12)
+            self._bind_drag(self._body)
+            return
+
+        grid = tk.Frame(self._body, bg=B)
+        grid.pack(fill="x", padx=12, pady=(8, 8))
+
+        self._item_row(grid, "START", self._pairs(d, "starter"))
+        self._item_row(grid, "CORE",  self._pairs(d, "core"), sep="›")
+        self._item_row(grid, "BOOTS", self._pairs(d, "boots"))
+        self._item_row(grid, "LATER", self._pairs(d, "situational"))
+
+        # ── skills: max order, then the level 1-3 opener ──
+        maxo  = d.get("max_order") or []
+        order = d.get("skill_order") or []
+        if maxo or order:
+            row = self._row(grid, "SKILLS")
+            for i, a in enumerate(maxo):
+                if i:
+                    tk.Label(row, text="›", bg=B, fg=self._FAINT,
+                             font=(self._FONT, 10)).pack(side="left", padx=3)
+                tk.Label(row, text=a, bg=B, fg=self._ABILITY.get(a, self._TEXT),
+                         font=(self._FONT, 12, "bold")).pack(side="left")
+            if order:
+                tk.Label(row, text="start " + " ".join(order[:3]), bg=B,
+                         fg=self._MUTED, font=(self._FONT, 8)).pack(
+                    side="left", padx=(12, 0), pady=(3, 0))
+
+        # ── summoner spells (icons, else names) ──
+        sids = d.get("spell_ids") or []
+        if sids:
+            row = self._row(grid, "SPELLS")
+            for sid in sids[:2]:
+                photo = app._spell_photo(sid, 26)
+                if photo is not None:
+                    self._photos.append(photo)
+                    tk.Label(row, image=photo, bg=B, bd=0).pack(side="left", padx=(0, 4))
+                else:
+                    tk.Label(row, text=_spell_name(sid), bg=B, fg=self._TEXT,
+                             font=(self._FONT, 9)).pack(side="left", padx=(0, 8))
+        elif d.get("spells"):
+            row = self._row(grid, "SPELLS")
+            tk.Label(row, text=" + ".join(d["spells"]), bg=B, fg=self._TEXT,
+                     font=(self._FONT, 9)).pack(side="left")
+
+        # ── runes: keystone + pages, minors beneath ──
+        prim  = d.get("rune_primary") or []
+        pages = " + ".join(p for p in (d.get("rune_primary_page", ""),
+                                       d.get("rune_secondary_page", "")) if p)
+        if prim or pages:
+            row = self._row(grid, "RUNES")
+            if prim:
+                tk.Label(row, text=prim[0], bg=B, fg=self._TEAL,
+                         font=(self._FONT, 9, "bold")).pack(side="left")
+            if pages:
+                tk.Label(row, text=("· " if prim else "") + pages, bg=B,
+                         fg=self._MUTED, font=(self._FONT, 8)).pack(
+                    side="left", padx=(6, 0), pady=(1, 0))
+            minors = list(prim[1:]) + list(d.get("rune_secondary") or [])
+            if minors:
+                tk.Label(grid, text=" · ".join(minors), bg=B, fg=self._FAINT,
+                         font=(self._FONT, 8), wraplength=self._WRAP - 60,
+                         justify="left").pack(anchor="w", padx=(58, 0))
+
+        self._bind_drag(self._body)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -3826,6 +4503,8 @@ class App(tk.Tk):
         self._icon_images:   dict = {}   # champ id → ImageTk.PhotoImage (circular avatar)
         self._icon_pil_cache: dict = {}  # champ id → PIL.Image, awaiting main-thread materialize
         self._spell_icons:   dict = {}   # (spell id, size) → ImageTk.PhotoImage
+        self._item_icons:    dict = {}   # (item id, size)  → ImageTk.PhotoImage
+        self._build_data     = None      # last build dict rendered on the Builds tab
         self._opgg_stats:    dict = {}   # champ id → (season games, wins) from op.gg
         self._opgg_fetched   = False     # True once a stats fetch has succeeded
         self._opgg_fetching  = False     # a fetch worker is currently running
@@ -3854,7 +4533,10 @@ class App(tk.Tk):
         # Always-on-top overlay over the League client
         self._overlay = LCUOverlay(self)
 
-        # Global hotkey for overlay enable/disable toggle
+        # Build-path overlay (ranked or ARAM), toggled with the global hotkey
+        self._build_overlay = BuildOverlay(self)
+
+        # Global hotkeys: ready-up overlay toggle, build overlay toggle
         threading.Thread(target=self._watch_overlay_hotkey, daemon=True).start()
 
         # Local REST API for Stream Deck / external triggers
@@ -3960,8 +4642,10 @@ class App(tk.Tk):
         return "NA"
 
     def _champ_select_pick(self):
-        """(champion display name, op.gg position) for the local player's
-        current champ-select pick/intent, or None if not in champ select."""
+        """(champion display name, op.gg position, op.gg game mode) for the
+        local player's current champ-select pick/intent, or None if not in
+        champ select. In ARAM (bench lobbies) the position is "" and the mode
+        is "aram" — the champion in hand changes with every bench swap."""
         try:
             r = self._lcu.get("/lol-champ-select/v1/session")
             if r.status_code != 200:
@@ -3977,8 +4661,10 @@ class App(tk.Tk):
                     break
             if not cid:
                 return None
+            if s.get("benchEnabled") or self._engine.game_mode.upper() == "ARAM":
+                return (self.ddragon.name(cid), "", "aram")
             pos = OPGG_POSITION.get(assigned, "")
-            return (self.ddragon.name(cid), pos)
+            return (self.ddragon.name(cid), pos, _opgg_mode(self._engine.game_mode))
         except Exception:
             return None
 
@@ -3990,7 +4676,7 @@ class App(tk.Tk):
         last_locked = None
         while True:
             try:
-                pick = self._champ_select_pick()   # (name, pos) or None
+                pick = self._champ_select_pick()   # (name, pos, mode) or None
             except Exception:
                 pick = None
             if pick and pick != last:
@@ -4120,41 +4806,48 @@ class App(tk.Tk):
         except Exception:
             return False
 
-    def _auto_load_build(self, name, pos):
+    def _auto_load_build(self, name, pos, mode="ranked"):
         """Push a champ-select hover into the Builds tab (UI thread)."""
         if not hasattr(self, "_build_champ_var"):
             return   # Builds page hasn't been built yet
         self._build_champ_var.set(name)
         if hasattr(self, "_build_ac"):
             self._build_ac.place_forget()
-        if pos:
+        self._set_build_mode(mode)
+        if pos and mode != "aram":
             self._set_build_pos(pos)
-        self._load_build(name, pos or self._build_pos_var.get())
+        self._load_build(name, pos or self._build_pos_var.get(), mode)
 
-    def _fetch_build(self, champ_name, position, tier="diamond_plus"):
-        """Fetch a champion's diamond+ build/skill recommendations from op.gg.
-        Returns a structured dict (see _render_build) or an {'error': msg}."""
+    def _fetch_build(self, champ_name, position, tier="diamond_plus", mode="ranked"):
+        """Fetch a champion's diamond+ build/skill recommendations from op.gg,
+        ranked (per position) or ARAM (mode="aram", no positions). Returns a
+        structured dict (see _render_build) or an {'error': msg}."""
         cid = self.ddragon.find_id_fuzzy(champ_name)
         if cid is None:
             return {"error": f"Unknown champion: {champ_name!r}"}
         og_name = self.ddragon.opgg_name(cid)          # UPPER_SNAKE_CASE
-        pos = (position or "").lower() or "mid"
+        mode = (mode or "ranked").lower()
+        aram = (mode == "aram")
+        # op.gg demands a position even for ARAM and then ignores it (verified
+        # live: identical payloads for top / mid / support), so any will do.
+        pos = "mid" if aram else ((position or "").lower() or "mid")
         body = {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {
                 "name": "lol_get_champion_analysis",
                 "arguments": {
                     "champion": og_name, "position": pos,
-                    "game_mode": "ranked", "tier": tier,
+                    "game_mode": mode, "tier": tier,
                     "desired_output_fields": [
                         "data.summary.average_stats.win_rate",
                         "data.summary.average_stats.pick_rate",
                         "data.summary.average_stats.ban_rate",
-                        "data.starter_items.ids_names", "data.core_items.ids_names",
-                        "data.boots.ids_names",
-                        "data.fourth_items[].ids_names",
-                        "data.fifth_items[].ids_names",
-                        "data.sixth_items[].ids_names",
+                        "data.starter_items.ids", "data.starter_items.ids_names",
+                        "data.core_items.ids", "data.core_items.ids_names",
+                        "data.boots.ids", "data.boots.ids_names",
+                        "data.fourth_items[].ids", "data.fourth_items[].ids_names",
+                        "data.fifth_items[].ids", "data.fifth_items[].ids_names",
+                        "data.sixth_items[].ids", "data.sixth_items[].ids_names",
                         "data.summoner_spells.ids",
                         "data.skills.order", "data.skill_masteries.ids",
                         "data.runes.primary_page_name", "data.runes.primary_rune_names",
@@ -4165,10 +4858,8 @@ class App(tk.Tk):
             },
         }
         try:
-            r = requests.post("https://mcp-api.op.gg/mcp", json=body, timeout=20,
-                              headers={"Accept": "application/json, text/event-stream"})
-            r.raise_for_status()
-            text = r.json()["result"]["content"][0]["text"]
+            text = _opgg_post(
+                body, 20, on_retry=lambda e: self.log(_opgg_retry_msg(e)))
         except Exception as e:
             _dbg(f"[build] fetch failed: {e}")
             return {"error": "Could not reach op.gg. Check your connection."}
@@ -4181,36 +4872,68 @@ class App(tk.Tk):
         def names(x):
             return x.get("ids_names", []) if isinstance(x, dict) else (x or [])
 
-        def top_options(arr, k=3):
+        def ids(x):
+            out = []
+            for i in (x.get("ids") or []) if isinstance(x, dict) else []:
+                try:
+                    out.append(int(i))
+                except (TypeError, ValueError):
+                    out.append(0)
+            return out
+
+        def top_pairs(arr, k=3):
+            """[(item id, name)] — the top option of each of the first k slots."""
             out = []
             if isinstance(arr, list):
                 for opt in arr:
-                    nm = (opt.get("ids_names") or []) if isinstance(opt, dict) else []
+                    nm = names(opt) if isinstance(opt, dict) else []
+                    ii = ids(opt)   if isinstance(opt, dict) else []
                     if nm:
-                        out.append(nm[0])
+                        out.append((ii[0] if ii else 0, nm[0]))
                     if len(out) >= k:
                         break
             return out
+
+        # Situational: the top pick of each 4th/5th/6th slot, deduped by name,
+        # ids kept alongside so the overlay can draw icons.
+        situ, seen = [], set()
+        for iid, nm in (top_pairs(d.get("fourth_items"), 2)
+                        + top_pairs(d.get("fifth_items"), 2)
+                        + top_pairs(d.get("sixth_items"), 2)):
+            if nm and nm not in seen:
+                seen.add(nm)
+                situ.append((iid, nm))
+            if len(situ) >= 4:
+                break
 
         st = (d.get("summary") or {}).get("average_stats") or {}
         spells = d.get("summoner_spells") or {}
         spell_ids = spells.get("ids") if isinstance(spells, dict) else []
         runes = d.get("runes") or {}
+        starter_ids = ids(d.get("starter_items"))
+        core_ids    = ids(d.get("core_items"))
+        boots_ids   = ids(d.get("boots"))
+        situ_ids    = [i for i, _ in situ]
         return {
             "champion":   self.ddragon.name(cid),
-            "position":   pos,
+            "mode":       mode,
+            "position":   "aram" if aram else pos,
             "win_rate":   st.get("win_rate"),
             "pick_rate":  st.get("pick_rate"),
             "ban_rate":   st.get("ban_rate"),
             "damage":     d.get("damage_type"),
             "spells":     [_spell_name(s) for s in (spell_ids or [])],
+            "spell_ids":  [int(s) for s in (spell_ids or []) if str(s).isdigit()],
             "starter":    names(d.get("starter_items")),
+            "starter_ids": starter_ids,
             "core":       names(d.get("core_items")),
+            "core_ids":   core_ids,
             "boots":      names(d.get("boots")),
-            "situational": self._dedupe(
-                top_options(d.get("fourth_items"), 2)
-                + top_options(d.get("fifth_items"), 2)
-                + top_options(d.get("sixth_items"), 2), cap=4),
+            "boots_ids":  boots_ids,
+            "situational": [n for _, n in situ],
+            "situational_ids": situ_ids,
+            # every item id on the page — the worker warms their icons
+            "item_ids_all": [i for i in starter_ids + core_ids + boots_ids + situ_ids if i],
             "skill_order": (d.get("skills") or {}).get("order", []),
             "max_order":   (d.get("skill_masteries") or {}).get("ids", []),
             "rune_primary_page":   runes.get("primary_page_name", ""),
@@ -4220,7 +4943,7 @@ class App(tk.Tk):
             # Up to 3 distinct spell + rune-page combos (most popular first),
             # each pushable to the client. op.gg exposes one per tier, so the
             # variety comes from sampling several rank tiers.
-            "combos": self._fetch_combos(og_name, pos),
+            "combos": self._fetch_combos(og_name, pos, mode),
         }
 
     # Rank tiers sampled for combo variety, broadest ("all") first so the most
@@ -4228,16 +4951,16 @@ class App(tk.Tk):
     _COMBO_TIERS = [("all", "All ranks"), ("diamond_plus", "Diamond+"),
                     ("challenger", "Challenger")]
 
-    def _fetch_one_combo(self, og_name, position, tier):
-        """One (spells + rune page) combo for a champion/role at a rank tier,
-        with the IDs needed to push it to the client, or None."""
+    def _fetch_one_combo(self, og_name, position, tier, mode="ranked"):
+        """One (spells + rune page) combo for a champion/role (or ARAM) at a
+        rank tier, with the IDs needed to push it to the client, or None."""
         body = {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {
                 "name": "lol_get_champion_analysis",
                 "arguments": {
                     "champion": og_name, "position": position,
-                    "game_mode": "ranked", "tier": tier,
+                    "game_mode": mode, "tier": tier,
                     "desired_output_fields": [
                         "data.runes.primary_page_id", "data.runes.primary_page_name",
                         "data.runes.primary_rune_ids", "data.runes.primary_rune_names",
@@ -4250,10 +4973,7 @@ class App(tk.Tk):
             },
         }
         try:
-            r = requests.post("https://mcp-api.op.gg/mcp", json=body, timeout=15,
-                              headers={"Accept": "application/json, text/event-stream"})
-            r.raise_for_status()
-            rec = _parse_opgg_record(r.json()["result"]["content"][0]["text"])
+            rec = _parse_opgg_record(_opgg_post(body, 15))
         except Exception as e:
             _dbg(f"[combo] {tier} fetch failed: {e}")
             return None
@@ -4282,12 +5002,12 @@ class App(tk.Tk):
             "pick_rate":           rn.get("pick_rate"),
         }
 
-    def _fetch_combos(self, og_name, position):
+    def _fetch_combos(self, og_name, position, mode="ranked"):
         """Up to 3 DISTINCT (spells + rune page) combos, most popular first.
         Samples several rank tiers in parallel, then dedupes."""
         results = {}
         def work(tier, label):
-            c = self._fetch_one_combo(og_name, position, tier)
+            c = self._fetch_one_combo(og_name, position, tier, mode)
             if c:
                 c["label"] = label
                 results[tier] = c
@@ -4296,7 +5016,7 @@ class App(tk.Tk):
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=18)
+            t.join(timeout=OPGG_RETRY_DELAY * 3 + 15)   # 2 attempts + the wait
         seen, combos = set(), []
         for tier, _label in self._COMBO_TIERS:
             c = results.get(tier)
@@ -4364,12 +5084,7 @@ class App(tk.Tk):
             },
         }
         try:
-            r = requests.post(
-                "https://mcp-api.op.gg/mcp", json=body, timeout=20,
-                headers={"Accept": "application/json, text/event-stream"},
-            )
-            r.raise_for_status()
-            text = r.json()["result"]["content"][0]["text"]
+            text = _opgg_post(body, 20)
         except Exception as e:
             _dbg(f"[opgg] match history fetch failed: {e}")
             return None
@@ -4410,8 +5125,7 @@ class App(tk.Tk):
         self._section_header(hdr, "Scouting Report", pady=(0, 1))
         sub = tk.Frame(pad, bg=DARK)
         sub.pack(fill="x", pady=(0, 5))
-        self._scout_status_var = tk.StringVar(
-            value="Waiting for a lobby — allies appear here, everyone once in game.")
+        self._scout_status_var = tk.StringVar(value=self._SCOUT_IDLE_MSG)
         tk.Label(sub, textvariable=self._scout_status_var, bg=DARK, fg=MUTED,
                  font=FONT_SMALL, anchor="w").pack(side="left")
         tk.Button(sub, text="Refresh", bg=BTN_BG, fg=GOLD, relief="flat",
@@ -4462,10 +5176,16 @@ class App(tk.Tk):
         self._render_scouting()
 
     # ── roster discovery ──────────────────────────────────────────────────────
+    _SCOUT_IDLE_MSG = ("Waiting for a lobby — both teams are scouted whenever the "
+                       "client shows them (custom games, champ select where names "
+                       "aren't hidden, and always once the game starts).")
+
     def _watch_scouting(self):
         """Follow the lobby / champ select / live game and keep the Scouting
-        roster in sync: allies while in lobby or champ select, all ten players
-        once the game is loading/running. Daemon thread."""
+        roster in sync. Both teams are scouted whenever the client exposes
+        them: custom lobbies list both sides, champ select carries theirTeam
+        (identities present unless Riot hides them for that queue), and the
+        live game always has all ten. Daemon thread."""
         last_key = None
         while True:
             try:
@@ -4503,37 +5223,84 @@ class App(tk.Tk):
         return None, ""
 
     def _scout_lobby_roster(self):
-        out = []
+        """Lobby members. A custom lobby lists both sides (customTeam100 /
+        customTeam200): the side holding the signed-in summoner is ours, the
+        other is scouted as the enemy team."""
+        out, seen = [], set()
+
+        def add(mbr, ally):
+            ident = self._scout_member_identity(mbr)
+            if not ident:
+                sid = int(mbr.get("summonerId", 0) or 0)
+                ident = self._scout_resolve_summoner(sid) if sid else None
+            if ident and ident not in seen:
+                seen.add(ident)
+                out.append({"name": ident[0], "tag": ident[1],
+                            "ally": ally, "bot": False})
+
         try:
             r = self._lcu.get("/lol-lobby/v2/lobby")
             if r.status_code != 200:
                 return []
-            for mbr in r.json().get("members", []):
-                ident = self._scout_member_identity(mbr)
-                if ident:
-                    out.append({"name": ident[0], "tag": ident[1],
-                                "ally": True, "bot": False})
+            lob = r.json()
+            gc  = lob.get("gameConfig") or {}
+            t100 = gc.get("customTeam100") or []
+            t200 = gc.get("customTeam200") or []
+            if t100 or t200:
+                me = self._scout_my_summoner_id()
+                mine = 100 if any(int(m.get("summonerId", 0) or 0) == me
+                                  for m in t100) else 200
+                if not me:                    # can't tell — members[] is ours
+                    mine_ids = {int(m.get("summonerId", 0) or 0)
+                                for m in lob.get("members", [])}
+                    mine = 100 if any(int(m.get("summonerId", 0) or 0) in mine_ids
+                                      for m in t100) else 200
+                for m in t100:
+                    add(m, mine == 100)
+                for m in t200:
+                    add(m, mine == 200)
+            for mbr in lob.get("members", []):
+                add(mbr, True)
         except Exception as e:
             _dbg(f"[scout] lobby roster: {e}")
         return out
 
+    def _scout_my_summoner_id(self) -> int:
+        try:
+            r = self._lcu.get("/lol-summoner/v1/current-summoner")
+            if r.status_code == 200:
+                return int(r.json().get("summonerId", 0) or 0)
+        except Exception:
+            pass
+        return 0
+
     def _scout_champselect_roster(self):
+        """Both teams from champ select. theirTeam is always present; its
+        identities are populated unless Riot hides enemy names for the queue
+        (then summonerId is 0 and there's no puuid — nothing to scout until
+        the game starts). Enemy champions show once locked."""
         out = []
         try:
             r = self._lcu.get("/lol-champ-select/v1/session")
             if r.status_code != 200:
                 return []
-            for mbr in r.json().get("myTeam", []):
-                sid = int(mbr.get("summonerId", 0) or 0)
-                if not sid:
-                    continue           # bots / hidden
-                ident = self._scout_resolve_summoner(sid)
-                if ident:
+            sess = r.json()
+            for team_key, ally in (("myTeam", True), ("theirTeam", False)):
+                for mbr in sess.get(team_key, []) or []:
+                    sid   = int(mbr.get("summonerId", 0) or 0)
+                    puuid = str(mbr.get("puuid") or "")
+                    ident = self._scout_member_identity(mbr)
+                    if not ident and sid:
+                        ident = self._scout_resolve_summoner(sid)
+                    if not ident and puuid.strip("0-"):
+                        ident = self._scout_resolve_puuid(puuid)
+                    if not ident:
+                        continue           # bots / hidden identities
                     # locked pick, else hover intent — for champ-scoped stats
                     cid = int(mbr.get("championId") or
                               mbr.get("championPickIntent") or 0)
                     out.append({"name": ident[0], "tag": ident[1],
-                                "ally": True, "bot": False,
+                                "ally": ally, "bot": False,
                                 "champ": self._scout_champ_name(cid)})
         except Exception as e:
             _dbg(f"[scout] champselect roster: {e}")
@@ -4627,6 +5394,20 @@ class App(tk.Tk):
             pass
         return None
 
+    def _scout_resolve_puuid(self, puuid):
+        """(gameName, tagLine) for a puuid — champ-select theirTeam entries
+        sometimes carry only the puuid."""
+        try:
+            r = self._lcu.get(f"/lol-summoner/v2/summoners/puuid/{puuid}")
+            if r.status_code == 200:
+                d = r.json()
+                g = d.get("gameName") or d.get("displayName") or ""
+                if g:
+                    return (str(g), str(d.get("tagLine", "") or ""))
+        except Exception:
+            pass
+        return None
+
     # ── per-player fetch (op.gg public data) ──────────────────────────────────
     def _scout_kick_fetch(self, name, tag):
         key = (name, tag)
@@ -4661,10 +5442,7 @@ class App(tk.Tk):
     def _opgg_mcp(tool, args, timeout=25):
         body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": tool, "arguments": args}}
-        r = requests.post("https://mcp-api.op.gg/mcp", json=body, timeout=timeout,
-                          headers={"Accept": "application/json, text/event-stream"})
-        r.raise_for_status()
-        return r.json()["result"]["content"][0]["text"]
+        return _opgg_post(body, timeout)
 
     def _scout_profile(self, name, tag, region):
         """Normalized public profile: level, best ranked queue (tier/lp/W-L +
@@ -5081,13 +5859,16 @@ class App(tk.Tk):
             if roster:
                 n_ally = sum(1 for p in roster if p["ally"])
                 src = self._scout_source or "lobby"
-                extra = (f", {len(roster) - n_ally} enemies"
-                         if len(roster) > n_ally else "")
+                if len(roster) > n_ally:
+                    extra = f", {len(roster) - n_ally} enemies"
+                elif src == "champ select":
+                    extra = " — enemy names hidden until the game starts"
+                else:
+                    extra = ""
                 self._scout_status_var.set(
                     f"Scouting {n_ally} allies{extra}  ({src})")
             else:
-                self._scout_status_var.set(
-                    "Waiting for a lobby — allies appear here, everyone once in game.")
+                self._scout_status_var.set(self._SCOUT_IDLE_MSG)
         if not roster:
             tk.Label(host, text="Nobody to scout yet.", bg=DARK, fg=FAINT,
                      font=FONT_SMALL).pack(anchor="w", pady=8)
@@ -5295,9 +6076,10 @@ class App(tk.Tk):
 
     def _prefetch_icons(self):
         ids = set()
-        for role in ROLES:
+        for role in ROLES + [ARAM_ROLE]:
             for key in ("picks", "bans"):
-                ids.update(int(c) for c in self.cfg["roleChampions"][role][key])
+                ids.update(int(c) for c in
+                           self.cfg["roleChampions"].get(role, {}).get(key, []))
         ids.update(int(c) for c in self.cfg.get("permaBans", []))
         got_new = False
         for cid in ids:
@@ -5599,6 +6381,17 @@ class App(tk.Tk):
             b.pack(side="left", padx=(0, 6))
             self._role_btns[role] = b
 
+        # ARAM: one list (no bans) that drives bench swaps and rerolls.
+        rf = tk.Frame(holder, bg=DARK)
+        self._role_frames[ARAM_ROLE] = rf
+        self._role_panels[ARAM_ROLE] = RolePanel(rf, ARAM_ROLE, self, aram=True)
+        b = tk.Button(sel, text=ROLE_LABEL[ARAM_ROLE], bg=BTN_BG, fg=TEXT,
+                      activebackground=_shade(GOLD, 1.05), relief="flat",
+                      cursor="hand2", padx=18, pady=6, font=FONT_BTN,
+                      command=lambda: show_role(ARAM_ROLE))
+        b.pack(side="left", padx=(14, 0))
+        self._role_btns[ARAM_ROLE] = b
+
         show_role(ROLES[0])   # default to Top
 
     # ── Dashboard helpers ──────────────────────────────────────────────────────
@@ -5649,6 +6442,8 @@ class App(tk.Tk):
              [("Runes", "autoRunes"), ("Spells", "autoSpells")]),
             ("Auto Item Set",      "Import op.gg item set",
              [("", "autoItems")]),
+            ("ARAM",               "Bench swap & reroll from your ARAM list",
+             [("Swap", "autoAramSwap"), ("Reroll", "autoAramReroll")]),
             ("Auto Invites",       "Accept friend invites",
              [("", "autoAcceptInvites")]),
         ]
@@ -5751,8 +6546,9 @@ class App(tk.Tk):
         # Inline ornamented header + "diamond+" note on the right.
         head = tk.Frame(parent, bg=DARK)
         head.pack(fill="x", padx=30, pady=(14, 8))
-        tk.Label(head, text="◆  DIAMOND+ · RANKED", bg=DARK, fg=FAINT,
-                 font=FONT_HINT).pack(side="right", padx=(12, 0), pady=(3, 0))
+        self._build_tier_lbl = tk.Label(head, text="◆  DIAMOND+ · RANKED",
+                                        bg=DARK, fg=FAINT, font=FONT_HINT)
+        self._build_tier_lbl.pack(side="right", padx=(12, 0), pady=(3, 0))
         dia = tk.Canvas(head, width=12, height=12, bg=DARK,
                         highlightthickness=0, bd=0)
         dia.create_polygon(6, 0, 12, 6, 6, 12, 0, 6, fill=GOLD, outline=GOLD)
@@ -5799,6 +6595,21 @@ class App(tk.Tk):
             self._build_pos_btns[pos] = b
         self._set_build_pos("mid")
 
+        # Mode: Ranked (Summoner's Rift, per position) or ARAM (no positions).
+        # Follows the lobby during champ select; click to browse the other.
+        tk.Label(posrow, text="MODE", bg=DARK, fg=FAINT,
+                 font=FONT_HINT).pack(side="left", padx=(22, 12), pady=(4, 0))
+        self._build_mode_var  = tk.StringVar(value="ranked")
+        self._build_mode_btns = {}
+        for label, mode in [("Ranked", "ranked"), ("ARAM", "aram")]:
+            b = tk.Button(posrow, text=label, bg=BTN_BG, fg=TEXT,
+                          activebackground=_shade(TEAL, 1.05), relief="flat",
+                          cursor="hand2", padx=14, pady=5, font=FONT_BTN,
+                          command=lambda m=mode: self._set_build_mode(m))
+            b.pack(side="left", padx=(0, 6))
+            self._build_mode_btns[mode] = b
+        self._set_build_mode("ranked")
+
         # Autocomplete dropdown — floated over the result area with place() (not
         # packed) so showing/hiding it never shoves the build cards up or down.
         self._build_entry = bentry
@@ -5832,6 +6643,23 @@ class App(tk.Tk):
         for p, b in self._build_pos_btns.items():
             on = (p == pos)
             b.config(bg=(GOLD if on else BTN_BG), fg=(DARK if on else TEXT))
+
+    def _set_build_mode(self, mode):
+        """Ranked vs ARAM on the Builds tab. ARAM has no positions, so the
+        position tabs grey out; the header note names the mode."""
+        mode = (mode or "ranked").lower()
+        if not hasattr(self, "_build_mode_var"):
+            return
+        self._build_mode_var.set(mode)
+        aram = (mode == "aram")
+        for m, b in self._build_mode_btns.items():
+            on = (m == mode)
+            b.config(bg=(TEAL if on else BTN_BG), fg=(DARK if on else TEXT))
+        for b in self._build_pos_btns.values():
+            b.config(state=("disabled" if aram else "normal"))
+        if hasattr(self, "_build_tier_lbl"):
+            self._build_tier_lbl.config(
+                text=f"◆  DIAMOND+ · {mode.upper().replace('_', ' ')}")
 
     def _build_ac_update(self, *_):
         if not hasattr(self, "_build_ac"):
@@ -5903,42 +6731,47 @@ class App(tk.Tk):
             self._build_placeholder("Not in champion select — pick or hover a "
                                     "champion, or search one above.")
             return
-        name, pos = pick
-        self._build_champ_var.set(name)
-        if hasattr(self, "_build_ac"):
-            self._build_ac.place_forget()
-        if pos:
-            self._set_build_pos(pos)
-        self._load_build(name, pos or self._build_pos_var.get())
+        self._auto_load_build(*pick)
 
-    def _load_build(self, champ=None, position=None):
+    def _load_build(self, champ=None, position=None, mode=None):
         champ = (champ or self._build_champ_var.get()).strip()
         if not champ:
             return
         if hasattr(self, "_build_ac"):
             self._build_ac.place_forget()
-        # When importing/loading a build during champ select, reflect the role
-        # the client assigned us on the Position indicator (unless the caller
-        # already supplied a position, e.g. current pick / hover).
-        if position is None:
-            position = self._assigned_role_pos()
-        position = position or self._build_pos_var.get()
-        self._set_build_pos(position)   # keep the indicator in sync with the load
+        mode = (mode or self._build_mode_var.get() or "ranked").lower()
+        self._set_build_mode(mode)
+        if mode == "aram":
+            position = "aram"            # no positions in ARAM
+        else:
+            # When importing/loading a build during champ select, reflect the
+            # role the client assigned us on the Position indicator (unless the
+            # caller already supplied a position, e.g. current pick / hover).
+            if position is None:
+                position = self._assigned_role_pos()
+            position = position or self._build_pos_var.get()
+            self._set_build_pos(position)   # keep the indicator in sync with the load
         # Sequence token: if a newer request starts before this fetch returns
         # (e.g. the hovered champion changed), the stale result is discarded.
         self._build_req = getattr(self, "_build_req", 0) + 1
         seq = self._build_req
-        self._build_placeholder(f"Loading {champ} ({position}) build from op.gg…")
+        self._build_placeholder(
+            f"Loading {champ} ({'ARAM' if mode == 'aram' else position}) build from op.gg…")
         threading.Thread(target=self._load_build_worker,
-                         args=(champ, position, seq), daemon=True).start()
+                         args=(champ, position, seq, mode), daemon=True).start()
 
-    def _load_build_worker(self, champ, position, seq=0):
-        data = self._fetch_build(champ, position)
-        # Warm the summoner-spell icon disk cache off the main thread so the
-        # render can build PhotoImages from local files without any network.
+    def _load_build_worker(self, champ, position, seq=0, mode="ranked"):
+        data = self._fetch_build(champ, position, mode=mode)
+        # Warm the summoner-spell and item icon disk caches off the main thread
+        # so the render (and the overlay) can build PhotoImages from local
+        # files without any network.
         for combo in (data or {}).get("combos", []):
             for sid in combo.get("spell_ids", []):
                 self.ddragon.spell_icon_file(sid)
+        for sid in (data or {}).get("spell_ids", []):
+            self.ddragon.spell_icon_file(sid)
+        for iid in (data or {}).get("item_ids_all", []):
+            self.ddragon.item_icon_file(iid)
         def _apply():
             if seq == getattr(self, "_build_req", seq):
                 self._render_build(data)
@@ -5963,6 +6796,27 @@ class App(tk.Tk):
         except Exception:
             return None
 
+    def _item_photo(self, iid, size=30):
+        """A cached Tk PhotoImage for an item icon, or None. Reads the cached
+        PNG (warmed by _load_build_worker); main thread only."""
+        try:
+            key = (int(iid), size)
+        except (TypeError, ValueError):
+            return None
+        if key in self._item_icons:
+            return self._item_icons[key]
+        try:
+            from PIL import Image, ImageTk
+            path = self.ddragon.item_icon_file(iid)
+            if not path:
+                return None
+            im = Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(im)
+            self._item_icons[key] = photo
+            return photo
+        except Exception:
+            return None
+
     def _ability_badges(self, parent, letters, sep):
         row = tk.Frame(parent, bg=CARD)
         for i, a in enumerate(letters):
@@ -5977,6 +6831,9 @@ class App(tk.Tk):
     def _render_build(self, data):
         for w in self._build_result.winfo_children():
             w.destroy()
+        self._build_data = data
+        if getattr(self, "_build_overlay", None) is not None:
+            self._build_overlay.set_data(data)
         if not data or data.get("error"):
             tk.Label(self._build_result,
                      text=(data or {}).get("error", "No build data."),
@@ -6326,90 +7183,40 @@ class App(tk.Tk):
 
         # Keybind capture widget.
         kb_row = _row(s, "Toggle keybind:")
-
-        raw_key = str(self.cfg.get("overlayToggleKey") or "")
-        self._kb_btn = tk.Button(
-            kb_row,
-            text=f"  {_overlay_combo_label(raw_key)}  ",
-            bg=BTN_BG, fg=WHITE, activebackground=BTN_HOV, relief="flat",
-            font=FONT_BTN, padx=8, pady=2, cursor="hand2")
+        self._kb_btn = self._make_keybind_button(kb_row, "overlayToggleKey")
         self._kb_btn.pack(side="left", padx=(8, 0))
-
-        def _start_kb_capture():
-            self.focus_set()   # pull focus away from any text entry
-            self._kb_btn.config(text="  Press a key…  ", fg=MUTED, state="disabled")
-            _tid = [None]
-
-            def _commit(combo):
-                if _tid[0]:
-                    self.after_cancel(_tid[0])
-                try:
-                    self.unbind("<KeyPress>")
-                except Exception:
-                    pass
-                self.cfg["overlayToggleKey"] = combo
-                save_config(self.cfg)
-                lbl = _overlay_combo_label(combo) if combo else "None"
-                self._kb_btn.config(text=f"  {lbl}  ", fg=WHITE, state="normal")
-
-            def _on_key(ev):
-                key = ev.keysym
-                if key in _OVERLAY_IGNORE_KEYS:
-                    return   # modifier-only press — keep waiting
-                # Plain Escape = clear the keybind
-                if key == "Escape" and not (ev.state & 0x4) and not (ev.state & 0x1):
-                    _commit("")
-                    return
-                # Build modifier prefix
-                mods = []
-                if ev.state & 0x4:      mods.append("Ctrl")
-                if ev.state & 0x1:      mods.append("Shift")
-                if ev.state & 0x20000:  mods.append("Alt")
-                # Normalise single-letter keysym to uppercase
-                if len(key) == 1:
-                    key2 = key.upper()
-                else:
-                    key2 = key
-                combo = "+".join(mods + [key2])
-                # Accept only if the key part resolves to a VK code
-                if _overlay_key_vk(key2):
-                    _commit(combo)
-                else:
-                    _commit(self.cfg.get("overlayToggleKey") or "")  # restore
-
-            self.bind("<KeyPress>", _on_key)
-            _tid[0] = self.after(5000, lambda: _commit(
-                self.cfg.get("overlayToggleKey") or ""))   # 5 s timeout
-
-        self._kb_btn.config(command=_start_kb_capture)
-
-        # Hover tooltip on the keybind button.
-        _kbt = [None]
-        def _kbt_show(e):
-            x = self._kb_btn.winfo_rootx()
-            y = self._kb_btn.winfo_rooty() + self._kb_btn.winfo_height() + 4
-            w = tk.Toplevel(self._kb_btn)
-            w.wm_overrideredirect(True)
-            w.wm_geometry(f"+{x}+{y}")
-            tk.Label(w,
-                     text="Click, then press any key:\n"
-                          "  A–Z  ·  0–9  ·  F1–F12\n"
-                          "  Home  ·  End  ·  Insert  ·  Delete  ·  PgUp  ·  PgDn\n\n"
-                          "Hold Ctrl, Alt, or Shift for combos (e.g. Ctrl+K)\n"
-                          "Press Esc to clear the keybind",
-                     bg=TIP_BG, fg=TEXT, font=FONT_SMALL,
-                     padx=10, pady=8, justify="left",
-                     relief="solid", borderwidth=1).pack()
-            _kbt[0] = w
-        def _kbt_hide(e):
-            if _kbt[0]:
-                _kbt[0].destroy()
-                _kbt[0] = None
-        self._kb_btn.bind("<Enter>", _kbt_show)
-        self._kb_btn.bind("<Leave>", _kbt_hide)
 
         _sbtn(s, "Reset overlay position", self._reset_overlay_pos).pack(
             anchor="w", pady=(10, 0))
+
+        # ── Build Overlay ─────────────────────────────────────────────────────
+        s = _section("Build Overlay")
+
+        self._build_overlay_var = tk.BooleanVar(value=False)
+        _check(s, "Show the build overlay now", self._build_overlay_var,
+               lambda: self._set_build_overlay_visible(
+                   self._build_overlay_var.get())).pack(anchor="w")
+        _hint(s, "The recommended build path for the champion loaded on the "
+                 "Builds tab (ranked or ARAM), floating over the client and the "
+                 "game. Drag it anywhere; hover an item for its name.")
+
+        bkb_row = _row(s, "Toggle keybind:")
+        self._build_kb_btn = self._make_keybind_button(bkb_row, "buildOverlayKey")
+        self._build_kb_btn.pack(side="left", padx=(8, 0))
+
+        self._build_auto_var = tk.BooleanVar(
+            value=bool(self.cfg.get("buildOverlayAutoShow", False)))
+        _check(s, "Pop up automatically when the game starts",
+               self._build_auto_var,
+               lambda: (
+                   self.cfg.__setitem__("buildOverlayAutoShow",
+                                        self._build_auto_var.get()),
+                   save_config(self.cfg),
+               )).pack(anchor="w", pady=(8, 0))
+        _sbtn(s, "Reset build overlay position",
+              self._reset_build_overlay_pos).pack(anchor="w", pady=(10, 0))
+        _hint(s, "In-game it needs Borderless or Windowed mode — exclusive "
+                 "Fullscreen hides every overlay.")
 
         # ── Party Ready-Up ────────────────────────────────────────────────────
         s = _section("Party Ready-Up")
@@ -6525,7 +7332,7 @@ class App(tk.Tk):
         api_port_entry.bind("<Return>",   _persist_api_port)
         _api_port_now = self.cfg.get("localApiPort", 8778)
         _hint(s, (f"GET http://127.0.0.1:{_api_port_now}/ready-up"
-                  f"  ·  /accept  ·  /status  ·  0 = disabled"))
+                  f"  ·  /accept  ·  /build-overlay  ·  /status  ·  0 = disabled"))
 
         # ── Startup ───────────────────────────────────────────────────────────
         s = _section("Startup")
@@ -6839,6 +7646,8 @@ class App(tk.Tk):
                 self._party_ready = False
             if hasattr(self, "_overlay"):
                 self._overlay.set_phase(phase)
+            if hasattr(self, "_build_overlay"):
+                self._build_overlay.set_phase(phase)
         self.after(0, _do)
 
     def _on_auto_switch(self, key: str, value: bool):
@@ -6925,23 +7734,134 @@ class App(tk.Tk):
             self._overlay_enabled_var.set(new_val)
         self.log(f"Overlay {'enabled' if new_val else 'disabled'} (hotkey).")
 
+    def _set_build_overlay_visible(self, on: bool):
+        ov = getattr(self, "_build_overlay", None)
+        if ov is None:
+            return
+        if on:
+            ov.show()
+        else:
+            ov.hide()
+        if hasattr(self, "_build_overlay_var"):
+            self._build_overlay_var.set(bool(on))
+
+    def _toggle_build_overlay(self):
+        """Flip the build-path overlay (hotkey / Stream Deck / settings)."""
+        ov = getattr(self, "_build_overlay", None)
+        if ov is None:
+            return
+        self._set_build_overlay_visible(not ov.is_visible())
+        self.log(f"Build overlay {'shown' if ov.is_visible() else 'hidden'} "
+                 f"({_overlay_combo_label(self.cfg.get('buildOverlayKey') or '')}).")
+
+    def _reset_build_overlay_pos(self):
+        ov = getattr(self, "_build_overlay", None)
+        if ov is not None:
+            ov.reset_position()
+        self.log("Build overlay position reset.")
+
     def _watch_overlay_hotkey(self):
-        """Background thread: polls GetAsyncKeyState for the overlay toggle keybind."""
-        was_down = False
+        """Background thread: polls GetAsyncKeyState for the global keybinds —
+        the ready-up overlay toggle and the build overlay toggle. Each fires
+        once per press (edge-triggered), with every modifier of the combo held."""
+        binds = {
+            "overlayToggleKey": self._toggle_overlay_enabled,
+            "buildOverlayKey":  self._toggle_build_overlay,
+        }
+        was_down = {k: False for k in binds}
+        gaks = ctypes.windll.user32.GetAsyncKeyState
         while True:
-            combo = (self.cfg.get("overlayToggleKey") or "").strip()
-            mod_vks, key_vk = _overlay_parse_combo(combo) if combo else ([], 0)
-            if key_vk:
-                gaks = ctypes.windll.user32.GetAsyncKeyState
-                key_down  = bool(gaks(key_vk) & 0x8000)
-                mods_down = all(bool(gaks(m) & 0x8000) for m in mod_vks)
-                is_down   = key_down and mods_down
-                if is_down and not was_down:
-                    self.after(0, self._toggle_overlay_enabled)
-                was_down = is_down
-            else:
-                was_down = False
+            for cfg_key, action in binds.items():
+                combo = (self.cfg.get(cfg_key) or "").strip()
+                mod_vks, key_vk = _overlay_parse_combo(combo) if combo else ([], 0)
+                if key_vk:
+                    key_down  = bool(gaks(key_vk) & 0x8000)
+                    mods_down = all(bool(gaks(m) & 0x8000) for m in mod_vks)
+                    is_down   = key_down and mods_down
+                    if is_down and not was_down[cfg_key]:
+                        self.after(0, action)
+                    was_down[cfg_key] = is_down
+                else:
+                    was_down[cfg_key] = False
             time.sleep(0.05)
+
+    def _make_keybind_button(self, parent, cfg_key: str):
+        """A 'press a key' capture button bound to cfg[cfg_key] (a combo string
+        such as 'Ctrl+Z'). Click it, press the key (hold Ctrl/Alt/Shift for a
+        combo); Esc clears; a 5 s timeout keeps the old binding."""
+        raw = str(self.cfg.get(cfg_key) or "")
+        btn = tk.Button(parent, text=f"  {_overlay_combo_label(raw)}  ",
+                        bg=BTN_BG, fg=WHITE, activebackground=BTN_HOV,
+                        relief="flat", font=FONT_BTN, padx=8, pady=2,
+                        cursor="hand2")
+
+        def _start_capture():
+            self.focus_set()   # pull focus away from any text entry
+            btn.config(text="  Press a key…  ", fg=MUTED, state="disabled")
+            _tid = [None]
+
+            def _commit(combo):
+                if _tid[0]:
+                    self.after_cancel(_tid[0])
+                try:
+                    self.unbind("<KeyPress>")
+                except Exception:
+                    pass
+                self.cfg[cfg_key] = combo
+                save_config(self.cfg)
+                lbl = _overlay_combo_label(combo) if combo else "None"
+                btn.config(text=f"  {lbl}  ", fg=WHITE, state="normal")
+
+            def _on_key(ev):
+                key = ev.keysym
+                if key in _OVERLAY_IGNORE_KEYS:
+                    return   # modifier-only press — keep waiting
+                # Plain Escape = clear the keybind
+                if key == "Escape" and not (ev.state & 0x4) and not (ev.state & 0x1):
+                    _commit("")
+                    return
+                mods = []
+                if ev.state & 0x4:      mods.append("Ctrl")
+                if ev.state & 0x1:      mods.append("Shift")
+                if ev.state & 0x20000:  mods.append("Alt")
+                key2 = key.upper() if len(key) == 1 else key
+                combo = "+".join(mods + [key2])
+                if _overlay_key_vk(key2):          # only keys we can poll
+                    _commit(combo)
+                else:
+                    _commit(self.cfg.get(cfg_key) or "")   # restore
+
+            self.bind("<KeyPress>", _on_key)
+            _tid[0] = self.after(5000, lambda: _commit(
+                self.cfg.get(cfg_key) or ""))   # 5 s timeout
+
+        btn.config(command=_start_capture)
+
+        # Hover tooltip listing what can be bound.
+        _tip = [None]
+        def _tip_show(_e):
+            x = btn.winfo_rootx()
+            y = btn.winfo_rooty() + btn.winfo_height() + 4
+            w = tk.Toplevel(btn)
+            w.wm_overrideredirect(True)
+            w.wm_geometry(f"+{x}+{y}")
+            tk.Label(w,
+                     text="Click, then press any key:\n"
+                          "  A–Z  ·  0–9  ·  F1–F12\n"
+                          "  Home  ·  End  ·  Insert  ·  Delete  ·  PgUp  ·  PgDn\n\n"
+                          "Hold Ctrl, Alt, or Shift for combos (e.g. Ctrl+Z)\n"
+                          "Press Esc to clear the keybind",
+                     bg=TIP_BG, fg=TEXT, font=FONT_SMALL,
+                     padx=10, pady=8, justify="left",
+                     relief="solid", borderwidth=1).pack()
+            _tip[0] = w
+        def _tip_hide(_e):
+            if _tip[0]:
+                _tip[0].destroy()
+                _tip[0] = None
+        btn.bind("<Enter>", _tip_show)
+        btn.bind("<Leave>", _tip_hide)
+        return btn
 
     def _on_ready_up_toggle(self):
         enabled = self._ready_up_var.get()
@@ -7052,6 +7972,7 @@ class App(tk.Tk):
         for role in ROLES:
             for k in ("picks", "bans"):
                     self.refresh_list(role, k)
+        self.refresh_list(ARAM_ROLE, "picks")
         self._refresh_permabans()
 
     # ── Permaban (global, always banned first) ─────────────────────────────────
@@ -7180,10 +8101,10 @@ class App(tk.Tk):
         status_fn(f"Fetching {game_name}#{tag_line} season stats…")
 
         def _post(body):
-            return requests.post(
-                "https://mcp-api.op.gg/mcp", json=body, timeout=15,
-                headers={"Accept": "application/json, text/event-stream"},
-            )
+            """Reply text of one request (retried once after 15 s on failure)."""
+            def _note(exc):
+                status_fn(f"op.gg lookup failed — retrying in {OPGG_RETRY_DELAY} s…", RED)
+            return _opgg_post(body, 15, on_retry=_note)
 
         # ── Request 1: season champion stats ─────────────────────────────────
         profile_body = {
@@ -7215,21 +8136,12 @@ class App(tk.Tk):
             },
         }
         try:
-            r1 = _post(profile_body)
-            r2 = _post(meta_body)
-            r1.raise_for_status(); r2.raise_for_status()
+            profile_text = _post(profile_body)
+            meta_text    = _post(meta_body)
         except Exception as e:
             status_fn(f"Network error: {e}", RED)
             return None
 
-        def _text(resp):
-            try:
-                return resp.json()["result"]["content"][0]["text"]
-            except Exception:
-                return ""
-
-        profile_text = _text(r1)
-        meta_text    = _text(r2)
         if not profile_text or not meta_text:
             status_fn("No data returned from op.gg.", RED)
             return None
@@ -7283,8 +8195,7 @@ class App(tk.Tk):
             },
         }
         try:
-            r3 = _post(hist_body)
-            hist_text = _text(r3)
+            hist_text = _post(hist_body)
         except Exception:
             hist_text = ""
 

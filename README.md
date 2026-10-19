@@ -24,6 +24,26 @@ Grab the latest release from the [Releases page](https://github.com/Naieter/LoL-
 - **Auto Ban** — bans from your per-role ban list (configurable delay); perma-ban list always goes first regardless of role
 - **Auto Runes** — imports meta rune pages and summoner spells from op.gg for your locked champion
 
+### ARAM
+ARAM has no bans and no pick turns — the client deals you a champion and the bench is the only choice. The tool handles that from a single **ARAM priority list** (Champions → ARAM tab, up to 15 champions):
+
+- **Auto bench swap** — whenever the bench holds a champion ranked above the one in your hand, the tool swaps to it
+- **Auto reroll** — rerolls only when neither your champion nor anything on the bench is on your list, so a reroll is never spent on a roll that was already fine
+- **Your choice wins** — swap to a champion by hand and the tool stops swapping and rerolling for that champ select
+- **Runes, spells & item set** import for ARAM (op.gg ARAM data, e.g. Flash + Ghost and the 1,400-gold start) once your champion has stayed put for a few seconds
+- The **Builds tab** switches to ARAM data automatically in an ARAM lobby (op.gg has no positions there)
+
+Both toggles live on the Dashboard under **ARAM** (Swap / Reroll).
+
+### Build Overlay
+A floating panel with the recommended **build path** for the champion loaded on the Builds tab — ranked or ARAM, whichever the tab is showing (it follows champ select).
+
+- Toggle it with a global hotkey: **Ctrl+Z** by default (change it in Settings → Build Overlay)
+- Shows start / core / boots / later items as icons (hover for names), skill max order and opener, summoner spells, keystone and rune pages
+- Always on top, draggable, never takes focus from the game; remembers where you left it
+- Optionally pops up on its own when the game starts, and hides itself when the game ends
+- In-game it needs **Borderless** or **Windowed** mode — exclusive Fullscreen hides every overlay on Windows
+
 ### Party Ready-Up
 Coordinate queue with your party — everyone marks themselves ready in the tool and the leader's client starts the queue automatically when all tool users are ready.
 
@@ -49,7 +69,8 @@ A local REST API lets a Stream Deck (or any HTTP client) trigger actions:
 |---|---|
 | `GET /ready-up` | Toggle your ready state |
 | `GET /accept` | Accept a ready check |
-| `GET /status` | JSON: current phase, ready state, party counts |
+| `GET /build-overlay` | Toggle the build overlay |
+| `GET /status` | JSON: current phase, game mode, ready state, party counts |
 
 Enable it in **Settings → Stream Deck API** by entering a port (e.g. `8778`). Set to `0` to disable. Requires restart after changing the port.
 
@@ -60,6 +81,7 @@ Enable it in **Settings → Stream Deck API** by entering a port (e.g. `8778`). 
 - **Auto-update** — checks GitHub for new releases on launch and prompts to update
 - **System tray** — minimizes to tray; can launch hidden at Windows startup
 - **Ultimate Bravery** — rolls a random available champion during champion select
+- **Scouting (beta)** — Porofessor-style lobby intel for both teams whenever the client exposes them: custom lobbies list both sides, champ select includes the enemy team unless Riot hides names for that queue, and the live game always shows all ten
 
 ---
 
@@ -67,8 +89,8 @@ Enable it in **Settings → Stream Deck API** by entering a port (e.g. `8778`). 
 
 1. Download **`LOL_Client_Tool.exe`** from [Releases](https://github.com/Naieter/LoL-Client-Automation/releases/latest)
 2. Run it — it connects to the League client automatically when League opens
-3. Go to each role tab (Top, Jungle, Mid, ADC, Support) and add your champion priorities
-4. Automations are on by default — toggle them in **Settings**
+3. Go to each role tab (Top, Jungle, Mid, ADC, Support) and add your champion priorities; fill the **ARAM** tab with the champions you want off the bench, best first
+4. Automations are on by default — toggle them on the **Dashboard**
 
 ### Per-Role Champion Priorities
 
@@ -126,6 +148,20 @@ The overlay button over the League client shows the current state and lets you t
 | Show overlay | On | Show the floating overlay button over the League client |
 | Toggle keybind | None | Global key (or combo) to toggle the overlay on/off |
 | Reset overlay position | — | Move the overlay back to its default position |
+
+### Build Overlay
+| Setting | Default | Description |
+|---|---|---|
+| Show the build overlay now | Off | Show/hide the build panel (same as the hotkey) |
+| Toggle keybind | Ctrl+Z | Global key (or combo) to toggle the build overlay |
+| Pop up automatically when the game starts | Off | Show it on game start; it hides itself when the game ends |
+| Reset build overlay position | — | Move the panel back to the top-left default |
+
+### ARAM (Dashboard)
+| Setting | Default | Description |
+|---|---|---|
+| Swap | On | Swap with a higher-priority champion on the bench |
+| Reroll | On | Reroll when nothing on your ARAM list is in hand or on the bench |
 
 ### Party Ready-Up
 | Setting | Default | Description |
@@ -205,7 +241,9 @@ python -m pytest test_lol_tool.py -v
 
 ## How It Works
 
-The tool polls for the League client process using `psutil`, reads the LCU port and auth token from `LeagueClientUx.exe`'s command-line arguments, and connects to the local HTTPS API at `127.0.0.1:{port}`. Champion data is fetched from Riot's DDragon CDN on first launch and cached locally.
+The tool polls for the League client process using `psutil`, reads the LCU port and auth token from `LeagueClientUx.exe`'s command-line arguments, and connects to the local HTTPS API at `127.0.0.1:{port}`. Champion, spell and item icons come from Riot's DDragon CDN on first use and are cached locally.
+
+ARAM is detected from the champ-select session (`benchEnabled`) and the gameflow queue (`gameMode: ARAM`). Bench swaps use `POST /lol-champ-select/v1/session/bench/swap/{championId}`, rerolls `POST /lol-champ-select/v1/session/my-selection/reroll`. Build data (ranked and ARAM) comes from op.gg's public MCP endpoint. Every op.gg lookup that fails (no connection, timeout, HTTP error, malformed reply) is retried once 15 seconds later before giving up.
 
 The ready-up relay is a small in-memory HTTP server. Clients post opaque hashes of summoner IDs — the relay never sees names or IDs. Presence entries expire after 20 seconds if a client stops heartbeating (e.g. tool closed).
 
