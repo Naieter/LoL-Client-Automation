@@ -783,6 +783,178 @@ class TestBanSuggestions(unittest.TestCase):
         out = self.bans(roster, cache)
         self.assertEqual(out[0]["why"], "Foe: 30 of 40 games, 67% WR · one-trick")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+_DD_DATA = {"Ryze": {"key": "13", "name": "Ryze", "id": "Ryze"},
+            "MissFortune": {"key": "21", "name": "Miss Fortune", "id": "MissFortune"}}
+
+
+class _DDResp:
+    def __init__(self, body):
+        self._body = body
+    def json(self):
+        return self._body
+
+
+class TestDDragonLoad(unittest.TestCase):
+    """Champion data must survive a startup with no network (the exe starts
+    with Windows): a failed load left every champion a bare id — op.gg was
+    asked for "champion 13"."""
+
+    def setUp(self):
+        cf = lol_tool.DDragon._cache_file()
+        if cf.exists():
+            cf.unlink()
+        self._real_get = lol_tool.requests.get
+
+    def tearDown(self):
+        lol_tool.requests.get = self._real_get
+
+    def _online(self):
+        def get(url, **k):
+            if url.endswith("versions.json"):
+                return _DDResp(["26.20.1"])
+            return _DDResp({"data": _DD_DATA})
+        lol_tool.requests.get = get
+
+    def _offline(self):
+        def get(url, **k):
+            raise ConnectionError("network is unreachable")
+        lol_tool.requests.get = get
+
+    def test_online_load_resolves_names_and_saves_a_copy(self):
+        self._online()
+        dd = lol_tool.DDragon()
+        self.assertEqual(dd.load(), 2)
+        self.assertEqual((dd.name(13), dd.source), ("Ryze", "network"))
+        self.assertEqual(dd.opgg_name(21), "MISS_FORTUNE")
+        self.assertTrue(lol_tool.DDragon._cache_file().exists())
+
+    def test_offline_start_uses_the_saved_copy(self):
+        self._online(); lol_tool.DDragon().load()       # an earlier good session
+        self._offline()
+        dd = lol_tool.DDragon()
+        self.assertEqual(dd.load(), 2)
+        self.assertEqual((dd.name(13), dd.source), ("Ryze", "cache"))
+        self.assertIn("ConnectionError", dd.last_error)
+        self.assertEqual(dd.find_id_fuzzy("missfortune"), 21)
+
+    def test_offline_with_no_copy_reports_zero_and_the_reason(self):
+        self._offline()
+        dd = lol_tool.DDragon()
+        self.assertEqual(dd.load(), 0)
+        self.assertEqual(dd.all_ids(), set())
+        self.assertEqual(dd.name(13), "13")             # the original symptom
+        self.assertIn("unreachable", dd.last_error)
+
+    def test_retry_after_network_returns_succeeds(self):
+        self._offline()
+        dd = lol_tool.DDragon()
+        self.assertEqual(dd.load(), 0)
+        self._online()
+        self.assertEqual(dd.load(), 2)
+        self.assertEqual(dd.name(13), "Ryze")
+
+    def test_failed_refresh_never_wipes_loaded_data(self):
+        self._online()
+        dd = lol_tool.DDragon(); dd.load()
+        self._offline()
+        self.assertEqual(dd.load(), 2)
+        self.assertEqual((dd.name(13), dd.source), ("Ryze", "network"))
+
+    def test_corrupt_copy_is_ignored(self):
+        lol_tool.DDragon._cache_file().write_text("{not json", encoding="utf-8")
+        self._offline()
+        self.assertEqual(lol_tool.DDragon().load(), 0)
+
+    def test_imports_wait_for_champion_names(self):
+        eng = lol_tool.AutoEngine(MagicMock(), lambda: {}, lambda m: None,
+                                  ddragon=lol_tool.DDragon())
+        self.assertFalse(eng._dd_ready())               # nothing loaded yet
+        self._online(); eng._dd.load()
+        self.assertTrue(eng._dd_ready())
+        self.assertTrue(lol_tool.AutoEngine(MagicMock(), lambda: {},
+                                            lambda m: None)._dd_ready())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestAramVariants(unittest.TestCase):
+    """ARAM: Mayhem reports gameMode "KIWI" (queue 2400, map 12)."""
+
+    def test_mayhem_and_map_12_count_as_aram(self):
+        self.assertTrue(lol_tool._is_aram("ARAM"))
+        self.assertTrue(lol_tool._is_aram("KIWI"))
+        self.assertTrue(lol_tool._is_aram("kiwi"))
+        self.assertTrue(lol_tool._is_aram("SOMENEWMODE", 12))    # Howling Abyss
+        self.assertFalse(lol_tool._is_aram("CLASSIC", 11))
+        self.assertFalse(lol_tool._is_aram("", None))
+        self.assertFalse(lol_tool._is_aram("TFT", "x"))
+
+    def test_mayhem_gets_aram_build_data(self):
+        self.assertEqual(lol_tool._opgg_mode("KIWI"), "aram")
+
+    def test_engine_is_aram_follows_mode_and_map(self):
+        eng = lol_tool.AutoEngine(MagicMock(), lambda: {}, lambda m: None)
+        self.assertFalse(eng.is_aram)
+        eng.game_mode, eng.map_id = "KIWI", 12
+        self.assertTrue(eng.is_aram)
+        eng.game_mode, eng.map_id = "CLASSIC", 11
+        self.assertFalse(eng.is_aram)
+
+
+class _GameHost:
+    """Enough of App for _ingame_pick: an LCU stub, DDragon, an engine."""
+    _ingame_pick = lol_tool.App._ingame_pick
+    _OPGG_POS_FROM_GAME = lol_tool.App._OPGG_POS_FROM_GAME
+
+    def __init__(self, routes, game_mode="CLASSIC", map_id=11, names=True):
+        self._lcu = MagicMock()
+        self._lcu.get.side_effect = lambda ep: _FakeResp(
+            200, routes[ep]) if ep in routes else _FakeResp(404)
+        self.ddragon = lol_tool.DDragon()
+        if names:
+            self.ddragon._apply("26.20.1", {
+                "Ryze": {"key": "13", "name": "Ryze", "id": "Ryze"},
+                "Ahri": {"key": "103", "name": "Ahri", "id": "Ahri"}})
+        self._engine = lol_tool.AutoEngine(MagicMock(), lambda: {}, lambda m: None)
+        self._engine.game_mode, self._engine.map_id = game_mode, map_id
+
+
+def _game(team_one, team_two=(), selections=()):
+    return {"/lol-gameflow/v1/session": {"gameData": {
+                "teamOne": list(team_one), "teamTwo": list(team_two),
+                "playerChampionSelections": list(selections)}},
+            "/lol-summoner/v1/current-summoner": {"puuid": "me-puuid", "summonerId": 7}}
+
+
+class TestInGameBuildPick(unittest.TestCase):
+
+    def test_mayhem_game_loads_my_champion_as_aram(self):
+        host = _GameHost(_game([{"puuid": "other", "championId": 103},
+                                {"puuid": "me-puuid", "championId": 13,
+                                 "selectedPosition": "NONE"}]),
+                         game_mode="KIWI", map_id=12)
+        self.assertEqual(host._ingame_pick(), ("Ryze", "", "aram"))
+
+    def test_rift_game_maps_the_position(self):
+        host = _GameHost(_game([], [{"summonerId": 7, "championId": 103,
+                                     "selectedPosition": "UTILITY"}]))
+        self.assertEqual(host._ingame_pick(), ("Ahri", "support", "ranked"))
+
+    def test_falls_back_to_champion_selections(self):
+        host = _GameHost(_game([{"puuid": "me-puuid", "championId": 0}],
+                               selections=[{"puuid": "me-puuid", "championId": 13}]))
+        self.assertEqual(host._ingame_pick()[0], "Ryze")
+
+    def test_never_looks_up_a_bare_id(self):
+        host = _GameHost(_game([{"puuid": "me-puuid", "championId": 13}]), names=False)
+        self.assertIsNone(host._ingame_pick())           # not ("13", …)
+
+    def test_not_in_a_game(self):
+        self.assertIsNone(_GameHost({})._ingame_pick())
+        self.assertIsNone(_GameHost(_game([{"puuid": "someone", "championId": 13}]))
+                          ._ingame_pick())
+
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     loader = unittest.TestLoader()
@@ -800,6 +972,9 @@ if __name__ == "__main__":
         TestScoutingBothTeams,
         TestOpggRetry,
         TestBanSuggestions,
+        TestDDragonLoad,
+        TestAramVariants,
+        TestInGameBuildPick,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

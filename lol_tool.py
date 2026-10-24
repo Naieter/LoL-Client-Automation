@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.22.0"
+APP_VERSION = "1.22.1"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -114,8 +114,21 @@ MAX_ARAM_ITEMS = 15   # ARAM list cap — bench swaps want a deeper pool than 5
 # LCU gameMode → op.gg game_mode. op.gg serves ranked / flex / urf / aram /
 # nexus_blitz (verified live); anything else (CLASSIC, PRACTICETOOL, …) gets
 # ranked data.
-OPGG_GAME_MODE = {"ARAM": "aram", "URF": "urf", "ARURF": "urf",
+OPGG_GAME_MODE = {"ARAM": "aram", "KIWI": "aram", "URF": "urf", "ARURF": "urf",
                   "NEXUSBLITZ": "nexus_blitz"}
+
+# ARAM variants by LCU gameMode. "KIWI" is ARAM: Mayhem (queue 2400, verified
+# live 2026-10-23). Anything on map 12 (Howling Abyss) is ARAM-shaped too, so
+# a new variant with an unknown code name is still caught by its map.
+ARAM_GAME_MODES = {"ARAM", "KIWI"}
+ARAM_MAP_ID     = 12
+
+def _is_aram(game_mode, map_id=0) -> bool:
+    try:
+        on_abyss = int(map_id or 0) == ARAM_MAP_ID
+    except (TypeError, ValueError):
+        on_abyss = False
+    return str(game_mode or "").upper() in ARAM_GAME_MODES or on_abyss
 
 def _opgg_mode(game_mode) -> str:
     return OPGG_GAME_MODE.get(str(game_mode or "").upper(), "ranked")
@@ -598,27 +611,77 @@ class DDragon:
         self._norm_to_id: dict = {}   # alnum-only name/key → int id (fuzzy match)
         self._version: str = None
         self._icon_dir = CONFIG_DIR / "champ_icons"
+        self.source     = ""     # "network" | "cache" | "" (nothing loaded)
+        self.last_error = ""     # why the last network attempt failed
 
-    def load(self):
+    @staticmethod
+    def _cache_file() -> Path:
+        # Resolved at call time so tests (and a moved CONFIG_DIR) are honoured.
+        return CONFIG_DIR / "ddragon_champions.json"
+
+    def load(self) -> int:
+        """Load champion data: Riot's DDragon CDN first, then the copy saved
+        on disk by the last successful download. Returns how many champions
+        are now known (0 = still nothing).
+
+        Started with Windows, the tool can run before the network is up; the
+        old single attempt then left every champion as a bare id for the
+        whole session (op.gg asked for "champion 13"). Callers retry while
+        this returns 0, and the disk copy means an offline start still has
+        names. A failed attempt never wipes data that is already loaded."""
         try:
             ver  = requests.get(f"{DDRAGON_URL}/api/versions.json", timeout=8).json()[0]
-            self._version = ver
             data = requests.get(
                 f"{DDRAGON_URL}/cdn/{ver}/data/en_US/champion.json", timeout=10
             ).json()["data"]
-            for champ in data.values():
-                cid  = int(champ["key"])
-                name = champ["name"]
-                self._id_to_name[cid] = name
-                self._name_to_id[name.lower()] = cid
-                self._id_to_key[cid] = champ["id"]   # e.g. "MissFortune", "DrMundo"
-                # Fuzzy index: strip spaces/punctuation so op.gg's varied name
-                # formats ("Miss Fortune", "MissFortune", "Cho'Gath"/"Chogath",
-                # "Dr. Mundo") all resolve to the right id.
-                self._norm_to_id[self._norm(name)]         = cid
-                self._norm_to_id[self._norm(champ["id"])]  = cid
+            if not data:
+                raise ValueError("empty champion list")
+            self._apply(ver, data)
+            self.source, self.last_error = "network", ""
+            try:
+                self._cache_file().parent.mkdir(parents=True, exist_ok=True)
+                self._cache_file().write_text(
+                    json.dumps({"version": ver, "data": data}), encoding="utf-8")
+            except Exception as e:
+                _dbg(f"[DDragon] cache write failed: {e}")
+            return len(self._id_to_name)
         except Exception as e:
-            print(f"[DDragon] {e}")
+            self.last_error = f"{type(e).__name__}: {str(e)[:120]}"
+            _dbg(f"[DDragon] network load failed: {self.last_error}")
+        if self._id_to_name:
+            return len(self._id_to_name)       # keep what we already have
+        try:
+            cached = json.loads(self._cache_file().read_text(encoding="utf-8"))
+            if cached.get("data"):
+                self._apply(cached.get("version"), cached["data"])
+                self.source = "cache"
+                return len(self._id_to_name)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            _dbg(f"[DDragon] cache read failed: {e}")
+        return 0
+
+    def _apply(self, ver, data: dict):
+        """Build fresh lookup tables, then swap them in at once, so threads
+        reading names mid-load never see a half-filled table."""
+        id_to_name, name_to_id, id_to_key, norm_to_id = {}, {}, {}, {}
+        for champ in data.values():
+            cid  = int(champ["key"])
+            name = champ["name"]
+            id_to_name[cid] = name
+            name_to_id[name.lower()] = cid
+            id_to_key[cid] = champ["id"]   # e.g. "MissFortune", "DrMundo"
+            # Fuzzy index: strip spaces/punctuation so op.gg's varied name
+            # formats ("Miss Fortune", "MissFortune", "Cho'Gath"/"Chogath",
+            # "Dr. Mundo") all resolve to the right id.
+            norm_to_id[self._norm(name)]        = cid
+            norm_to_id[self._norm(champ["id"])] = cid
+        self._name_to_id, self._id_to_key, self._norm_to_id = \
+            name_to_id, id_to_key, norm_to_id
+        self._id_to_name = id_to_name     # last: all_ids() going truthy = ready
+        if ver:
+            self._version = ver
 
     @staticmethod
     def _norm(s: str) -> str:
@@ -889,6 +952,7 @@ class AutoEngine:
         self._tft_detected_logged:  bool  = False # already reported this TFT session
         self.game_mode           = ""    # live session's LCU gameMode ("ARAM", "CLASSIC", "TFT", …)
         self.queue_id            = 0     # live session's queue id (450 = ARAM)
+        self.map_id              = 0     # live session's map (12 = Howling Abyss)
         # ARAM champ select (bench mode) — see _handle_aram_select
         self._aram_initial       = None  # champion the client first dealt us
         self._aram_user_choice   = None  # champion the USER swapped to manually (respected)
@@ -930,7 +994,7 @@ class AutoEngine:
             # No active session — fall back to idle_phase so the overlay
             # updates correctly instead of staying stale as "Lobby" forever.
             phase = idle_phase if idle_phase else "None"
-            self.game_mode, self.queue_id = "", 0
+            self.game_mode, self.queue_id, self.map_id = "", 0, 0
         else:
             sj    = r.json()
             phase = sj.get("phase", "")
@@ -943,6 +1007,10 @@ class AutoEngine:
                 self.queue_id = int(q.get("id") or 0)
             except (TypeError, ValueError):
                 self.queue_id = 0
+            try:
+                self.map_id = int(q.get("mapId") or 0)
+            except (TypeError, ValueError):
+                self.map_id = 0
 
         # Definitive champ-select probe: BOTH gameflow endpoints have been seen
         # in the wild reporting 'Lobby' through an entire champ select, which
@@ -1166,7 +1234,7 @@ class AutoEngine:
         # a champion and the bench is the only choice. The draft logic below
         # would find nothing to act on, but it must never touch a bench lobby,
         # so hand the whole session to the ARAM handler instead.
-        if session.get("benchEnabled") or self.game_mode.upper() == "ARAM":
+        if session.get("benchEnabled") or self.is_aram:
             self._handle_aram_select(cfg, session)
             return
 
@@ -1558,7 +1626,7 @@ class AutoEngine:
                         and a.get("type") == "pick"
                         and a.get("completed")):
                     locked = int(a.get("championId", 0) or 0)
-        if locked:
+        if locked and self._dd_ready():
             key = (locked, assigned_role)
             do_runes  = bool(cfg.get("autoRunes"))
             do_spells = bool(cfg.get("autoSpells"))
@@ -1705,7 +1773,8 @@ class AutoEngine:
                     self._log(f"[debug] ARAM reroll HTTP {r.status_code} {r.text[:120]}")
 
         # ── Imports once the champion in hand has settled ──
-        if current and now - self._aram_champ_since >= self.ARAM_IMPORT_WAIT:
+        if (current and self._dd_ready()
+                and now - self._aram_champ_since >= self.ARAM_IMPORT_WAIT):
             key = (current, ARAM_ROLE)
             do_runes  = bool(cfg.get("autoRunes"))
             do_spells = bool(cfg.get("autoSpells"))
@@ -2230,6 +2299,17 @@ class AutoEngine:
             pass
         # Fallback: assume everything is pickable
         return set(range(1_000_000))
+
+    @property
+    def is_aram(self) -> bool:
+        """ARAM or an ARAM variant (ARAM: Mayhem = "KIWI", any map-12 queue)."""
+        return _is_aram(self.game_mode, self.map_id)
+
+    def _dd_ready(self) -> bool:
+        """True once champion names are loaded (or no DDragon is attached).
+        Imports wait for it — run with bare ids they look up nothing and,
+        because each import fires once per champion, never run again."""
+        return self._dd is None or bool(self._dd.all_ids())
 
     @staticmethod
     def _best(priority: list, unavailable: set, playable: set):
@@ -4569,13 +4649,41 @@ class App(tk.Tk):
         ).start())
 
     # ── Champion data ─────────────────────────────────────────────────────────
+    DDRAGON_RETRY_FIRST = 15    # s before the first retry when nothing loaded
+    DDRAGON_RETRY_MAX   = 120   # s cap for the backoff (and the online refresh)
+
     def _load_champs(self):
+        """Background thread: load champion data, retrying with backoff until
+        something loads. Without names, builds, runes, item sets and the
+        overlay all fail ("Unknown champion: '13'")."""
         self.log("Loading champion data...")
-        self.ddragon.load()
+        delay, warned = self.DDRAGON_RETRY_FIRST, False
+        while True:
+            n = self.ddragon.load()
+            if n:
+                break
+            if not warned:
+                warned = True
+                self.log(f"Couldn't load champion data ({self.ddragon.last_error or 'no network'}) "
+                         f"— retrying in the background until it works.")
+            time.sleep(delay)
+            delay = min(delay * 2, self.DDRAGON_RETRY_MAX)
+        offline = self.ddragon.source == "cache"
+        self.log(f"Loaded {n} champions"
+                 + (" from the saved copy (offline) — refreshing once online." if offline else "."))
         self.after(0, self._refresh_all)
-        self.log(f"Loaded {len(self.ddragon.all_display_names())} champions.")
         self._prefetch_icons()   # network I/O — safe here, already off the UI thread
         self.refresh_opgg_stats()   # per-chip op.gg history (needs the client connected)
+        # Started from the disk copy: keep trying the CDN quietly so a new
+        # patch's champions and icon version arrive without a restart.
+        while self.ddragon.source == "cache":
+            time.sleep(self.DDRAGON_RETRY_MAX)
+            self.ddragon.load()
+            if self.ddragon.source == "network":
+                self.log(f"Champion data refreshed online "
+                         f"({len(self.ddragon.all_ids())} champions).")
+                self.after(0, self._refresh_all)
+                self._prefetch_icons()
 
     def get_champ_stats(self, cid):
         """op.gg season history for a champion, for the chip's right third.
@@ -4643,6 +4751,11 @@ class App(tk.Tk):
         return "NA"
 
     def _champ_select_pick(self):
+        if not self.ddragon.all_ids():
+            return None     # no names yet — the hover watcher retries each second
+        return self._champ_select_pick_raw()
+
+    def _champ_select_pick_raw(self):
         """(champion display name, op.gg position, op.gg game mode) for the
         local player's current champ-select pick/intent, or None if not in
         champ select. In ARAM (bench lobbies) the position is "" and the mode
@@ -4662,17 +4775,66 @@ class App(tk.Tk):
                     break
             if not cid:
                 return None
-            if s.get("benchEnabled") or self._engine.game_mode.upper() == "ARAM":
+            if s.get("benchEnabled") or self._engine.is_aram:
                 return (self.ddragon.name(cid), "", "aram")
             pos = OPGG_POSITION.get(assigned, "")
             return (self.ddragon.name(cid), pos, _opgg_mode(self._engine.game_mode))
         except Exception:
             return None
 
+    _OPGG_POS_FROM_GAME = {"top": "top", "jungle": "jungle", "middle": "mid",
+                           "mid": "mid", "bottom": "adc", "utility": "support",
+                           "support": "support"}
+
+    def _ingame_pick(self):
+        """(champion name, op.gg position, op.gg mode) for the local player in
+        the LIVE game, from the gameflow session — the fallback when champ
+        select was missed (tool started mid-game, or champion names only
+        arrived after champ select). None if unknown."""
+        try:
+            if not self.ddragon.all_ids():
+                return None
+            r = self._lcu.get("/lol-gameflow/v1/session")
+            if r.status_code != 200:
+                return None
+            gd = r.json().get("gameData") or {}
+            me = self._lcu.get("/lol-summoner/v1/current-summoner")
+            me = me.json() if me.status_code == 200 else {}
+            puuid = str(me.get("puuid") or "")
+            sid   = int(me.get("summonerId") or 0)
+
+            def mine(e):
+                return ((puuid and str(e.get("puuid") or "") == puuid)
+                        or (sid and int(e.get("summonerId") or 0) == sid))
+
+            cid, pos = 0, ""
+            for e in (gd.get("teamOne") or []) + (gd.get("teamTwo") or []):
+                if isinstance(e, dict) and mine(e):
+                    cid = int(e.get("championId") or 0)
+                    pos = str(e.get("selectedPosition") or "").lower()
+                    break
+            if not cid:
+                for e in gd.get("playerChampionSelections") or []:
+                    if isinstance(e, dict) and mine(e):
+                        cid = int(e.get("championId") or 0)
+                        break
+            if not cid:
+                return None
+            name = self.ddragon.name(cid)
+            if self._engine.is_aram:
+                return (name, "", "aram")
+            return (name, self._OPGG_POS_FROM_GAME.get(pos, ""),
+                    _opgg_mode(self._engine.game_mode))
+        except Exception as e:
+            _dbg(f"[build] in-game pick: {e}")
+            return None
+
     def _watch_build_hover(self):
         """Poll champ select and mirror the locally-hovered champion into the
         Builds tab — auto-pick pre-hover or a manual hover both count, replacing
-        whatever was searched. Runs on its own daemon thread."""
+        whatever was searched. Once the game is running, the live game's
+        champion is used if champ select never produced a build. Runs on its
+        own daemon thread."""
         last = None
         last_locked = None
         while True:
@@ -4680,11 +4842,18 @@ class App(tk.Tk):
                 pick = self._champ_select_pick()   # (name, pos, mode) or None
             except Exception:
                 pick = None
+            from_game = False
+            if pick is None and getattr(self._engine, "_last_phase", "") \
+                    in ("GameStart", "InProgress"):
+                pick, from_game = self._ingame_pick(), True
             if pick and pick != last:
+                # Carried over from champ select (same champion): keep that
+                # load — it knows the assigned role, the game data often doesn't.
+                if not (from_game and last and last[0] == pick[0]):
+                    self.after(0, lambda p=pick: self._auto_load_build(*p))
                 last = pick
-                self.after(0, lambda p=pick: self._auto_load_build(*p))
             elif pick is None and last is not None:
-                # Left champ select — let the next hover re-trigger a load.
+                # Left champ select / the game — the next pick loads afresh.
                 last = None
             # When our pick locks in, pop the window up on the Builds tab.
             try:
@@ -4825,6 +4994,9 @@ class App(tk.Tk):
         structured dict (see _render_build) or an {'error': msg}."""
         cid = self.ddragon.find_id_fuzzy(champ_name)
         if cid is None:
+            if not self.ddragon.all_ids():
+                return {"error": "Champion data is still loading — the build "
+                                 "will appear once it's ready."}
             return {"error": f"Unknown champion: {champ_name!r}"}
         og_name = self.ddragon.opgg_name(cid)          # UPPER_SNAKE_CASE
         mode = (mode or "ranked").lower()
