@@ -955,6 +955,93 @@ class TestInGameBuildPick(unittest.TestCase):
         self.assertIsNone(_GameHost(_game([{"puuid": "someone", "championId": 13}]))
                           ._ingame_pick())
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+FLASH, GHOST, HEAL, IGNITE, MARK, MARK_ALT = 4, 6, 7, 14, 32, 39
+
+
+class TestSpellKeys(unittest.TestCase):
+    """Pin summoner spells to D or F; imports keep the pair, reorder only."""
+
+    order = staticmethod(lol_tool._order_spells)
+
+    def setUp(self):
+        cf = lol_tool.CONFIG_FILE
+        if cf.exists():
+            cf.unlink()
+
+    def test_defaults_are_off_and_change_nothing(self):
+        cfg = lol_tool.load_config()
+        self.assertEqual((cfg["spellKeyD"], cfg["spellKeyF"]), (0, 0))
+        self.assertEqual(self.order([FLASH, IGNITE], cfg), [FLASH, IGNITE])
+        self.assertEqual(self.order([IGNITE, FLASH], cfg), [IGNITE, FLASH])
+
+    def test_flash_on_f(self):
+        cfg = {"spellKeyF": FLASH}
+        self.assertEqual(self.order([FLASH, IGNITE], cfg), [IGNITE, FLASH])
+        self.assertEqual(self.order([HEAL, FLASH], cfg), [HEAL, FLASH])
+
+    def test_flash_on_d(self):
+        cfg = {"spellKeyD": FLASH}
+        self.assertEqual(self.order([IGNITE, FLASH], cfg), [FLASH, IGNITE])
+        self.assertEqual(self.order([FLASH, HEAL], cfg), [FLASH, HEAL])
+
+    def test_two_pins_both_honoured(self):
+        cfg = {"spellKeyD": GHOST, "spellKeyF": FLASH}
+        self.assertEqual(self.order([FLASH, GHOST], cfg), [GHOST, FLASH])
+        self.assertEqual(self.order([GHOST, FLASH], cfg), [GHOST, FLASH])
+        # only one of the pinned spells in the pair: that one still lands right
+        self.assertEqual(self.order([FLASH, HEAL], cfg), [HEAL, FLASH])
+        self.assertEqual(self.order([HEAL, GHOST], cfg), [GHOST, HEAL])
+
+    def test_never_changes_which_spells_are_imported(self):
+        cfg = {"spellKeyD": IGNITE, "spellKeyF": FLASH}
+        self.assertEqual(self.order([GHOST, HEAL], cfg), [GHOST, HEAL])
+        for pair in ([FLASH, IGNITE], [IGNITE, FLASH], [GHOST, FLASH], [HEAL, IGNITE]):
+            self.assertEqual(sorted(self.order(pair, cfg)), sorted(pair))
+
+    def test_mark_matches_both_ids(self):
+        self.assertEqual(self.order([MARK_ALT, FLASH], {"spellKeyF": MARK}), [FLASH, MARK_ALT])
+        self.assertEqual(self.order([MARK, FLASH], {"spellKeyF": MARK_ALT}), [FLASH, MARK])
+
+    def test_tolerates_odd_input(self):
+        self.assertEqual(self.order([], {"spellKeyF": FLASH}), [])
+        self.assertEqual(self.order([FLASH], {"spellKeyF": FLASH}), [FLASH])
+        self.assertEqual(self.order(["4", "14"], {"spellKeyF": "4"}), [14, 4])
+        self.assertEqual(self.order([FLASH, IGNITE], None), [FLASH, IGNITE])
+        self.assertEqual(self.order([FLASH, IGNITE], {"spellKeyF": "junk"}), [FLASH, IGNITE])
+
+    def test_lock_in_import_pushes_the_users_order(self):
+        """End to end through _import_runes_spells: op.gg says Flash + Ignite,
+        the user wants Flash on F → the client gets D Ignite, F Flash."""
+        cfg = lol_tool.load_config()
+        cfg["spellKeyF"] = FLASH
+        lcu = MagicMock()
+        lcu.patch.return_value = MagicMock(status_code=204)
+        logs = []
+        dd = MagicMock()
+        dd.opgg_name.return_value = "AHRI"
+        dd.name.return_value = "Ahri"
+        eng = lol_tool.AutoEngine(lcu, lambda: cfg, logs.append, ddragon=dd)
+        eng._opgg_runes = lambda *a, **k: (8100, [1, 2, 3, 4, 5, 6], 8200, [FLASH, IGNITE])
+        eng._import_runes_spells(103, "middle", do_runes=False, do_spells=True)
+        ep, body = lcu.patch.call_args[0]
+        self.assertEqual(ep, "/lol-champ-select/v1/session/my-selection")
+        self.assertEqual(body, {"spell1Id": IGNITE, "spell2Id": FLASH})
+        self.assertIn("D Ignite · F Flash", " ".join(logs))
+
+    def test_role_default_fallback_is_ordered_too(self):
+        cfg = {"spellKeyD": FLASH, "autoSpells": True}
+        lcu = MagicMock()
+        lcu.patch.return_value = MagicMock(status_code=204)
+        dd = MagicMock()
+        dd.opgg_name.return_value = "LEE_SIN"
+        dd.name.return_value = "Lee Sin"
+        eng = lol_tool.AutoEngine(lcu, lambda: cfg, lambda m: None, ddragon=dd)
+        eng._opgg_runes = lambda *a, **k: (8100, [1, 2, 3, 4, 5, 6], 8200, [])  # no meta spells
+        eng._import_runes_spells(64, "jungle", do_runes=False, do_spells=True)
+        self.assertEqual(lcu.patch.call_args[0][1], {"spell1Id": FLASH, "spell2Id": 11})
+
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     loader = unittest.TestLoader()
@@ -975,6 +1062,7 @@ if __name__ == "__main__":
         TestDDragonLoad,
         TestAramVariants,
         TestInGameBuildPick,
+        TestSpellKeys,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

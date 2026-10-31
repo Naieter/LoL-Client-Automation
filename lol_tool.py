@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.22.1"
+APP_VERSION = "1.23.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -204,6 +204,8 @@ DEFAULT_CONFIG = {
     "buildOverlayX":        None,      # saved build overlay screen position (None = default)
     "buildOverlayY":        None,
     "buildOverlayAutoShow": False,     # pop the build overlay up when the game starts
+    "spellKeyD": 0,   # summoner spell id that always goes on D when imported (0 = any)
+    "spellKeyF": 0,   # summoner spell id that always goes on F when imported (0 = any)
     "roleChampions": {role: {"picks": [], "bans": []}
                       for role in ROLES + [ARAM_ROLE]},
 }
@@ -405,6 +407,46 @@ SUMMONER_SPELLS = {
 
 def _spell_name(sid):
     return SUMMONER_SPELLS.get(int(sid), f"Spell {sid}")
+
+
+# Spells offered for the D / F key preference, in the order players think of them.
+SPELL_KEY_CHOICES = [(4, "Flash"), (6, "Ghost"), (7, "Heal"), (21, "Barrier"),
+                     (3, "Exhaust"), (14, "Ignite"), (12, "Teleport"),
+                     (11, "Smite"), (1, "Cleanse"), (13, "Clarity"), (32, "Mark")]
+# Mark/Snowball has two ids (ARAM vs. other modes); pin either, match both.
+_SPELL_SAME = {39: 32}
+
+
+def _order_spells(spells, cfg=None) -> list:
+    """Put an imported spell pair in [D, F] order per the user's key setting
+    (cfg spellKeyD / spellKeyF). Only reorders — the pair itself is never
+    changed: pin Flash to F and a Ghost + Heal build stays Ghost + Heal.
+    In the LCU, spell1Id is the D key and spell2Id is the F key."""
+    pair = []
+    for x in list(spells or [])[:2]:
+        try:
+            pair.append(int(x))
+        except (TypeError, ValueError):
+            return list(spells or [])[:2]
+    if len(pair) < 2:
+        return pair
+    cfg = cfg or {}
+
+    def pin(key):
+        try:
+            v = int(cfg.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return _SPELL_SAME.get(v, v)
+
+    key_d, key_f = pin("spellKeyD"), pin("spellKeyF")
+    a, b = pair
+    na, nb = _SPELL_SAME.get(a, a), _SPELL_SAME.get(b, b)
+    if key_f and na == key_f and nb != key_f:
+        a, b = b, a          # the F spell is sitting on D
+    elif key_d and nb == key_d and na != key_d:
+        a, b = b, a          # the D spell is sitting on F
+    return [a, b]
 
 # Summoner-spell id → DDragon icon image name (…/img/spell/<name>.png).
 SPELL_IMG = {
@@ -1868,12 +1910,14 @@ class AutoEngine:
             if do_spells:
                 if len(spells) < 2:
                     spells = list(ROLE_SPELLS.get((position or "").lower(), (4, 14)))
+                spells = _order_spells(spells, self._cfg())   # user's D / F keys
                 rs = self._lcu.patch(
                     "/lol-champ-select/v1/session/my-selection",
                     {"spell1Id": int(spells[0]), "spell2Id": int(spells[1])},
                 )
                 if rs.status_code in (200, 204):
-                    self._log("Imported meta summoner spells.")
+                    self._log(f"Imported meta summoner spells: D {_spell_name(spells[0])}"
+                              f" · F {_spell_name(spells[1])}.")
                 else:
                     self._log(f"[runes] spells HTTP {rs.status_code} {rs.text[:120]}")
         except Exception as e:
@@ -5095,8 +5139,11 @@ class App(tk.Tk):
             "pick_rate":  st.get("pick_rate"),
             "ban_rate":   st.get("ban_rate"),
             "damage":     d.get("damage_type"),
-            "spells":     [_spell_name(s) for s in (spell_ids or [])],
-            "spell_ids":  [int(s) for s in (spell_ids or []) if str(s).isdigit()],
+            "spells":     [_spell_name(s) for s in
+                           _order_spells([s for s in (spell_ids or [])
+                                          if str(s).isdigit()], self.cfg)],
+            "spell_ids":  _order_spells([int(s) for s in (spell_ids or [])
+                                         if str(s).isdigit()], self.cfg),
             "starter":    names(d.get("starter_items")),
             "starter_ids": starter_ids,
             "core":       names(d.get("core_items")),
@@ -5157,7 +5204,7 @@ class App(tk.Tk):
         prim = [int(x) for x in (rn.get("primary_rune_ids") or [])]
         sec  = [int(x) for x in (rn.get("secondary_rune_ids") or [])]
         shard = [int(x) for x in (rn.get("stat_mod_ids") or [])]
-        sids = [int(x) for x in (sp.get("ids") or [])][:2]
+        sids = _order_spells([int(x) for x in (sp.get("ids") or [])][:2], self.cfg)
         if not (prim and sec and len(sids) == 2):
             return None
         return {
@@ -7398,7 +7445,7 @@ class App(tk.Tk):
                                            combo["secondary_page_id"], perks)
                 runes_ok = getattr(rp, "status_code", 0) in (200, 201)
 
-            sids = combo.get("spell_ids", [])
+            sids = _order_spells(combo.get("spell_ids", []), self.cfg)
             spells_status = None
             if len(sids) == 2:
                 rs = self._lcu.patch("/lol-champ-select/v1/session/my-selection",
@@ -7576,6 +7623,30 @@ class App(tk.Tk):
               self._reset_build_overlay_pos).pack(anchor="w", pady=(10, 0))
         _hint(s, "In-game it needs Borderless or Windowed mode — exclusive "
                  "Fullscreen hides every overlay.")
+
+        # ── Summoner Spell Keys ───────────────────────────────────────────────
+        s = _section("Summoner Spell Keys")
+        labels = ["Any"] + [n for _, n in SPELL_KEY_CHOICES]
+        id_to_label = {sid: n for sid, n in SPELL_KEY_CHOICES}
+        self._spell_key_vars = {}
+        for key in ("D", "F"):
+            row = _row(s, f"{key} key:")
+            cur = int(self.cfg.get(f"spellKey{key}") or 0)
+            var = tk.StringVar(value=id_to_label.get(_SPELL_SAME.get(cur, cur), "Any"))
+            self._spell_key_vars[key] = var
+            om = tk.OptionMenu(row, var, *labels,
+                               command=lambda v, k=key: self._set_spell_key(k, v))
+            om.config(bg=BTN_BG, fg=WHITE, activebackground=BTN_HOV,
+                      activeforeground=WHITE, relief="flat", highlightthickness=0,
+                      font=FONT_BTN, width=10, cursor="hand2", bd=0)
+            om["menu"].config(bg=PANEL, fg=WHITE, activebackground=GOLD,
+                              activeforeground=DARK, font=FONT_SMALL, bd=0)
+            om.pack(side="left", padx=(8, 0))
+        _hint(s, "When an imported spell pair includes the spell you pick, it always "
+                 "lands on that key — auto import and the Builds tab's Apply both "
+                 "follow it.")
+        _hint(s, "It never changes which two spells you get: with Flash on F, a "
+                 "Ghost + Heal build stays Ghost + Heal.")
 
         # ── Party Ready-Up ────────────────────────────────────────────────────
         s = _section("Party Ready-Up")
@@ -8092,6 +8163,23 @@ class App(tk.Tk):
         if hasattr(self, "_overlay_enabled_var"):
             self._overlay_enabled_var.set(new_val)
         self.log(f"Overlay {'enabled' if new_val else 'disabled'} (hotkey).")
+
+    def _set_spell_key(self, key: str, label: str):
+        """Settings: pin a summoner spell to D or F (label 'Any' clears it).
+        A spell can only own one key, so picking it for D clears it from F
+        and vice versa."""
+        sid = next((i for i, n in SPELL_KEY_CHOICES if n == label), 0)
+        other = "F" if key == "D" else "D"
+        self.cfg[f"spellKey{key}"] = sid
+        if sid and int(self.cfg.get(f"spellKey{other}") or 0) == sid:
+            self.cfg[f"spellKey{other}"] = 0
+            var = getattr(self, "_spell_key_vars", {}).get(other)
+            if var is not None:
+                var.set("Any")
+        save_config(self.cfg)
+        d = _spell_name(self.cfg["spellKeyD"]) if self.cfg.get("spellKeyD") else "any"
+        f = _spell_name(self.cfg["spellKeyF"]) if self.cfg.get("spellKeyF") else "any"
+        self.log(f"Summoner spell keys: D = {d}, F = {f}.")
 
     def _set_build_overlay_visible(self, on: bool):
         ov = getattr(self, "_build_overlay", None)

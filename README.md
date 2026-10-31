@@ -22,7 +22,7 @@ Grab the latest release from the [Releases page](https://github.com/Naieter/LoL-
 - **Auto Pick** — locks your champion from a per-role priority list (configurable delay)
 - **Auto Pre-Pick** — hovers your champion during the planning phase
 - **Auto Ban** — bans from your per-role ban list (configurable delay); perma-ban list always goes first regardless of role
-- **Auto Runes** — imports meta rune pages and summoner spells from op.gg for your locked champion
+- **Auto Runes** — imports meta rune pages and summoner spells from op.gg for your locked champion — summoner spells land on your preferred keys (Settings → Summoner Spell Keys, e.g. Flash always on F)
 
 ### ARAM
 ARAM has no bans and no pick turns — the client deals you a champion and the bench is the only choice. The tool handles that from a single **ARAM priority list** (Champions → ARAM tab, up to 15 champions):
@@ -163,6 +163,14 @@ The overlay button over the League client shows the current state and lets you t
 |---|---|---|
 | Swap | On | Swap with a higher-priority champion on the bench |
 | Reroll | On | Reroll when nothing on your ARAM list is in hand or on the bench |
+
+### Summoner Spell Keys
+| Setting | Default | Description |
+|---|---|---|
+| D key | Any | Spell that always goes on D when an imported pair includes it |
+| F key | Any | Spell that always goes on F when an imported pair includes it (e.g. Flash on F) |
+
+Applies to the automatic import on lock-in and to the Builds tab's Apply button. It only reorders the pair: it never changes which two spells are imported.
 
 ### Party Ready-Up
 | Setting | Default | Description |
