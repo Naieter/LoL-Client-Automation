@@ -499,6 +499,7 @@ class _ScoutHost:
     _scout_my_summoner_id     = lol_tool.App._scout_my_summoner_id
     _scout_lobby_roster       = lol_tool.App._scout_lobby_roster
     _scout_champselect_roster = lol_tool.App._scout_champselect_roster
+    _scout_roster_from_session = lol_tool.App._scout_roster_from_session
 
     def __init__(self, routes):
         self._routes = routes
@@ -1042,6 +1043,198 @@ class TestSpellKeys(unittest.TestCase):
         eng._import_runes_spells(64, "jungle", do_runes=False, do_spells=True)
         self.assertEqual(lcu.patch.call_args[0][1], {"spell1Id": FLASH, "spell2Id": 11})
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+ZED, AHRI, YASUO, JINX = 238, 103, 157, 222
+
+
+def _r5s_session(my_ban_champ=0, time_left=25000, enemy_locked_cells=(), bans_done=()):
+    """A Ranked 5s champ select shaped like the live one (2026-11-20): enemy
+    names visible, bans one at a time. Local player = cell 3, whose ban is up."""
+    my_team = [{"cellId": c, "summonerId": 100 + c, "puuid": f"p{c}",
+                "gameName": f"Ally{c}", "tagLine": "NA1", "championId": 0,
+                "assignedPosition": pos}
+               for c, pos in zip(range(5), ("top", "bottom", "utility", "middle", "jungle"))]
+    their = [{"cellId": c, "summonerId": 100 + c, "puuid": f"p{c}",
+              "gameName": f"Foe{c}", "tagLine": "NA1",
+              "championId": JINX if c in enemy_locked_cells else 0,
+              "assignedPosition": ""} for c in range(5, 10)]
+    actions = [[{"id": 90 + c, "actorCellId": c, "type": "pick", "completed": True,
+                 "isInProgress": False, "championId": JINX}] for c in enemy_locked_cells]
+    actions.append([{"id": 50, "actorCellId": 3, "type": "ban", "isInProgress": True,
+                     "completed": False, "championId": my_ban_champ, "isAllyAction": True}])
+    return {"localPlayerCellId": 3, "myTeam": my_team, "theirTeam": their,
+            "actions": actions,
+            "bans": {"myTeamBans": list(bans_done), "theirTeamBans": []},
+            "timer": {"adjustedTimeLeftInPhase": time_left, "isInfinite": False,
+                      "phase": "BAN_PICK"}}
+
+
+def _r5s_engine(session, plan, cfg_extra=None, queue=710):
+    cfg = lol_tool.load_config()
+    cfg.update({"autoBan": True, "autoPick": False, "autoPrePick": False,
+                "autoRunes": False, "autoSpells": False, "autoItems": False,
+                "banDelay": 0})
+    cfg["roleChampions"]["middle"]["bans"] = [YASUO]       # the user's own ban list
+    cfg.update(cfg_extra or {})
+    lcu = MagicMock()
+    routes = {"/lol-champ-select/v1/session": session,
+              "/lol-champ-select/v1/pickable-champion-ids": []}
+    lcu.get.side_effect = lambda ep: _FakeResp(200, routes[ep]) if ep in routes \
+        else _FakeResp(404)
+    lcu.patch.return_value = MagicMock(status_code=204, text="")
+    logs = []
+    eng = lol_tool.AutoEngine(lcu, lambda: cfg, logs.append, scout_bans_fn=plan)
+    eng.queue_id = queue
+    return eng, lcu, logs
+
+
+def _patched(lcu):
+    return [(c[0][1]["championId"], c[0][1]["completed"]) for c in lcu.patch.call_args_list
+            if "/actions/" in c[0][0]]
+
+
+class TestRanked5sScoutingBans(unittest.TestCase):
+
+    def setUp(self):
+        cf = lol_tool.CONFIG_FILE
+        if cf.exists():
+            cf.unlink()
+
+    def test_defaults_on(self):
+        self.assertTrue(lol_tool.load_config()["autoBanScouting"])
+        self.assertIn(710, lol_tool.SCOUT_BAN_QUEUES)
+
+    def test_hovers_then_bans_the_scouting_pick_over_the_ban_list(self):
+        plan = lambda sess: ([ZED, AHRI], {ZED: "Foe5: 40 of 40 games"}, 0)
+        eng, lcu, logs = _r5s_engine(_r5s_session(), plan)
+        eng._handle_champ_select(eng._cfg())
+        self.assertEqual(_patched(lcu), [(ZED, False)])            # hover Zed, not Yasuo
+        # client echoes the hover → next poll locks it (banDelay 0)
+        eng, lcu2, logs = eng, MagicMock(), logs
+        eng._lcu = lcu2
+        sess = _r5s_session(my_ban_champ=ZED)
+        routes = {"/lol-champ-select/v1/session": sess,
+                  "/lol-champ-select/v1/pickable-champion-ids": []}
+        lcu2.get.side_effect = lambda ep: _FakeResp(200, routes[ep]) if ep in routes \
+            else _FakeResp(404)
+        lcu2.patch.return_value = MagicMock(status_code=204, text="")
+        eng._handle_champ_select(eng._cfg())
+        self.assertEqual(_patched(lcu2), [(ZED, True)])
+        self.assertTrue(any("Banned" in l and "scouting" in l and "Foe5" in l for l in logs))
+
+    def test_scouting_goes_ahead_of_permabans(self):
+        plan = lambda sess: ([ZED], {ZED: "x"}, 0)
+        eng, lcu, _ = _r5s_engine(_r5s_session(), plan, {"permaBans": [AHRI]})
+        eng._handle_champ_select(eng._cfg())
+        self.assertEqual(_patched(lcu)[0][0], ZED)
+
+    def test_already_banned_scouting_pick_moves_to_the_next(self):
+        plan = lambda sess: ([ZED, AHRI], {ZED: "a", AHRI: "b"}, 0)
+        eng, lcu, _ = _r5s_engine(_r5s_session(bans_done=[ZED]), plan)
+        eng._handle_champ_select(eng._cfg())
+        self.assertEqual(_patched(lcu)[0][0], AHRI)
+
+    def test_holds_the_lock_while_enemy_stats_are_loading(self):
+        plan = lambda sess: ([], {}, 3)                        # fetches still running
+        eng, lcu, _ = _r5s_engine(_r5s_session(my_ban_champ=YASUO), plan)
+        eng._ban_hovered[50] = YASUO                           # fallback already hovered
+        eng._handle_champ_select(eng._cfg())
+        self.assertNotIn((YASUO, True), _patched(lcu))         # no lock yet
+
+    def test_still_bans_when_the_turn_is_ending(self):
+        plan = lambda sess: ([], {}, 3)
+        eng, lcu, logs = _r5s_engine(_r5s_session(my_ban_champ=YASUO, time_left=3000), plan)
+        eng._ban_hovered[50] = YASUO
+        eng._handle_champ_select(eng._cfg())
+        self.assertIn((YASUO, True), _patched(lcu))            # never miss a ban
+        self.assertTrue(any("no scouting data" in l for l in logs))
+
+    def test_other_queues_ignore_scouting(self):
+        plan = MagicMock(return_value=([ZED], {ZED: "x"}, 0))
+        eng, lcu, _ = _r5s_engine(_r5s_session(), plan, queue=420)   # solo/duo
+        eng._handle_champ_select(eng._cfg())
+        self.assertEqual(_patched(lcu)[0][0], YASUO)
+        plan.assert_not_called()
+
+    def test_setting_off_ignores_scouting(self):
+        plan = MagicMock(return_value=([ZED], {ZED: "x"}, 0))
+        eng, lcu, _ = _r5s_engine(_r5s_session(), plan, {"autoBanScouting": False})
+        eng._handle_champ_select(eng._cfg())
+        self.assertEqual(_patched(lcu)[0][0], YASUO)
+        plan.assert_not_called()
+
+    def test_broken_plan_falls_back_to_the_ban_list(self):
+        def plan(sess):
+            raise RuntimeError("boom")
+        eng, lcu, _ = _r5s_engine(_r5s_session(), plan)
+        eng._handle_champ_select(eng._cfg())
+        self.assertEqual(_patched(lcu)[0][0], YASUO)
+
+
+class _PlanHost:
+    """Enough of App for _scout_ban_plan."""
+    _scout_ban_plan            = lol_tool.App._scout_ban_plan
+    _scout_roster_from_session = lol_tool.App._scout_roster_from_session
+    _scout_member_identity     = staticmethod(lol_tool.App._scout_member_identity)
+    _scout_ban_suggestions     = staticmethod(lol_tool.App._scout_ban_suggestions)
+    _SCOUT_OFF_MAP             = lol_tool.App._SCOUT_OFF_MAP
+
+    def __init__(self, cache):
+        self._scout_cache = cache
+        self.kicked = []
+        self.ddragon = lol_tool.DDragon()
+        self.ddragon._apply("26.23.1", {
+            "Zed": {"key": str(ZED), "name": "Zed", "id": "Zed"},
+            "Ahri": {"key": str(AHRI), "name": "Ahri", "id": "Ahri"},
+            "Jinx": {"key": str(JINX), "name": "Jinx", "id": "Jinx"}})
+
+    def _scout_kick_fetch(self, name, tag):
+        self.kicked.append(name)
+
+    def _scout_champ_name(self, cid):
+        return self.ddragon.name(cid) if cid else None
+
+
+def _pool(*champs):
+    return {"prof": {"pool": [{"id": 0, "name": c, "play": g, "win": w, "lose": g - w}
+                              for c, g, w in champs],
+                     "pool_games": sum(g for _, g, _ in champs)},
+            "games": [], "ok": True}
+
+
+class TestScoutBanPlan(unittest.TestCase):
+
+    def test_plan_ranks_enemies_and_reports_missing_ones(self):
+        host = _PlanHost({("Foe5", "NA1"): _pool(("Zed", 40, 26)),
+                          ("Foe6", "NA1"): _pool(("Ahri", 10, 5), ("Jinx", 10, 5))})
+        ids, why, pending = host._scout_ban_plan(_r5s_session())
+        self.assertEqual(ids[0], ZED)
+        self.assertIn("Foe5", why[ZED])
+        self.assertEqual(pending, 3)                      # Foe7..Foe9 not fetched
+        self.assertEqual(sorted(host.kicked), ["Foe7", "Foe8", "Foe9"])
+
+    def test_locked_enemies_stop_counting(self):
+        # Foe5 (the Zed one-trick) already locked Jinx in the first pick phase
+        host = _PlanHost({("Foe5", "NA1"): _pool(("Zed", 40, 26)),
+                          ("Foe6", "NA1"): _pool(("Ahri", 10, 5))})
+        ids, why, _ = host._scout_ban_plan(_r5s_session(enemy_locked_cells=(5,)))
+        self.assertNotIn(ZED, ids)
+        self.assertEqual(ids[0], AHRI)
+
+    def test_roster_marks_locked_players(self):
+        host = _PlanHost({})
+        roster = host._scout_roster_from_session(_r5s_session(enemy_locked_cells=(6,)))
+        locked = {p["name"]: p["locked"] for p in roster}
+        self.assertTrue(locked["Foe6"])
+        self.assertFalse(locked["Foe5"])
+        self.assertEqual(len(roster), 10)
+
+    def test_suggestions_skip_locked_enemies(self):
+        roster = [{"name": "Foe5", "tag": "NA1", "ally": False, "bot": False, "locked": True}]
+        self.assertEqual(lol_tool.App._scout_ban_suggestions(
+            roster, {("Foe5", "NA1"): _pool(("Zed", 40, 26))}), [])
+
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     loader = unittest.TestLoader()
@@ -1063,6 +1256,8 @@ if __name__ == "__main__":
         TestAramVariants,
         TestInGameBuildPick,
         TestSpellKeys,
+        TestRanked5sScoutingBans,
+        TestScoutBanPlan,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

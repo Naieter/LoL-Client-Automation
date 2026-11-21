@@ -164,6 +164,13 @@ The overlay button over the League client shows the current state and lets you t
 | Swap | On | Swap with a higher-priority champion on the bench |
 | Reroll | On | Reroll when nothing on your ARAM list is in hand or on the bench |
 
+### Ranked 5s
+| Setting | Default | Description |
+|---|---|---|
+| Auto-ban from scouting | On | In Ranked 5s, Auto Ban takes the Scouting tab's top ban suggestion first (ahead of permabans and role bans) |
+
+Ranked 5s shows the enemy team in champ select, so the tool scouts them and bans what those players actually play, weighted toward narrow champion pools. Enemies who already locked a champion stop counting, which keeps the second ban phase pointed at players still to pick. If enemy stats are still loading, the ban waits for them until the last seconds of the turn; with no data it falls back to your ban lists.
+
 ### Summoner Spell Keys
 | Setting | Default | Description |
 |---|---|---|

@@ -85,7 +85,7 @@ def _delayed_play(path: str, cancel: threading.Event,
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "LOL Client Tool  –  Role-Based Pick"
-APP_VERSION = "1.23.0"
+APP_VERSION = "1.24.0"
 GITHUB_REPO = "Naieter/LoL-Client-Automation"
 CONFIG_DIR  = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LOL_Client_TOOL"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -109,6 +109,12 @@ ROLE_LABEL = {
 # and icon prefetch all work unchanged — it just isn't one of ROLES, so the
 # draft pick/ban code never sees it.
 ARAM_ROLE      = "aram"
+
+# Team-ranked queues where the enemy roster is visible in champ select, so
+# auto-ban can follow the scouting ban suggestions. 710 = "Ranked 5s"
+# (RANKED_PREMADE_5x5) — read from the live client 2026-11-20, which also
+# showed the enemy team's names in champ select and one-at-a-time bans.
+SCOUT_BAN_QUEUES = {710}
 MAX_ARAM_ITEMS = 15   # ARAM list cap — bench swaps want a deeper pool than 5
 
 # LCU gameMode → op.gg game_mode. op.gg serves ranked / flex / urf / aram /
@@ -204,6 +210,7 @@ DEFAULT_CONFIG = {
     "buildOverlayX":        None,      # saved build overlay screen position (None = default)
     "buildOverlayY":        None,
     "buildOverlayAutoShow": False,     # pop the build overlay up when the game starts
+    "autoBanScouting": True,   # Ranked 5s: ban from the scouting suggestions first
     "spellKeyD": 0,   # summoner spell id that always goes on D when imported (0 = any)
     "spellKeyF": 0,   # summoner spell id that always goes on F when imported (0 = any)
     "roleChampions": {role: {"picks": [], "bans": []}
@@ -952,12 +959,16 @@ class AutoEngine:
 
     POLL = 0.5  # seconds
 
-    def __init__(self, lcu: LCU, cfg_fn, log_fn, ddragon=None, on_phase=None):
+    def __init__(self, lcu: LCU, cfg_fn, log_fn, ddragon=None, on_phase=None,
+                 scout_bans_fn=None):
         self._lcu          = lcu
         self._cfg          = cfg_fn    # callable → dict
         self._log          = log_fn    # callable(str)
         self._dd           = ddragon   # DDragon, for champ-id → op.gg name
         self._on_phase     = on_phase  # callable(phase) — UI reacts to phase
+        # callable(session) → (ban ids best first, {id: reason}, enemies still
+        # being fetched) from the Scouting tab; used in SCOUT_BAN_QUEUES only
+        self._scout_bans_fn = scout_bans_fn
         self._stop         = threading.Event()
         self._last_phase   = ""
         self._done_actions:  set  = set()
@@ -1389,6 +1400,26 @@ class AutoEngine:
         if perma:
             ban_prio = perma + [c for c in ban_prio if c not in set(perma)]
 
+        # Ranked 5s: the enemy roster is visible, so bans follow the scouting
+        # suggestions first (ahead of permabans) — they target what THESE
+        # players actually play. Computed only while one of my bans is live.
+        scout_mode = bool(cfg.get("autoBanScouting", True)
+                          and self.queue_id in SCOUT_BAN_QUEUES
+                          and self._scout_bans_fn is not None)
+        scout_ids, scout_why, scout_pending = [], {}, 0
+        if scout_mode and any(
+                str(a.get("actorCellId", "")) == str(session.get("localPlayerCellId"))
+                and a.get("type") == "ban" and a.get("isInProgress")
+                and not a.get("completed")
+                for g in session.get("actions", []) for a in g):
+            try:
+                scout_ids, scout_why, scout_pending = self._scout_bans_fn(session)
+            except Exception as e:
+                _dbg(f"[ban] scouting bans unavailable: {e}")
+            if scout_ids:
+                ban_prio = list(scout_ids) + [c for c in ban_prio
+                                              if c not in set(scout_ids)]
+
         # Champions actually selectable this session (Practice Tool → all)
         playable = self._get_pickable_ids()
         # Reference removes already-taken champions from the playable pool.
@@ -1552,7 +1583,10 @@ class AutoEngine:
                     # back to a higher priority an ally merely moved off of. Only
                     # retarget when the current pick is taken or an ally is on it.
                     current = self._ban_hovered.get(aid)
-                    if current and current not in unavail:
+                    # From scouting, always take the current best: bans are one
+                    # at a time in Ranked 5s (no ally to oscillate against), and
+                    # data for another enemy may land mid-turn and change it.
+                    if current and current not in unavail and not scout_ids:
                         champ = current
                     else:
                         champ = self._best(ban_prio, unavail, set(range(1_000_000)))
@@ -1588,11 +1622,16 @@ class AutoEngine:
                     if aid not in self._ban_attempt:
                         self._ban_attempt[aid] = time.monotonic()
                     attempt_ms = (time.monotonic() - self._ban_attempt[aid]) * 1000
-                    stuck = (not confirmed) and bool(champ) \
+                    # Ranked 5s: enemy stats still loading and nothing scored
+                    # yet → hold the lock (the hover can still go up) rather
+                    # than ban from the role list; the end-of-turn force below
+                    # still guarantees a ban.
+                    scout_wait = bool(scout_mode and not scout_ids and scout_pending)
+                    stuck = (not confirmed) and bool(champ) and not scout_wait \
                         and attempt_ms >= delay_ms + 6000
                     # Lock once the ban delay has passed, or force it through if
                     # the ban timer is nearly up so we never miss the ban.
-                    ready  = confirmed and elapsed >= delay_ms
+                    ready  = confirmed and elapsed >= delay_ms and not scout_wait
                     ending = (not is_infinite) and 0 < time_left <= 4000
                     # ── Debug dump: exact state driving the ban decision ──
                     _raw_bans = [
@@ -1635,7 +1674,14 @@ class AutoEngine:
                         if self._commit_action(action, champ, complete=True) \
                                 and aid not in self._lock_sent:
                             self._lock_sent.add(aid)
-                            self._log(f"Banned champion #{champ}")
+                            nm = self._dd.name(champ) if self._dd else f"#{champ}"
+                            if champ in scout_why:
+                                self._log(f"Banned {nm} (scouting — {scout_why[champ]})")
+                            elif scout_mode:
+                                self._log(f"Banned {nm} (no scouting data — "
+                                          f"used your ban list)")
+                            else:
+                                self._log(f"Banned champion #{champ}")
                     else:
                         _dbg(f"[ban]   -> WAIT (hovered {champ}, {int(elapsed)}/{delay_ms}ms)")
 
@@ -4620,7 +4666,8 @@ class App(tk.Tk):
         self.ddragon = DDragon()
         self._lcu    = LCU()
         self._engine = AutoEngine(self._lcu, lambda: self.cfg, self.log,
-                                  self.ddragon, self._on_phase_change)
+                                  self.ddragon, self._on_phase_change,
+                                  scout_bans_fn=self._scout_ban_plan)
 
         self._role_panels: dict = {}   # role → RolePanel
         self._connected    = False
@@ -5421,7 +5468,7 @@ class App(tk.Tk):
                     self._scout_banned = banned
                     self.after(0, self._render_scouting)
                 if roster is not None:
-                    key = (source, tuple(sorted((p["name"], p["tag"], p["ally"])
+                    key = (source, tuple(sorted((p["name"], p["tag"], p["ally"], bool(p.get("locked")))
                                                 for p in roster)))
                     if key != last_key:
                         last_key = key
@@ -5505,12 +5552,23 @@ class App(tk.Tk):
         identities are populated unless Riot hides enemy names for the queue
         (then summonerId is 0 and there's no puuid — nothing to scout until
         the game starts). Enemy champions show once locked."""
-        out = []
         try:
             r = self._lcu.get("/lol-champ-select/v1/session")
             if r.status_code != 200:
                 return []
-            sess = r.json()
+            return self._scout_roster_from_session(r.json())
+        except Exception as e:
+            _dbg(f"[scout] champselect roster: {e}")
+            return []
+
+    def _scout_roster_from_session(self, sess: dict) -> list:
+        """Roster entries from a champ-select session dict. `locked` marks a
+        player whose pick is completed — they can't play anything else any
+        more, so their pool no longer drives ban suggestions."""
+        out = []
+        locked_cells = {str(a.get("actorCellId")) for g in sess.get("actions", []) or []
+                        for a in g if a.get("type") == "pick" and a.get("completed")}
+        try:
             for team_key, ally in (("myTeam", True), ("theirTeam", False)):
                 for mbr in sess.get(team_key, []) or []:
                     sid   = int(mbr.get("summonerId", 0) or 0)
@@ -5527,10 +5585,34 @@ class App(tk.Tk):
                               mbr.get("championPickIntent") or 0)
                     out.append({"name": ident[0], "tag": ident[1],
                                 "ally": ally, "bot": False,
-                                "champ": self._scout_champ_name(cid)})
+                                "champ": self._scout_champ_name(cid),
+                                "locked": str(mbr.get("cellId")) in locked_cells})
         except Exception as e:
             _dbg(f"[scout] champselect roster: {e}")
         return out
+
+    def _scout_ban_plan(self, session: dict):
+        """Engine callback (engine thread): ban targets from the Scouting tab's
+        data for this exact session. Returns (champion ids best first,
+        {id: reason}, number of enemies whose stats are still loading).
+        Missing enemies get their fetch kicked off here, so a fast first ban
+        doesn't wait for the 3 s scouting watcher."""
+        roster = self._scout_roster_from_session(session)
+        pending = 0
+        for p in roster:
+            if p["ally"] or p.get("bot") or p.get("locked"):
+                continue
+            if (p["name"], p["tag"]) not in self._scout_cache:
+                pending += 1
+                self._scout_kick_fetch(p["name"], p["tag"])
+        sugg = self._scout_ban_suggestions(roster, self._scout_cache, n=10)
+        ids, why = [], {}
+        for e in sugg:
+            cid = self.ddragon.find_id_fuzzy(e["champ"])
+            if cid is not None and cid not in why:
+                ids.append(int(cid))
+                why[int(cid)] = e["why"]
+        return ids, why, pending
 
     def _scout_champ_name(self, cid):
         try:
@@ -6040,8 +6122,8 @@ class App(tk.Tk):
         skip = {norm(x) for x in exclude}
         agg: dict = {}        # norm champ → {"champ", "score", "players"}
         for p in roster or []:
-            if p.get("ally") or p.get("bot"):
-                continue
+            if p.get("ally") or p.get("bot") or p.get("locked"):
+                continue      # a locked enemy can't play anything else now
             data = (cache or {}).get((p["name"], p["tag"])) or {}
             prof  = data.get("prof") or {}
             games = [g for g in (data.get("games") or [])
@@ -7624,6 +7706,23 @@ class App(tk.Tk):
         _hint(s, "In-game it needs Borderless or Windowed mode — exclusive "
                  "Fullscreen hides every overlay.")
 
+        # ── Ranked 5s ─────────────────────────────────────────────────────────
+        s = _section("Ranked 5s")
+        self._ban_scouting_var = tk.BooleanVar(
+            value=bool(self.cfg.get("autoBanScouting", True)))
+        _check(s, "Auto-ban from scouting", self._ban_scouting_var,
+               lambda: (
+                   self.cfg.__setitem__("autoBanScouting",
+                                        self._ban_scouting_var.get()),
+                   save_config(self.cfg),
+               )).pack(anchor="w")
+        _hint(s, "In Ranked 5s the enemy team is visible, so Auto Ban takes the top "
+                 "ban suggestion from the Scouting tab — ahead of your permabans and "
+                 "role bans — and skips enemies who already locked a champion.")
+        _hint(s, "If enemy stats are still loading it holds the ban until they "
+                 "arrive or the turn nearly runs out; with no data it uses your "
+                 "ban lists as usual. Needs Auto Ban on.")
+
         # ── Summoner Spell Keys ───────────────────────────────────────────────
         s = _section("Summoner Spell Keys")
         labels = ["Any"] + [n for _, n in SPELL_KEY_CHOICES]
@@ -8346,6 +8445,8 @@ class App(tk.Tk):
             self.cfg["neekoSoundVolume"] = self._neeko_vol_var.get()
         if hasattr(self, "_tft_fix_var"):
             self.cfg["tftFixEnabled"] = self._tft_fix_var.get()
+        if hasattr(self, "_ban_scouting_var"):
+            self.cfg["autoBanScouting"] = self._ban_scouting_var.get()
         save_config(self.cfg)
         self.log("Config saved.")
 
